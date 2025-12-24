@@ -198,7 +198,7 @@ class AnnotationGUI(qt.QWidget):
         self.layout().addWidget(line)
         
         self.btn_export = qt.QPushButton("5. Export & Reset")
-        self.btn_export.connect('clicked()', self.on_export)
+        self.btn_export.clicked.connect(self.on_export)
         self.btn_export.setStyleSheet("text-align: center; padding: 10px; font-weight: bold; background-color: #007bff; color: white;")
         self.btn_export.setEnabled(False)
         self.layout().addWidget(self.btn_export)
@@ -1052,32 +1052,104 @@ class AnnotationGUI(qt.QWidget):
             if not hasattr(slicer.modules, 'extractcenterline'):
                 raise RuntimeError("VMTK Extension not installed. Install from Extension Manager.")
 
+            # Switch to VMTK module FIRST
+            slicer.util.selectModule("ExtractCenterline")
+            
+            # Small delay to ensure module is fully loaded
+            slicer.app.processEvents()
+            
+            # Get the widget (which has the logic and parameter node setup)
+            vmtk_widget = slicer.modules.extractcenterline.widgetRepresentation()
+            if not vmtk_widget:
+                raise RuntimeError("Failed to get VMTK widget")
+            
+            # Access the widget's internal objects
+            widget_self = vmtk_widget.self()
+            
+            # The widget already has _parameterNode after initialization
+            parameterNode = widget_self._parameterNode
+            
+            if not parameterNode:
+                # If for some reason it's not initialized, create one
+                logic = widget_self.logic
+                parameterNode = logic.getParameterNode()
+            
+            if not parameterNode:
+                raise RuntimeError("Failed to get VMTK parameter node")
+            
+            # Pre-create output nodes with standardized names
             self.network_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{self.current_id}_Network")
             self.endpoint_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", f"{self.current_id}_Endpoints")
-
-            # Reduce segmentation opacity to see endpoints clearly
+            self.centerline_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{self.current_id}_Centerline")
+            
+            # Convert binarized merged segmentation to model for VMTK
+            inputSurfaceModel = None
+            if self.binarized_merged_node:
+                # Export segmentation to model
+                inputSurfaceModel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{self.current_id}_merged_binary_surface")
+                
+                # Get the first (and only) segment ID
+                segmentation = self.binarized_merged_node.GetSegmentation()
+                segmentId = segmentation.GetNthSegmentID(0)
+                
+                # Export to closed surface
+                self.binarized_merged_node.CreateClosedSurfaceRepresentation()
+                polyData = vtk.vtkPolyData()
+                self.binarized_merged_node.GetClosedSurfaceRepresentation(segmentId, polyData)
+                
+                if polyData.GetNumberOfPoints() > 0:
+                    inputSurfaceModel.SetAndObservePolyData(polyData)
+                    inputSurfaceModel.CreateDefaultDisplayNodes()
+                    
+                    # Make it visible with reduced opacity
+                    displayNode = inputSurfaceModel.GetDisplayNode()
+                    if displayNode:
+                        displayNode.SetVisibility(True)
+                        displayNode.SetOpacity(0.3)
+                        displayNode.SetColor(0.8, 0.8, 0.0)  # Yellow tint
+                else:
+                    raise RuntimeError("Binarized merged mask has no surface data")
+            
+            # Set node references in parameter node using the exact names from VMTK code
+            if inputSurfaceModel:
+                parameterNode.SetNodeReferenceID("InputSurface", inputSurfaceModel.GetID())
+            
+            parameterNode.SetNodeReferenceID("OutputCenterlineModel", self.centerline_node.GetID())
+            parameterNode.SetNodeReferenceID("NetworkModel", self.network_node.GetID())
+            parameterNode.SetNodeReferenceID("EndPoints", self.endpoint_node.GetID())
+            
+            # Hide other segmentations to reduce clutter
             if self.seg_node:
-                display_node = self.seg_node.GetDisplayNode()
-                if display_node:
-                    current_opacity = display_node.GetOpacity3D()
-                    new_opacity = max(0.0, current_opacity - 0.3)
-                    display_node.SetOpacity3D(new_opacity)
-
-            slicer.util.selectModule("ExtractCenterline")
+                self.seg_node.GetDisplayNode().SetVisibility(False)
+            if self.ref_node:
+                self.ref_node.GetDisplayNode().SetVisibility(False)
+            if self.binarized_merged_node:
+                self.binarized_merged_node.GetDisplayNode().SetVisibility(False)
+            
+            # Force GUI update from parameter node
+            widget_self.updateGUIFromParameterNode()
+            
+            # Process events to ensure UI updates
+            slicer.app.processEvents()
+            
             self.mark_done(self.btn_vmtk, "VMTK Ready")
             self.btn_click_mode.setEnabled(True)
             self.btn_export.setEnabled(True)
             self.workflow_state["phase"] = 3
             
-            self.lbl_status.setText("✓ In VMTK Module: Extract centerline → Then use Click Mode for zones")
+            self.lbl_status.setText(f"✓ VMTK Ready: Input surface created from '{self.current_id}_merged_binary'. Place endpoints and extract centerline.")
             
             qt.QMessageBox.information(self, "VMTK Setup",
-                "Extract Centerline Instructions:\n\n"
-                "1. Select your refined segmentation as input\n"
-                "2. Place endpoints at vessel entry/exit points\n"
-                "3. Click 'Apply' to extract centerline\n\n"
-                "After extraction, use 'Start Click Mode' to add zone landmarks\n"
-                "by clicking directly on the centerline in the 3D view.")
+                f"Extract Centerline Instructions:\n\n"
+                f"✓ Input Surface: {self.current_id}_merged_binary_surface (pre-selected)\n"
+                f"✓ Output Centerline: {self.current_id}_Centerline (pre-created)\n"
+                f"✓ Output Network: {self.current_id}_Network (pre-created)\n"
+                f"✓ Endpoints: {self.current_id}_Endpoints (pre-created)\n\n"
+                f"Next Steps:\n"
+                f"1. Verify the yellow surface is visible\n"
+                f"2. Click 'Auto-detect end points' or manually place endpoints\n"
+                f"3. Click 'Apply' to extract centerline\n\n"
+                f"After extraction, use 'Start Zone Picker' for landmarks.")
         
         self.safe_execute(vmtk_operation, "Failed to setup VMTK")
 
@@ -1085,6 +1157,7 @@ class AnnotationGUI(qt.QWidget):
     # STEP 5: EXPORT (ENHANCED WITH VALIDATION)
     # ------------------------------------------------------------------
     def on_export(self):
+        print("DEBUG: Export button clicked")
         def export_operation():
             # Disable click mode if active
             if self.click_mode_active:
@@ -1113,16 +1186,19 @@ class AnnotationGUI(qt.QWidget):
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)
             
-            progress = slicer.util.createProgressDialog(parent=self, value=0, maximum=7)
-            progress.labelText = "Starting export..."
+            # Use standard Qt progress dialog for better reliability
+            progress = qt.QProgressDialog("Exporting data...", "Cancel", 0, 7, self)
+            progress.setWindowModality(qt.Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.show()
             slicer.app.processEvents()
             
             exported_files = []
             
             try:
                 # 1. Segmentation
-                progress.labelText = "Saving refined mask..."
-                progress.value = 1
+                progress.setLabelText("Saving refined mask...")
+                progress.setValue(1)
                 slicer.app.processEvents()
                 
                 seg_path = os.path.join(save_dir, f"{self.current_id}_refined_mask.seg.nrrd")
@@ -1130,15 +1206,18 @@ class AnnotationGUI(qt.QWidget):
                 exported_files.append("✓ Refined Mask")
                 
                 # 2. Centerline
-                progress.labelText = "Saving centerline..."
-                progress.value = 2
+                progress.setLabelText("Saving centerline...")
+                progress.setValue(2)
                 slicer.app.processEvents()
                 
-                centerline_model = self.find_node([
-                    f"{self.current_id}_Centerline",
-                    "Centerline model",
-                    "Centerline Model"
-                ])
+                # Prefer stored node, fallback to search
+                centerline_model = self.centerline_node
+                if not centerline_model:
+                    centerline_model = self.find_node([
+                        f"{self.current_id}_Centerline",
+                        "Centerline model",
+                        "Centerline Model"
+                    ])
                 
                 if centerline_model:
                     slicer.util.saveNode(centerline_model,
@@ -1146,15 +1225,17 @@ class AnnotationGUI(qt.QWidget):
                     exported_files.append("✓ Centerline Model")
                 
                 # 3. Network
-                progress.labelText = "Saving network..."
-                progress.value = 3
+                progress.setLabelText("Saving network...")
+                progress.setValue(3)
                 slicer.app.processEvents()
                 
-                network_model = self.find_node([
-                    f"{self.current_id}_Network",
-                    "Network model",
-                    "Voronoi diagram"
-                ])
+                network_model = self.network_node
+                if not network_model:
+                    network_model = self.find_node([
+                        f"{self.current_id}_Network",
+                        "Network model",
+                        "Voronoi diagram"
+                    ])
                 
                 if network_model:
                     slicer.util.saveNode(network_model,
@@ -1162,15 +1243,17 @@ class AnnotationGUI(qt.QWidget):
                     exported_files.append("✓ Network Model")
                 
                 # 4. Endpoints
-                progress.labelText = "Saving endpoints..."
-                progress.value = 4
+                progress.setLabelText("Saving endpoints...")
+                progress.setValue(4)
                 slicer.app.processEvents()
                 
-                endpoint_markups = self.find_node([
-                    f"{self.current_id}_Endpoints",
-                    "Centerline endpoints",
-                    "Endpoints"
-                ])
+                endpoint_markups = self.endpoint_node
+                if not endpoint_markups:
+                    endpoint_markups = self.find_node([
+                        f"{self.current_id}_Endpoints",
+                        "Centerline endpoints",
+                        "Endpoints"
+                    ])
                 
                 if endpoint_markups:
                     slicer.util.saveNode(endpoint_markups,
@@ -1178,8 +1261,8 @@ class AnnotationGUI(qt.QWidget):
                     exported_files.append("✓ Endpoints")
                 
                 # 5. Zones
-                progress.labelText = "Saving zone landmarks..."
-                progress.value = 5
+                progress.setLabelText("Saving zone landmarks...")
+                progress.setValue(5)
                 slicer.app.processEvents()
                 
                 if self.zone_node and self.zone_node.GetNumberOfControlPoints() > 0:
@@ -1188,8 +1271,8 @@ class AnnotationGUI(qt.QWidget):
                     exported_files.append(f"✓ Zone Landmarks ({self.zone_node.GetNumberOfControlPoints()} points)")
                 
                 # 6. Notes
-                progress.labelText = "Saving notes..."
-                progress.value = 6
+                progress.setLabelText("Saving notes...")
+                progress.setValue(6)
                 slicer.app.processEvents()
                 
                 notes_txt = self.notes_edit.toPlainText().strip() if self.notes_edit else ""
@@ -1200,8 +1283,8 @@ class AnnotationGUI(qt.QWidget):
                     exported_files.append("✓ Notes")
                 
                 # 7. Save metadata
-                progress.labelText = "Saving metadata..."
-                progress.value = 7
+                progress.setLabelText("Saving metadata...")
+                progress.setValue(7)
                 slicer.app.processEvents()
                 
                 metadata = {
