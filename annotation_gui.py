@@ -21,6 +21,7 @@ class AnnotationGUI(qt.QWidget):
         self.vol_node = None
         self.seg_node = None
         self.ref_node = None
+        self.binarized_merged_node = None
         self.zone_node = None
         self.network_node = None
         self.endpoint_node = None
@@ -893,7 +894,7 @@ class AnnotationGUI(qt.QWidget):
             self.btn_undo_point.setEnabled(count > 0)
 
     # ------------------------------------------------------------------
-    # STEP 1: LOAD (ENHANCED ERROR HANDLING)
+    # STEP 1: LOAD 
     # ------------------------------------------------------------------
     def on_load_data(self):
         """Public wrapper for load"""
@@ -928,39 +929,76 @@ class AnnotationGUI(qt.QWidget):
                 raise FileNotFoundError(f"Missing CT scan file: {vol_path}")
             if not os.path.exists(seg_path):
                 raise FileNotFoundError(f"Missing unified segmentation: {seg_path}")
+            if not os.path.exists(ref_path):
+                raise FileNotFoundError(f"Missing merged segmentation: {ref_path}")
             
-            # Load with error checking
+            # Load CT volume
             self.vol_node = slicer.util.loadVolume(vol_path)
             if not self.vol_node:
                 raise RuntimeError("Failed to load CT volume")
             
-            # Load segmentation as labelmap first to binarize
-            self.lbl_status.setText(f"Binarizing segmentation mask...")
+            # Load unified segmentation (keep as-is)
+            self.lbl_status.setText(f"Loading unified segmentation...")
             slicer.app.processEvents()
             
-            temp_labelmap = slicer.util.loadLabelVolume(seg_path)
-            if not temp_labelmap:
-                raise RuntimeError("Failed to load segmentation")
+            temp_unified = slicer.util.loadLabelVolume(seg_path)
+            if not temp_unified:
+                raise RuntimeError("Failed to load unified segmentation")
+            
+            # Convert unified to segmentation node
+            self.seg_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.current_id}_unified")
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(temp_unified, self.seg_node)
+            slicer.mrmlScene.RemoveNode(temp_unified)
+            
+            # Create closed surface representation for unified
+            self.seg_node.CreateClosedSurfaceRepresentation()
+            
+            # Load merged segmentation (keep original)
+            self.lbl_status.setText(f"Loading merged segmentation...")
+            slicer.app.processEvents()
+            
+            temp_merged = slicer.util.loadLabelVolume(ref_path)
+            if not temp_merged:
+                raise RuntimeError("Failed to load merged segmentation")
+            
+            # Convert merged to segmentation node
+            self.ref_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.current_id}_merged")
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(temp_merged, self.ref_node)
+            slicer.mrmlScene.RemoveNode(temp_merged)
+            
+            # Create closed surface representation for merged
+            self.ref_node.CreateClosedSurfaceRepresentation()
+            
+            # Binarize merged mask
+            self.lbl_status.setText(f"Binarizing merged segmentation...")
+            slicer.app.processEvents()
+            
+            temp_merged_binary = slicer.util.loadLabelVolume(ref_path)
+            if not temp_merged_binary:
+                raise RuntimeError("Failed to load merged segmentation for binarization")
             
             # Binarize: convert all non-zero values to 1
             import numpy as np
-            array = slicer.util.arrayFromVolume(temp_labelmap)
+            array = slicer.util.arrayFromVolume(temp_merged_binary)
             array[array > 0] = 1
-            slicer.util.updateVolumeFromArray(temp_labelmap, array)
+            slicer.util.updateVolumeFromArray(temp_merged_binary, array)
             
-            # Convert to segmentation node
-            self.seg_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.current_id}_unified_binary")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(temp_labelmap, self.seg_node)
+            # Convert binarized merged to segmentation node
+            self.binarized_merged_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.current_id}_merged_binary")
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(temp_merged_binary, self.binarized_merged_node)
+            slicer.mrmlScene.RemoveNode(temp_merged_binary)
             
-            # Clean up temporary labelmap
-            slicer.mrmlScene.RemoveNode(temp_labelmap)
-            
-            if os.path.exists(ref_path):
-                self.ref_node = slicer.util.loadSegmentation(ref_path)
+            # Create closed surface representation for binarized merged
+            self.binarized_merged_node.CreateClosedSurfaceRepresentation()
 
-            # Setup display
+            # Setup display and visibility
             slicer.app.layoutManager().sliceWidget('Red').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(self.vol_node.GetID())
-            self.seg_node.CreateClosedSurfaceRepresentation()
+            
+            # Set visibility: Only unified and CT visible
+            self.seg_node.GetDisplayNode().SetVisibility(True)  # Unified visible
+            self.ref_node.GetDisplayNode().SetVisibility(False)  # Merged hidden
+            self.binarized_merged_node.GetDisplayNode().SetVisibility(False)  # Binarized merged hidden
+            
             slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
             
             # Enable next steps
@@ -970,7 +1008,7 @@ class AnnotationGUI(qt.QWidget):
             
             self.workflow_state["phase"] = 1
             self.has_unsaved_work = True
-            self.lbl_status.setText(f"✓ Loaded: {self.current_id} (Binary mask)")
+            self.lbl_status.setText(f"✓ Loaded: {self.current_id} (3 masks: unified, merged, merged_binary)")
         
         self.safe_execute(load_operation, "Failed to load data")
 
@@ -1221,6 +1259,7 @@ class AnnotationGUI(qt.QWidget):
         self.vol_node = None
         self.seg_node = None
         self.ref_node = None
+        self.binarized_merged_node = None
         self.zone_node = None
         self.network_node = None
         self.endpoint_node = None
