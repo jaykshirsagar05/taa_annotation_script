@@ -15,7 +15,7 @@ class TAAAnnotation(ScriptedLoadableModule):
         self.parent.title = "TAA Annotation"
         self.parent.categories = ["Segmentation"]
         self.parent.dependencies = ["SegmentEditor", "ExtractCenterline"]
-        self.parent.contributors = ["Your Name (Your Institution)"]
+        self.parent.contributors = ["University of Ottawa Heart Institute (Canada)"]
         self.parent.helpText = """
         TAA (Thoracic Aortic Aneurysm) Annotation Protocol Module.
         <br><br>
@@ -297,6 +297,14 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     "color: #28a745; font-weight: bold;" if isActive 
                     else "color: #666; font-style: italic;"
                 )
+                
+                if isActive:
+                    if self.logic.segNode:
+                        self.logic.segNode.GetDisplayNode().SetVisibility(True)
+                        self.logic.segNode.GetDisplayNode().SetOpacity(0.5)
+                    if self.logic.refNode:
+                        self.logic.refNode.GetDisplayNode().SetVisibility(True)
+                        self.logic.refNode.GetDisplayNode().SetOpacity(0.2)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -547,12 +555,43 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
     def setupVMTK(self):
         """Setup VMTK centerline extraction"""
         import vtk
+        import numpy as np
         
         try:
             if not hasattr(slicer.modules, 'extractcenterline'):
                 slicer.util.errorDisplay("VMTK Extension not installed")
                 return False
             
+            # Export refined segmentation to temporary label volume
+            if not self.segNode:
+                slicer.util.errorDisplay("No refined segmentation available")
+                return False
+            
+            # Create temporary label volume from refined segmentation
+            tempRefinedLabel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "temp_refined_label")
+            slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
+                self.segNode, tempRefinedLabel, slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
+            )
+            
+            # Binarize - merge all labels into single mask
+            array = slicer.util.arrayFromVolume(tempRefinedLabel)
+            array[array > 0] = 1
+            slicer.util.updateVolumeFromArray(tempRefinedLabel, array)
+            
+            # Create segmentation node from binarized volume
+            binarizedRefinedNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLSegmentationNode", 
+                f"{self.currentId}_refined_binary"
+            )
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                tempRefinedLabel, binarizedRefinedNode
+            )
+            binarizedRefinedNode.CreateClosedSurfaceRepresentation()
+            
+            # Clean up temporary label volume
+            slicer.mrmlScene.RemoveNode(tempRefinedLabel)
+            
+            # Setup VMTK module
             slicer.util.selectModule("ExtractCenterline")
             slicer.app.processEvents()
             
@@ -572,15 +611,15 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             self.endpointNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", f"{self.currentId}_Endpoints")
             self.centerlineNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{self.currentId}_Centerline")
             
-            # Create surface model from binarized mask
+            # Create surface model from binarized refined mask
             inputSurfaceModel = None
-            if self.binarizedMergedNode:
-                inputSurfaceModel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{self.currentId}_merged_binary_surface")
-                segmentation = self.binarizedMergedNode.GetSegmentation()
+            if binarizedRefinedNode:
+                inputSurfaceModel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{self.currentId}_refined_binary_surface")
+                segmentation = binarizedRefinedNode.GetSegmentation()
                 segmentId = segmentation.GetNthSegmentID(0)
-                self.binarizedMergedNode.CreateClosedSurfaceRepresentation()
+                binarizedRefinedNode.CreateClosedSurfaceRepresentation()
                 polyData = vtk.vtkPolyData()
-                self.binarizedMergedNode.GetClosedSurfaceRepresentation(segmentId, polyData)
+                binarizedRefinedNode.GetClosedSurfaceRepresentation(segmentId, polyData)
                 
                 if polyData.GetNumberOfPoints() > 0:
                     inputSurfaceModel.SetAndObservePolyData(polyData)
@@ -590,7 +629,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                         displayNode.SetVisibility(True)
                         displayNode.SetOpacity(0.3)
                         displayNode.SetColor(0.8, 0.8, 0.0)
-            
+        
             # Set node references
             if inputSurfaceModel:
                 parameterNode.SetNodeReferenceID("InputSurface", inputSurfaceModel.GetID())
@@ -603,12 +642,16 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                 if node:
                     node.GetDisplayNode().SetVisibility(False)
             
+            # Hide the temporary binarized node as well (keep only surface visible)
+            if binarizedRefinedNode:
+                binarizedRefinedNode.GetDisplayNode().SetVisibility(False)
+            
             widgetSelf.updateGUIFromParameterNode()
             slicer.app.processEvents()
             
             self.workflowState["phase"] = 3
             return True
-            
+        
         except Exception as e:
             slicer.util.errorDisplay(f"Failed to setup VMTK: {str(e)}")
             import traceback
