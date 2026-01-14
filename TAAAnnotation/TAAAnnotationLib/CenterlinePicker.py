@@ -277,12 +277,16 @@ class CenterlinePicker:
         if threeDWidget:
             threeDWidget.threeDView().forceRender()
 
-    def confirmZonePoint(self):
-        """Confirm and add current preview point"""
+    def confirmZonePoint(self, zoneName):
+        """Confirm and add current preview point with specified zone name"""
         if not self.currentPreviewPos:
             return
         
-        label = self.logic.addZonePoint(self.currentPreviewPos, self.currentPreviewId)
+        result = self.logic.addZonePoint(self.currentPreviewPos, zoneName)
+        
+        if result is None:
+            slicer.util.warningDisplay("Maximum 10 zones reached.")
+            return
         
         # Clean up preview
         if self.previewNode:
