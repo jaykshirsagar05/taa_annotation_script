@@ -448,7 +448,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             # Define paths
             volPath = os.path.join(folderPath, f"ct_scan_{self.currentId}.nii.gz")
             segPath = os.path.join(folderPath, f"{self.currentId}_unified_mask_smoothed.nii.gz")
-            refPath = os.path.join(folderPath, f"{self.currentId}_merged.nii.gz")
+            refPath = os.path.join(folderPath, f"{self.currentId}_merged_mask.nii.gz")
             
             # Validate files
             for path, name in [(volPath, "CT scan"), (segPath, "unified segmentation"), (refPath, "merged segmentation")]:
