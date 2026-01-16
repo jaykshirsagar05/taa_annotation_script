@@ -3,10 +3,14 @@ import qt
 import slicer
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
+from TAAAnnotationLib import (
+    OrthancClient, AnnotationStatus,
+    WorkflowWidget, OrthancIntegrationWidget,
+    AutosaveManager, CenterlinePicker, ExportManager
+)
+import tempfile
 
-#
-# TAAAnnotation
-#
+
 class TAAAnnotation(ScriptedLoadableModule):
     """Main module class - defines metadata and help text"""
     
@@ -21,20 +25,18 @@ class TAAAnnotation(ScriptedLoadableModule):
         <br><br>
         This module provides a guided workflow for:
         <ul>
-        <li>Loading CT scans and segmentation masks</li>
+        <li>Loading CT scans from Orthanc PACS or local files</li>
         <li>Refining segmentation using Segment Editor</li>
         <li>Extracting centerlines using VMTK</li>
         <li>Placing zonal landmarks on the centerline</li>
-        <li>Exporting annotated data bundles</li>
+        <li>Exporting and submitting annotated data</li>
         </ul>
         """
         self.parent.acknowledgementText = """
         Developed for TAA research annotation workflow.
         """
 
-#
-# TAAAnnotationWidget
-#
+
 class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     """Widget class - handles the UI"""
 
@@ -42,367 +44,341 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)
         self.logic = None
-        self._parameterNode = None
-        self._updatingGUIFromParameterNode = False
+        
+        # Orthanc integration
+        self.orthancClient = OrthancClient()
+        self.orthancTempDir = None
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
         
-        # Load widget from .ui file or create programmatically
-        self.uiWidget = self.createUI()
-        self.layout.addWidget(self.uiWidget)
-        
-        # Create logic instance
+        # Create logic
         self.logic = TAAAnnotationLogic()
         
-        # Connect signals
-        self.connectSignals()
-        
-        # Initialize autosave
-        from TAAAnnotationLib.AutosaveManager import AutosaveManager
-        self.autosaveManager = AutosaveManager(self.logic)
-        self.autosaveManager.attemptCrashRecovery(self.showRecoveryBanner)
-        
-        # Initialize centerline picker
-        from TAAAnnotationLib.CenterlinePicker import CenterlinePicker
-        self.centerlinePicker = CenterlinePicker(self.logic, self.updateZoneUI)
-        
-        # Add spacer
-        self.layout.addStretch(1)
-        
-        # Initial UI state
-        self.updateUIState()
-
-    def createUI(self):
-        """Create the UI programmatically"""
-        widget = qt.QWidget()
-        layout = qt.QVBoxLayout(widget)
-        
-        # Styles
-        self.defaultStyle = "text-align: left; padding: 8px; font-size: 12px;"
-        self.doneStyle = "background-color: #28a745; color: white; text-align: left; padding: 8px; font-weight: bold;"
-        self.activeStyle = "background-color: #fff3cd; border: 2px solid #ffc107; text-align: left; padding: 8px;"
+        # --- Main Layout ---
+        mainWidget = qt.QWidget()
+        mainLayout = qt.QVBoxLayout(mainWidget)
         
         # --- Header ---
         title = qt.QLabel("TAA Refinement Protocol")
         title.setStyleSheet("font-weight: bold; font-size: 16px; margin-bottom: 10px; color: #333;")
         title.setAlignment(qt.Qt.AlignCenter)
-        layout.addWidget(title)
+        mainLayout.addWidget(title)
         
-        # --- Recovery Banner (hidden by default) ---
-        self.recoveryBanner = qt.QFrame()
-        self.recoveryBanner.setStyleSheet("background-color: #ffc107; padding: 10px; border-radius: 5px;")
-        recoveryLayout = qt.QHBoxLayout(self.recoveryBanner)
-        self.recoveryLabel = qt.QLabel("⚠ Previous session detected")
-        self.btnRecover = qt.QPushButton("Recover")
-        self.btnIgnore = qt.QPushButton("Start Fresh")
-        recoveryLayout.addWidget(self.recoveryLabel)
-        recoveryLayout.addWidget(self.btnRecover)
-        recoveryLayout.addWidget(self.btnIgnore)
-        self.recoveryBanner.hide()
-        layout.addWidget(self.recoveryBanner)
+        # --- Orthanc Integration Widget ---
+        self.orthancWidget = OrthancIntegrationWidget(self.orthancClient)
+        self.orthancWidget.studyLoaded.connect(self.onOrthancStudyLoaded)
+        self.orthancWidget.annotationSubmitted.connect(self.onSubmitToOrthanc)
+        self.orthancWidget.annotationApproved.connect(self.onApproveAnnotation)
+        self.orthancWidget.annotationRejected.connect(self.onRejectAnnotation)
+        self.orthancWidget.loggedOut.connect(self.onOrthancLogout)
+        mainLayout.addWidget(self.orthancWidget)
         
-        # --- Phase 1: Load ---
-        self.btnLoad = qt.QPushButton("1. Load Data & Initialize")
-        self.btnLoad.setStyleSheet(self.defaultStyle)
-        layout.addWidget(self.btnLoad)
+        # --- Separator ---
+        separator = qt.QFrame()
+        separator.setFrameShape(qt.QFrame.HLine)
+        separator.setStyleSheet("margin: 10px 0;")
+        mainLayout.addWidget(separator)
         
-        # --- Phase 2: Refine ---
-        self.btnSeg = qt.QPushButton("2. Refine Mask")
-        self.btnSeg.setStyleSheet(self.defaultStyle)
-        self.btnSeg.setEnabled(False)
-        layout.addWidget(self.btnSeg)
+        orLabel = qt.QLabel("— OR load manually below —")
+        orLabel.setAlignment(qt.Qt.AlignCenter)
+        orLabel.setStyleSheet("color: #999; margin: 5px 0;")
+        mainLayout.addWidget(orLabel)
         
-        # --- Phase 3: VMTK ---
-        self.btnVmtk = qt.QPushButton("3. Extract VMTK Centerline")
-        self.btnVmtk.setStyleSheet(self.defaultStyle)
-        self.btnVmtk.setEnabled(False)
-        layout.addWidget(self.btnVmtk)
+        # --- Workflow Widget ---
+        self.workflowWidget = WorkflowWidget()
+        self.workflowWidget.setLogic(self.logic)
+        self.workflowWidget.loadDataRequested.connect(self.onLoadData)
+        self.workflowWidget.refineRequested.connect(self.onRefineSetup)
+        self.workflowWidget.vmtkRequested.connect(self.onVmtkSetup)
+        self.workflowWidget.exportRequested.connect(self.onExport)
+        self.workflowWidget.quickSaveRequested.connect(self.onQuickSave)
+        self.workflowWidget.notesChanged.connect(self.onNotesChanged)
+        self.workflowWidget.btnRecover.clicked.connect(self.onRecover)
+        self.workflowWidget.btnIgnore.clicked.connect(self.onIgnoreRecovery)
+        mainLayout.addWidget(self.workflowWidget)
         
-        # --- Phase 4: Zones ---
-        self.groupZones = qt.QGroupBox("4. Zonal Landmarks (Preview & Confirm)")
-        zonesLayout = qt.QVBoxLayout(self.groupZones)
+        # Spacer
+        mainLayout.addStretch(1)
         
-        # Centerline selector
-        clLayout = qt.QHBoxLayout()
-        clLabel = qt.QLabel("Centerline:")
-        self.centerlineCombo = slicer.qMRMLNodeComboBox()
-        self.centerlineCombo.nodeTypes = ["vtkMRMLModelNode"]
-        self.centerlineCombo.selectNodeUponCreation = False
-        self.centerlineCombo.addEnabled = False
-        self.centerlineCombo.removeEnabled = False
-        self.centerlineCombo.noneEnabled = True
-        self.centerlineCombo.showHidden = False
-        self.centerlineCombo.setMRMLScene(slicer.mrmlScene)
-        self.centerlineCombo.setToolTip("Select the centerline model")
-        clLayout.addWidget(clLabel)
-        clLayout.addWidget(self.centerlineCombo)
-        zonesLayout.addLayout(clLayout)
+        self.layout.addWidget(mainWidget)
         
-        # Picker buttons
-        btnLayout = qt.QHBoxLayout()
-        self.btnClickMode = qt.QPushButton("🎯 Start Zone Picker")
-        self.btnClickMode.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;")
-        self.btnClickMode.setEnabled(False)
-        btnLayout.addWidget(self.btnClickMode)
+        # Initialize autosave
+        self.autosaveManager = AutosaveManager(self.logic)
+        self.autosaveManager.attemptCrashRecovery(self.workflowWidget.showRecoveryBanner)
         
-        self.btnConfirmPoint = qt.QPushButton("✅ Confirm Zone")
-        self.btnConfirmPoint.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; padding: 10px;")
-        self.btnConfirmPoint.setEnabled(False)
-        btnLayout.addWidget(self.btnConfirmPoint)
-        zonesLayout.addLayout(btnLayout)
+        # Initialize centerline picker
+        self.centerlinePicker = CenterlinePicker(self.logic, self.workflowWidget.updateZoneUI)
+        self.workflowWidget.setCenterlinePicker(self.centerlinePicker)
         
-        # Status labels
-        self.lblClickStatus = qt.QLabel("Picker: OFF")
-        self.lblClickStatus.setStyleSheet("color: #666; font-style: italic;")
-        zonesLayout.addWidget(self.lblClickStatus)
-        
-        self.btnUndoPoint = qt.QPushButton("↩ Undo Last Point")
-        self.btnUndoPoint.setEnabled(False)
-        zonesLayout.addWidget(self.btnUndoPoint)
-        
-        self.lblZoneCount = qt.QLabel("Zone Points: 0")
-        self.lblZoneCount.setStyleSheet("font-weight: bold; color: #17a2b8;")
-        zonesLayout.addWidget(self.lblZoneCount)
-        
-        # Zone list
-        self.zoneList = qt.QListWidget()
-        self.zoneList.setMaximumHeight(120)
-        self.zoneList.setToolTip("Double-click to jump, right-click to delete")
-        self.zoneList.setContextMenuPolicy(qt.Qt.CustomContextMenu)
-        zonesLayout.addWidget(self.zoneList)
-        
-        layout.addWidget(self.groupZones)
-        
-        # --- Quick Save ---
-        self.btnQuickSave = qt.QPushButton("💾 Quick Save Progress")
-        self.btnQuickSave.setStyleSheet("background-color: #6c757d; color: white; padding: 8px;")
-        self.btnQuickSave.setEnabled(False)
-        layout.addWidget(self.btnQuickSave)
-        
-        # --- Phase 5: Export ---
-        line = qt.QFrame()
-        line.setFrameShape(qt.QFrame.HLine)
-        layout.addWidget(line)
-        
-        self.btnExport = qt.QPushButton("5. Export & Reset")
-        self.btnExport.setStyleSheet("text-align: center; padding: 10px; font-weight: bold; background-color: #007bff; color: white;")
-        self.btnExport.setEnabled(False)
-        layout.addWidget(self.btnExport)
-        
-        # --- Status ---
-        self.lblStatus = qt.QLabel("Status: Ready for Scan")
-        self.lblStatus.setWordWrap(True)
-        self.lblStatus.setStyleSheet("color: #666; margin-top: 10px;")
-        layout.addWidget(self.lblStatus)
-        
-        # --- Notes ---
-        notesLabel = qt.QLabel("Annotation Notes (saved with export)")
-        notesLabel.setStyleSheet("font-weight: bold; margin-top: 8px;")
-        layout.addWidget(notesLabel)
-        
-        self.notesEdit = qt.QPlainTextEdit()
-        self.notesEdit.setPlaceholderText("Add observations about scan quality, artifacts, decisions...")
-        self.notesEdit.setMaximumHeight(100)
-        layout.addWidget(self.notesEdit)
-        
-        return widget
+        # Initial UI state
+        self.workflowWidget.updateUIState(0)
 
-    def connectSignals(self):
-        """Connect UI signals to slots"""
-        self.btnLoad.connect('clicked()', self.onLoadData)
-        self.btnSeg.connect('clicked()', self.onRefineSetup)
-        self.btnVmtk.connect('clicked()', self.onVmtkSetup)
-        self.btnClickMode.connect('clicked()', self.onToggleClickMode)
-        self.btnConfirmPoint.connect('clicked()', self.onConfirmZone)
-        self.btnUndoPoint.connect('clicked()', self.onUndoZone)
-        self.btnQuickSave.connect('clicked()', self.onQuickSave)
-        self.btnExport.connect('clicked()', self.onExport)
-        self.btnRecover.connect('clicked()', self.onRecover)
-        self.btnIgnore.connect('clicked()', self.onIgnoreRecovery)
-        self.zoneList.itemDoubleClicked.connect(self.onJumpToZone)
-        self.zoneList.customContextMenuRequested.connect(self.onZoneContextMenu)
-        self.notesEdit.textChanged.connect(self.onNotesChanged)
-
-    def showRecoveryBanner(self, message):
-        """Show recovery banner with message"""
-        self.recoveryLabel.setText(message)
-        self.recoveryBanner.show()
-
-    def updateUIState(self):
-        """Update UI based on current workflow state"""
-        phase = self.logic.workflowState.get("phase", 0)
-        
-        self.btnSeg.setEnabled(phase >= 1)
-        self.btnVmtk.setEnabled(phase >= 2)
-        self.btnClickMode.setEnabled(phase >= 3)
-        self.btnQuickSave.setEnabled(phase >= 1)
-        self.btnExport.setEnabled(phase >= 3)
-
-    def updateZoneUI(self):
-        """Update zone-related UI elements"""
-        if self.logic.zoneNode:
-            count = self.logic.zoneNode.GetNumberOfControlPoints()
-            self.lblZoneCount.setText(f"Zone Points: {count}")
-            self.btnUndoPoint.setEnabled(count > 0)
-            
-            # Update list
-            self.zoneList.clear()
-            for i in range(count):
-                label = self.logic.zoneNode.GetNthControlPointLabel(i)
-                pos = [0, 0, 0]
-                self.logic.zoneNode.GetNthControlPointPosition(i, pos)
-                self.zoneList.addItem(f"{label}: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
-        
-        # NEW: Enable Confirm button if there's a preview point
-        if hasattr(self, 'centerlinePicker') and self.centerlinePicker.currentPreviewPos is not None:
-            self.btnConfirmPoint.setEnabled(True)
-        else:
-            self.btnConfirmPoint.setEnabled(False)
-
-    # --- Event Handlers ---
+    # --- Manual Load Handler ---
     def onLoadData(self):
+        """Handle manual data loading from folder."""
         folderPath = qt.QFileDialog.getExistingDirectory(self.parent, "Select Subject Directory")
         if folderPath:
             success = self.logic.loadData(folderPath)
             if success:
-                self.markDone(self.btnLoad, "Data Loaded")
-                self.updateUIState()
-                self.lblStatus.setText(f"✓ Loaded: {self.logic.currentId}")
+                self.workflowWidget.markDone(1, "Data Loaded")
+                self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+                self.workflowWidget.setStatus(f"✓ Loaded: {self.logic.currentId}")
+                self.workflowWidget.setCurrentId(self.logic.currentId)
 
+    # --- Orthanc Handlers ---
+    def onOrthancStudyLoaded(self, study_id: str, study_info: dict):
+        """Handle study loaded from Orthanc."""
+        ct_path = study_info.get('_ct_path')
+        unified_path = study_info.get('_unified_path')
+        merged_path = study_info.get('_merged_path')
+        self.orthancTempDir = study_info.get('_temp_dir')
+        
+        # Load using logic
+        self.logic.currentId = study_info['patient_id']
+        self.logic.rootDir = self.orthancTempDir
+        self.logic.loadProcedureDataFromPaths(ct_path, unified_path, merged_path)
+        
+        # Update UI
+        self.workflowWidget.setCurrentId(study_info['patient_id'], "from Orthanc")
+        self.workflowWidget.markDone(1, "Data Loaded (Orthanc)")
+        self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+        
+        # Load existing annotations for reviewers
+        if self.orthancWidget.getRole() == "reviewer":
+            self._loadExistingAnnotations(study_id, self.orthancTempDir)
+
+    def _loadExistingAnnotations(self, study_id: str, temp_dir: str):
+        """Load existing annotations for review."""
+        # Download refined mask
+        refined_path = self.orthancClient.download_nifti(
+            study_id,
+            OrthancClient.ATTACHMENT_REFINED_MASK,
+            os.path.join(temp_dir, f"{self.logic.currentId}_refined_mask.seg.nrrd")
+        )
+        if refined_path:
+            slicer.util.loadSegmentation(refined_path)
+        
+        # Download zones
+        zones_path = self.orthancClient.download_nifti(
+            study_id,
+            OrthancClient.ATTACHMENT_ZONES,
+            os.path.join(temp_dir, f"{self.logic.currentId}_Zones.fcsv")
+        )
+        if zones_path:
+            slicer.util.loadMarkups(zones_path)
+        
+        # Download centerline
+        centerline_path = self.orthancClient.download_nifti(
+            study_id,
+            OrthancClient.ATTACHMENT_CENTERLINE,
+            os.path.join(temp_dir, f"{self.logic.currentId}_Centerline.vtk")
+        )
+        if centerline_path:
+            slicer.util.loadModel(centerline_path)
+
+    def onSubmitToOrthanc(self, study_id: str):
+        """Handle annotation submission."""
+        if not study_id:
+            slicer.util.errorDisplay("No Orthanc study loaded")
+            return
+        
+        # Validate zones
+        zoneCount = self.logic.zoneNode.GetNumberOfControlPoints() if self.logic.zoneNode else 0
+        if zoneCount < 10:
+            if not slicer.util.confirmYesNoDisplay(
+                f"Only {zoneCount}/10 zone landmarks placed. Submit anyway?",
+                "Incomplete Zones"
+            ):
+                return
+        
+        # Show progress
+        progressDialog = slicer.util.createProgressDialog(labelText="Submitting...", maximum=6)
+        
+        try:
+            progressDialog.setValue(1)
+            slicer.app.processEvents()
+            
+            export_dir = tempfile.mkdtemp(prefix="orthanc_submit_")
+            files = {}
+            
+            # Save segmentation
+            if self.logic.segNode:
+                path = os.path.join(export_dir, f"{self.logic.currentId}_refined_mask.seg.nrrd")
+                slicer.util.saveNode(self.logic.segNode, path)
+                files["refined_mask"] = path
+                print(f"[Submit] Saved refined mask: {path}")
+            
+            progressDialog.setValue(2)
+            slicer.app.processEvents()
+            
+            # Save centerline - use logic node directly
+            if self.logic.centerlineNode:
+                path = os.path.join(export_dir, f"{self.logic.currentId}_Centerline.vtk")
+                slicer.util.saveNode(self.logic.centerlineNode, path)
+                files["centerline"] = path
+                print(f"[Submit] Saved centerline: {path}")
+            else:
+                print("[Submit] WARNING: No centerline node found in logic")
+            
+            progressDialog.setValue(3)
+            slicer.app.processEvents()
+            
+            # Save endpoints - use logic node directly
+            if self.logic.endpointNode:
+                path = os.path.join(export_dir, f"{self.logic.currentId}_Endpoints.fcsv")
+                slicer.util.saveNode(self.logic.endpointNode, path)
+                files["endpoints"] = path
+                print(f"[Submit] Saved endpoints: {path}")
+            else:
+                print("[Submit] WARNING: No endpoints node found in logic")
+            
+            progressDialog.setValue(4)
+            slicer.app.processEvents()
+            
+            # Save zones
+            if self.logic.zoneNode:
+                path = os.path.join(export_dir, f"{self.logic.currentId}_Zones.fcsv")
+                slicer.util.saveNode(self.logic.zoneNode, path)
+                files["zones"] = path
+                print(f"[Submit] Saved zones: {path}")
+            
+            progressDialog.setValue(5)
+            slicer.app.processEvents()
+            
+            notes = self.workflowWidget.getNotesText()
+            
+            progressDialog.setLabelText("Uploading...")
+            slicer.app.processEvents()
+            
+            success, message = self.orthancClient.submit_annotation(study_id, files, notes)
+            
+            progressDialog.close()
+            
+            if success:
+                slicer.util.infoDisplay(f"✓ Annotation submitted!\n\n{message}")
+                self.logic.hasUnsavedWork = False
+                self.orthancWidget.markSubmitted()
+                self.orthancWidget.refreshWorklist()
+                # Reset for next study after successful submission
+                self.resetForNextStudy()
+            else:
+                slicer.util.errorDisplay(f"Failed: {message}")
+                
+        except Exception as e:
+            progressDialog.close()
+            slicer.util.errorDisplay(f"Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def onApproveAnnotation(self, study_id: str):
+        """Handle annotation approval."""
+        if not slicer.util.confirmYesNoDisplay(
+            "Approve this annotation as ground truth?",
+            "Confirm Approval"
+        ):
+            return
+        
+        try:
+            comments = self.orthancWidget.getReviewComments()
+            success, message = self.orthancClient.approve_annotation(study_id, comments)
+            
+            if success:
+                slicer.util.infoDisplay(f"✓ {message}")
+                self.orthancWidget.disableReviewButtons()
+                self.orthancWidget.refreshWorklist()
+                self.resetForNextStudy()
+            else:
+                slicer.util.errorDisplay(f"Failed: {message}")
+        except Exception as e:
+            slicer.util.errorDisplay(f"Error: {str(e)}")
+
+    def onRejectAnnotation(self, study_id: str, reason: str):
+        """Handle annotation rejection."""
+        if not slicer.util.confirmYesNoDisplay(
+            f"Reject this annotation?\n\nReason: {reason[:100]}...",
+            "Confirm Rejection"
+        ):
+            return
+        
+        try:
+            success, message = self.orthancClient.reject_annotation(study_id, reason)
+            
+            if success:
+                slicer.util.infoDisplay(f"✓ {message}")
+                self.orthancWidget.disableReviewButtons()
+                self.orthancWidget.refreshWorklist()
+                self.resetForNextStudy()
+            else:
+                slicer.util.errorDisplay(f"Failed: {message}")
+        except Exception as e:
+            slicer.util.errorDisplay(f"Error: {str(e)}")
+
+    def onOrthancLogout(self):
+        """Handle Orthanc logout."""
+        if self.logic.hasUnsavedWork:
+            if not slicer.util.confirmYesNoDisplay(
+                "You have unsaved work. Logout anyway?",
+                "Unsaved Work"
+            ):
+                return
+        slicer.mrmlScene.Clear(0)
+        self.logic.reset()
+        self.workflowWidget.resetUI()
+
+    def resetForNextStudy(self):
+        """Reset for next study."""
+        slicer.mrmlScene.Clear(0)
+        self.logic.reset()
+        self.workflowWidget.resetUI()
+        self.workflowWidget.setOrthancMode(False)  # Reset Orthanc mode
+        self.orthancWidget.resetForNextStudy()
+        self.workflowWidget.setStatus("Ready for next study")
+
+    # --- Workflow Handlers ---
     def onRefineSetup(self):
         if self.logic.setupRefinement():
-            self.markDone(self.btnSeg, "Refine Mode")
-            self.updateUIState()
+            self.workflowWidget.markDone(2, "Refine Mode")
+            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
 
     def onVmtkSetup(self):
         if self.logic.setupVMTK():
-            self.markDone(self.btnVmtk, "VMTK Ready")
-            self.updateUIState()
-
-    def onToggleClickMode(self):
-        try:
-            centerlineNode = self.centerlineCombo.currentNode()
-            result = self.centerlinePicker.toggleClickMode(centerlineNode)
-            print(f"DEBUG: toggleClickMode returned: {result}, isActive: {self.centerlinePicker.isActive}")
-            if result:
-                isActive = self.centerlinePicker.isActive
-                self.btnClickMode.setText("🛑 Stop Picker" if isActive else "🎯 Start Zone Picker")
-                self.btnClickMode.setStyleSheet(
-                    "background-color: #dc3545; color: white; font-weight: bold; padding: 10px;" if isActive
-                    else "background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;"
-                )
-                self.lblClickStatus.setText("Picker: ON" if isActive else "Picker: OFF")
-                self.lblClickStatus.setStyleSheet(
-                    "color: #28a745; font-weight: bold;" if isActive 
-                    else "color: #666; font-style: italic;"
-                )
-                
-                if isActive:
-                    if self.logic.segNode:
-                        self.logic.segNode.GetDisplayNode().SetVisibility(True)
-                        self.logic.segNode.GetDisplayNode().SetOpacity(0.5)
-                    if self.logic.refNode:
-                        self.logic.refNode.GetDisplayNode().SetVisibility(True)
-                        self.logic.refNode.GetDisplayNode().SetOpacity(0.2)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            slicer.util.errorDisplay(f"Error in toggleClickMode: {str(e)}")
-
-    def onConfirmZone(self):
-        self.centerlinePicker.confirmZonePoint()
-        self.updateZoneUI()
-        self.btnConfirmPoint.setEnabled(False)
-
-    def onUndoZone(self):
-        self.logic.undoLastZonePoint()
-        self.updateZoneUI()
+            self.workflowWidget.markDone(3, "VMTK Ready")
+            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
 
     def onQuickSave(self):
         self.autosaveManager.quickSave()
-        self.lblStatus.setText(f"✓ Quick saved at {self.logic.getTimestamp()}")
+        self.workflowWidget.setStatus(f"✓ Quick saved at {self.logic.getTimestamp()}")
 
     def onExport(self):
-        from TAAAnnotationLib.ExportManager import ExportManager
         exporter = ExportManager(self.logic)
-        notes = self.notesEdit.toPlainText().strip()
+        notes = self.workflowWidget.getNotesText()
         if exporter.exportAll(notes):
             self.resetApplication()
 
     def onRecover(self):
         if self.autosaveManager.recoverSession():
-            self.recoveryBanner.hide()
-            self.updateUIState()
+            self.workflowWidget.hideRecoveryBanner()
+            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
 
     def onIgnoreRecovery(self):
         self.autosaveManager.cleanup()
-        self.recoveryBanner.hide()
+        self.workflowWidget.hideRecoveryBanner()
 
-    def onJumpToZone(self, item):
-        index = self.zoneList.row(item)
-        self.logic.jumpToZonePoint(index)
-
-    def onZoneContextMenu(self, position):
-        item = self.zoneList.itemAt(position)
-        if not item:
-            return
-        
-        menu = qt.QMenu()
-        deleteAction = menu.addAction("Delete Point")
-        renameAction = menu.addAction("Rename Point")
-        
-        action = menu.exec_(self.zoneList.mapToGlobal(position))
-        index = self.zoneList.row(item)
-        
-        if action == deleteAction:
-            self.logic.deleteZonePoint(index)
-            self.updateZoneUI()
-        elif action == renameAction:
-            newName, ok = qt.QInputDialog.getText(
-                self.parent, "Rename Point", "New label:",
-                qt.QLineEdit.Normal, self.logic.zoneNode.GetNthControlPointLabel(index)
-            )
-            if ok and newName:
-                self.logic.renameZonePoint(index, newName)
-                self.updateZoneUI()
-
-    def onNotesChanged(self):
+    def onNotesChanged(self, text):
         self.logic.hasUnsavedWork = True
 
-    def markDone(self, button, text):
-        button.setStyleSheet(self.doneStyle)
-        button.setText(f"✔ {text}")
-
     def resetApplication(self):
-        """Reset to initial state"""
+        """Full reset."""
         self.centerlinePicker.disable()
         self.logic.reset()
         self.autosaveManager.cleanup()
-        
-        # Reset UI buttons
-        self.btnLoad.setStyleSheet(self.defaultStyle)
-        self.btnLoad.setText("1. Load Data & Initialize")
-        self.btnSeg.setStyleSheet(self.defaultStyle)
-        self.btnSeg.setText("2. Refine Mask")
-        self.btnVmtk.setStyleSheet(self.defaultStyle)
-        self.btnVmtk.setText("3. Extract VMTK Centerline")
-        self.btnClickMode.setText("🎯 Start Zone Picker")
-        self.btnClickMode.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;")
-        self.btnConfirmPoint.setEnabled(False)
-        self.centerlineCombo.setCurrentNode(None)
-        self.centerlineCombo.setMRMLScene(slicer.mrmlScene)
-        
-        self.updateUIState()
-        self.zoneList.clear()
-        self.lblZoneCount.setText("Zone Points: 0")
-        self.lblClickStatus.setText("Picker: OFF")
-        self.lblClickStatus.setStyleSheet("color: #666; font-style: italic;")  # NEW: Reset style
-        self.notesEdit.setPlainText("")
-        self.lblStatus.setText("✓ Reset. Ready for next scan.")
+        self.workflowWidget.resetUI()
+        self.workflowWidget.updateUIState(0)
+        self.workflowWidget.setStatus("✓ Reset. Ready for next scan.")
 
     def cleanup(self):
-        """Called when module is unloaded"""
+        """Module cleanup."""
         self.centerlinePicker.disable()
         self.autosaveManager.stop()
 
@@ -472,7 +448,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             # Define paths
             volPath = os.path.join(folderPath, f"ct_scan_{self.currentId}.nii.gz")
             segPath = os.path.join(folderPath, f"{self.currentId}_unified_mask_smoothed.nii.gz")
-            refPath = os.path.join(folderPath, f"{self.currentId}_merged.nii.gz")
+            refPath = os.path.join(folderPath, f"{self.currentId}_merged_mask.nii.gz")
             
             # Validate files
             for path, name in [(volPath, "CT scan"), (segPath, "unified segmentation"), (refPath, "merged segmentation")]:
@@ -720,6 +696,136 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             threeDWidget = slicer.app.layoutManager().threeDWidget(0)
             if threeDWidget:
                 threeDWidget.threeDView().setFocalPoint(pos[0], pos[1], pos[2])
+    
+    def loadProcedureDataFromPaths(self, ct_path: str, unified_path: str, merged_path: str):
+        """
+        Load procedure data from explicit file paths (for Orthanc integration).
+        
+        Args:
+            ct_path: Path to CT NIfTI file
+            unified_path: Path to unified mask NIfTI file  
+            merged_path: Path to merged mask NIfTI file
+        """
+        slicer.mrmlScene.Clear(0)
+        
+        # Load CT volume
+        print(f"[Loading] CT from: {ct_path}")
+        self.volNode = slicer.util.loadVolume(ct_path)
+        if not self.volNode:
+            raise RuntimeError(f"Failed to load CT volume from {ct_path}")
+        
+        # Load unified segmentation (for editing)
+        print(f"[Loading] Unified mask from: {unified_path}")
+        unifiedLabelNode = slicer.util.loadLabelVolume(unified_path)
+        if not unifiedLabelNode:
+            raise RuntimeError(f"Failed to load unified mask from {unified_path}")
+        
+        self.segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", 
+                                                        f"{self.currentId}_Segmentation")
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+            unifiedLabelNode, self.segNode)
+        slicer.mrmlScene.RemoveNode(unifiedLabelNode)
+        self.segNode.CreateClosedSurfaceRepresentation()
+        
+        # Load merged segmentation (reference)
+        print(f"[Loading] Merged mask from: {merged_path}")
+        mergedLabelNode = slicer.util.loadLabelVolume(merged_path)
+        if mergedLabelNode:
+            # FIXED: Use self.refNode to be compatible with setupRefinement()
+            self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode",
+                                                                    f"{self.currentId}_Merged")
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                mergedLabelNode, self.refNode)
+            slicer.mrmlScene.RemoveNode(mergedLabelNode)
+            self.refNode.CreateClosedSurfaceRepresentation()
+            self.refNode.GetDisplayNode().SetVisibility(False)
+        
+        # Create binarized version for centerline
+        self._createBinarizedMask(merged_path)
+        
+        # Setup views
+        self._setupViews()
+        
+        self.workflowState["phase"] = 1
+        self.hasUnsavedWork = False
+        
+        print(f"[Loading] Complete - ready for annotation")
+
+    def _createBinarizedMask(self, merged_path):
+        """Create binarized mask for centerline extraction from merged mask path."""
+        if not os.path.exists(merged_path):
+            return
+
+        tempMergedBinary = slicer.util.loadLabelVolume(merged_path)
+        array = slicer.util.arrayFromVolume(tempMergedBinary)
+        array[array > 0] = 1
+        slicer.util.updateVolumeFromArray(tempMergedBinary, array)
+            
+        self.binarizedMergedNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.currentId}_merged_binary")
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tempMergedBinary, self.binarizedMergedNode)
+        slicer.mrmlScene.RemoveNode(tempMergedBinary)
+        self.binarizedMergedNode.CreateClosedSurfaceRepresentation()
+        self.binarizedMergedNode.GetDisplayNode().SetVisibility(False)
+
+    def _setupViews(self):
+        """Configure 4-up view and background volume."""
+        if self.volNode:
+            slicer.app.layoutManager().sliceWidget('Red').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(self.volNode.GetID())
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+
+    def loadProcedureDataFromPaths(self, ct_path: str, unified_path: str, merged_path: str):
+        """
+        Load procedure data from explicit file paths (for Orthanc integration).
+        
+        Args:
+            ct_path: Path to CT NIfTI file
+            unified_path: Path to unified mask NIfTI file  
+            merged_path: Path to merged mask NIfTI file
+        """
+        slicer.mrmlScene.Clear(0)
+        
+        # Load CT volume
+        print(f"[Loading] CT from: {ct_path}")
+        self.volNode = slicer.util.loadVolume(ct_path)
+        if not self.volNode:
+            raise RuntimeError(f"Failed to load CT volume from {ct_path}")
+        
+        # Load unified segmentation (for editing)
+        print(f"[Loading] Unified mask from: {unified_path}")
+        unifiedLabelNode = slicer.util.loadLabelVolume(unified_path)
+        if not unifiedLabelNode:
+            raise RuntimeError(f"Failed to load unified mask from {unified_path}")
+        
+        self.segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", 
+                                                        f"{self.currentId}_Segmentation")
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+            unifiedLabelNode, self.segNode)
+        slicer.mrmlScene.RemoveNode(unifiedLabelNode)
+        self.segNode.CreateClosedSurfaceRepresentation()
+        
+        # Load merged segmentation (reference)
+        print(f"[Loading] Merged mask from: {merged_path}")
+        mergedLabelNode = slicer.util.loadLabelVolume(merged_path)
+        if mergedLabelNode:
+            # FIXED: Use self.refNode to be compatible with setupRefinement()
+            self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode",
+                                                                    f"{self.currentId}_Merged")
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                mergedLabelNode, self.refNode)
+            slicer.mrmlScene.RemoveNode(mergedLabelNode)
+            self.refNode.CreateClosedSurfaceRepresentation()
+            self.refNode.GetDisplayNode().SetVisibility(False)
+        
+        # Create binarized version for centerline
+        self._createBinarizedMask(merged_path)
+        
+        # Setup views
+        self._setupViews()
+        
+        self.workflowState["phase"] = 1
+        self.hasUnsavedWork = False
+        
+        print(f"[Loading] Complete - ready for annotation")
 
 
 #
