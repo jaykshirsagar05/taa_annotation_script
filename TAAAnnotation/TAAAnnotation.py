@@ -193,7 +193,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 return
         
         # Show progress
-        progressDialog = slicer.util.createProgressDialog(labelText="Submitting...", maximum=5)
+        progressDialog = slicer.util.createProgressDialog(labelText="Submitting...", maximum=6)
         
         try:
             progressDialog.setValue(1)
@@ -207,32 +207,47 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 path = os.path.join(export_dir, f"{self.logic.currentId}_refined_mask.seg.nrrd")
                 slicer.util.saveNode(self.logic.segNode, path)
                 files["refined_mask"] = path
+                print(f"[Submit] Saved refined mask: {path}")
             
             progressDialog.setValue(2)
             slicer.app.processEvents()
             
-            # Save centerline
-            try:
-                node = slicer.util.getNode("*Centerline*")
-                if node:
-                    path = os.path.join(export_dir, f"{self.logic.currentId}_Centerline.vtk")
-                    slicer.util.saveNode(node, path)
-                    files["centerline"] = path
-            except:
-                pass
+            # Save centerline - use logic node directly
+            if self.logic.centerlineNode:
+                path = os.path.join(export_dir, f"{self.logic.currentId}_Centerline.vtk")
+                slicer.util.saveNode(self.logic.centerlineNode, path)
+                files["centerline"] = path
+                print(f"[Submit] Saved centerline: {path}")
+            else:
+                print("[Submit] WARNING: No centerline node found in logic")
+            
+            progressDialog.setValue(3)
+            slicer.app.processEvents()
+            
+            # Save endpoints - use logic node directly
+            if self.logic.endpointNode:
+                path = os.path.join(export_dir, f"{self.logic.currentId}_Endpoints.fcsv")
+                slicer.util.saveNode(self.logic.endpointNode, path)
+                files["endpoints"] = path
+                print(f"[Submit] Saved endpoints: {path}")
+            else:
+                print("[Submit] WARNING: No endpoints node found in logic")
+            
+            progressDialog.setValue(4)
+            slicer.app.processEvents()
             
             # Save zones
             if self.logic.zoneNode:
                 path = os.path.join(export_dir, f"{self.logic.currentId}_Zones.fcsv")
                 slicer.util.saveNode(self.logic.zoneNode, path)
                 files["zones"] = path
+                print(f"[Submit] Saved zones: {path}")
             
-            progressDialog.setValue(3)
+            progressDialog.setValue(5)
             slicer.app.processEvents()
             
             notes = self.workflowWidget.getNotesText()
             
-            progressDialog.setValue(4)
             progressDialog.setLabelText("Uploading...")
             slicer.app.processEvents()
             
@@ -245,6 +260,8 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.logic.hasUnsavedWork = False
                 self.orthancWidget.markSubmitted()
                 self.orthancWidget.refreshWorklist()
+                # Reset for next study after successful submission
+                self.resetForNextStudy()
             else:
                 slicer.util.errorDisplay(f"Failed: {message}")
                 
@@ -314,6 +331,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         slicer.mrmlScene.Clear(0)
         self.logic.reset()
         self.workflowWidget.resetUI()
+        self.workflowWidget.setOrthancMode(False)  # Reset Orthanc mode
         self.orthancWidget.resetForNextStudy()
         self.workflowWidget.setStatus("Ready for next study")
 

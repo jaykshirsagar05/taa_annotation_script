@@ -224,6 +224,9 @@ class OrthancWorklistWidget(qt.QWidget):
         self.currentStudies = []
         
         filter_idx = self.filterCombo.currentIndex
+        # Handle case where PythonQt returns method instead of property value
+        if callable(filter_idx):
+            filter_idx = filter_idx()
         
         try:
             if self.role == "annotator":

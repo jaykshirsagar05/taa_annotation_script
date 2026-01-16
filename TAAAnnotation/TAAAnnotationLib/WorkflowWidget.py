@@ -28,6 +28,7 @@ class WorkflowWidget(qt.QWidget):
         super().__init__(parent)
         self.centerlinePicker = None
         self.logic = None
+        self.orthancTempDir = ""  # Temporary directory for Orthanc studies
         self._setupUI()
         
     def setLogic(self, logic):
@@ -191,13 +192,18 @@ class WorkflowWidget(qt.QWidget):
         
     # --- Public Methods ---
     
-    def updateUIState(self, phase: int):
+    def updateUIState(self, phase: int, orthancMode: bool = False):
         """Update UI based on workflow phase."""
         self.btnSeg.setEnabled(phase >= 1)
         self.btnVmtk.setEnabled(phase >= 2)
         self.btnClickMode.setEnabled(phase >= 3)
         self.btnQuickSave.setEnabled(phase >= 1)
-        self.btnExport.setEnabled(phase >= 3)
+        
+        # Export only enabled for local workflow, not Orthanc
+        if orthancMode:
+            self.btnExport.setEnabled(False)
+        else:
+            self.btnExport.setEnabled(phase >= 3)
         
     def setCurrentId(self, current_id: str, source: str = ""):
         """Set the current study ID display."""
@@ -383,3 +389,39 @@ class WorkflowWidget(qt.QWidget):
             if ok and newName:
                 self.logic.renameZonePoint(index, newName)
                 self.updateZoneUI()
+    
+    def setOrthancMode(self, enabled: bool):
+        """Enable/disable Orthanc mode - disables local export when using Orthanc."""
+        if enabled:
+            self.btnExport.setEnabled(False)
+            self.btnExport.setToolTip("Using Orthanc workflow - use 'Submit to Orthanc' instead")
+            self.btnExport.setStyleSheet("background-color: #6c757d; color: white; padding: 10px;")
+            self.btnExport.setText("5. Export & Reset (Disabled - Use Orthanc)")
+        else:
+            self.btnExport.setToolTip("")
+            self.btnExport.setStyleSheet("text-align: center; padding: 10px; font-weight: bold; background-color: #007bff; color: white;")
+            self.btnExport.setText("5. Export & Reset")
+    
+    def onOrthancStudyLoaded(self, study_id: str, study_info: dict):
+        """Handle study loaded from Orthanc."""
+        ct_path = study_info.get('_ct_path')
+        unified_path = study_info.get('_unified_path')
+        merged_path = study_info.get('_merged_path')
+        self.orthancTempDir = study_info.get('_temp_dir')
+        
+        # Load using logic
+        self.logic.currentId = study_info['patient_id']
+        self.logic.rootDir = self.orthancTempDir
+        self.logic.loadProcedureDataFromPaths(ct_path, unified_path, merged_path)
+        
+        # Update UI
+        self.workflowWidget.setCurrentId(study_info['patient_id'], "from Orthanc")
+        self.workflowWidget.markDone(1, "Data Loaded (Orthanc)")
+        self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+        
+        # Disable local export when using Orthanc workflow
+        self.workflowWidget.setOrthancMode(True)
+        
+        # Load existing annotations for reviewers
+        if self.orthancWidget.getRole() == "reviewer":
+            self._loadExistingAnnotations(study_id, self.orthancTempDir)
