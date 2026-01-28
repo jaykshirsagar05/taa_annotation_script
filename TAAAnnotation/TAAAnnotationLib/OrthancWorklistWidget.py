@@ -14,7 +14,7 @@ from .OrthancClient import OrthancClient, AnnotationStatus
 
 
 class OrthancLoginWidget(qt.QWidget):
-    """Login panel for Orthanc authentication."""
+    """Login panel for Orthanc authentication via AdminDashboard."""
     
     def __init__(self, orthanc_client: OrthancClient, 
                  on_login_success: Optional[Callable] = None,
@@ -28,11 +28,14 @@ class OrthancLoginWidget(qt.QWidget):
         layout = qt.QVBoxLayout(self)
         
         # Server settings group
-        serverGroup = qt.QGroupBox("Orthanc Server")
+        serverGroup = qt.QGroupBox("Server Connection")
         serverLayout = qt.QFormLayout(serverGroup)
         
-        self.serverUrlEdit = qt.QLineEdit("http://localhost:8042")
-        serverLayout.addRow("Server URL:", self.serverUrlEdit)
+        self.adminUrlEdit = qt.QLineEdit("http://localhost:8000")
+        serverLayout.addRow("Admin Dashboard:", self.adminUrlEdit)
+        
+        self.orthancUrlEdit = qt.QLineEdit("http://localhost:8042")
+        serverLayout.addRow("Orthanc Server:", self.orthancUrlEdit)
         
         layout.addWidget(serverGroup)
         
@@ -51,22 +54,10 @@ class OrthancLoginWidget(qt.QWidget):
         
         layout.addWidget(credGroup)
         
-        # Role selection
-        roleGroup = qt.QGroupBox("Role")
-        roleLayout = qt.QHBoxLayout(roleGroup)
-        
-        self.roleGroup = qt.QButtonGroup(self)
-        self.annotatorRadio = qt.QRadioButton("Annotator")
-        self.annotatorRadio.setChecked(True)
-        self.reviewerRadio = qt.QRadioButton("Reviewer")
-        
-        self.roleGroup.addButton(self.annotatorRadio, 0)
-        self.roleGroup.addButton(self.reviewerRadio, 1)
-        
-        roleLayout.addWidget(self.annotatorRadio)
-        roleLayout.addWidget(self.reviewerRadio)
-        
-        layout.addWidget(roleGroup)
+        # Note: Role is now determined by AdminDashboard, not selected locally
+        roleNote = qt.QLabel("Note: Your role is assigned by the administrator")
+        roleNote.setStyleSheet("color: gray; font-style: italic; font-size: 11px;")
+        layout.addWidget(roleNote)
         
         # Login button
         self.loginButton = qt.QPushButton("Login")
@@ -85,7 +76,8 @@ class OrthancLoginWidget(qt.QWidget):
         
     def onLogin(self):
         """Handle login button click."""
-        server_url = self.serverUrlEdit.text.strip()
+        admin_url = self.adminUrlEdit.text.strip()
+        orthanc_url = self.orthancUrlEdit.text.strip()
         username = self.usernameEdit.text.strip()
         password = self.passwordEdit.text
         
@@ -95,20 +87,20 @@ class OrthancLoginWidget(qt.QWidget):
             return
         
         self.loginButton.setEnabled(False)
-        self.statusLabel.setText("Connecting...")
+        self.statusLabel.setText("Connecting to AdminDashboard...")
         self.statusLabel.setStyleSheet("color: gray;")
         
-        # Update server URL
-        self.orthancClient.server_url = server_url
+        # Update URLs
+        self.orthancClient.admin_url = admin_url
+        self.orthancClient.server_url = orthanc_url
         
-        # Attempt login
+        # Attempt login via AdminDashboard
         success, message = self.orthancClient.login(username, password)
         
         if success:
+            role = self.orthancClient.get_role()
             self.statusLabel.setText(f"✓ {message}")
             self.statusLabel.setStyleSheet("color: green;")
-            
-            role = "reviewer" if self.reviewerRadio.isChecked() else "annotator"
             
             if self.onLoginSuccess:
                 self.onLoginSuccess(role)
@@ -118,8 +110,8 @@ class OrthancLoginWidget(qt.QWidget):
             self.loginButton.setEnabled(True)
     
     def getSelectedRole(self) -> str:
-        """Get the selected role."""
-        return "reviewer" if self.reviewerRadio.isChecked() else "annotator"
+        """Get the authenticated user's role (from AdminDashboard)."""
+        return self.orthancClient.get_role() or "annotator"
 
 
 class OrthancWorklistWidget(qt.QWidget):
@@ -161,7 +153,9 @@ class OrthancWorklistWidget(qt.QWidget):
         self.filterCombo = qt.QComboBox()
         if self.role == "annotator":
             self.filterCombo.addItems(["My Worklist", "All Pending", "My In Progress", "Rejected"])
-        else:
+        elif self.role == "admin":
+            self.filterCombo.addItems(["All Studies", "Pending", "In Progress", "Annotated", "In Review", "Ground Truth"])
+        else:  # reviewer
             self.filterCombo.addItems(["My Worklist", "Awaiting Review", "My In Review", "Ground Truth"])
         self.filterCombo.currentIndexChanged.connect(self.refreshWorklist)
         filterLayout.addWidget(self.filterCombo)
@@ -224,7 +218,6 @@ class OrthancWorklistWidget(qt.QWidget):
         self.currentStudies = []
         
         filter_idx = self.filterCombo.currentIndex
-        # Handle case where PythonQt returns method instead of property value
         if callable(filter_idx):
             filter_idx = filter_idx()
         
@@ -240,6 +233,20 @@ class OrthancWorklistWidget(qt.QWidget):
                               and s.get("annotator") == self.orthancClient.current_user]
                 else:  # Rejected
                     studies = self.orthancClient.query_studies_by_status(AnnotationStatus.REJECTED)
+            elif self.role == "admin":
+                # Admin can see all studies with different filters
+                if filter_idx == 0:  # All Studies
+                    studies = self.orthancClient.get_all_studies()
+                elif filter_idx == 1:  # Pending
+                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.PENDING)
+                elif filter_idx == 2:  # In Progress
+                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.IN_PROGRESS)
+                elif filter_idx == 3:  # Annotated
+                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.ANNOTATED)
+                elif filter_idx == 4:  # In Review
+                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.IN_REVIEW)
+                else:  # Ground Truth
+                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.GROUND_TRUTH)
             else:  # reviewer
                 if filter_idx == 0:  # My Worklist
                     studies = self.orthancClient.get_worklist("reviewer")
@@ -331,6 +338,11 @@ class OrthancWorklistWidget(qt.QWidget):
             self.loadButton.setEnabled(status == "in_progress" and annotator == current_user)
             # Can release if in_progress and claimed by self
             self.releaseButton.setEnabled(status == "in_progress" and annotator == current_user)
+        elif self.role == "admin":
+            # Admin can claim any study, load any in-progress/in-review study
+            self.claimButton.setEnabled(status in ["pending", "rejected", "annotated"])
+            self.loadButton.setEnabled(status in ["in_progress", "in_review"])
+            self.releaseButton.setEnabled(status in ["in_progress", "in_review"])
         else:  # reviewer
             # Can claim if annotated
             self.claimButton.setEnabled(status == "annotated")

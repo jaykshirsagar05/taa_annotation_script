@@ -174,6 +174,12 @@ class OrthancIntegrationWidget(qt.QWidget):
             self.btnApprove.setVisible(False)
             self.btnReject.setVisible(False)
             self.reviewCommentsEdit.setVisible(False)
+        elif role == "admin":
+            # Admin can do both submit and review
+            self.btnSubmit.setVisible(True)
+            self.btnApprove.setVisible(True)
+            self.btnReject.setVisible(True)
+            self.reviewCommentsEdit.setVisible(True)
         else:  # reviewer
             self.btnSubmit.setVisible(False)
             self.btnApprove.setVisible(True)

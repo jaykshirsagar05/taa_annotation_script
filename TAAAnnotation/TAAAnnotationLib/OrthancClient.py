@@ -2,10 +2,15 @@
 OrthancClient.py - REST API client for Orthanc PACS server integration.
 
 Handles:
-- Authentication with Orthanc server
-- Query/retrieve studies and series
+- Authentication via AdminDashboard (centralized user management)
+- Query/retrieve studies and series from Orthanc
 - Upload/download NIfTI attachments
 - Annotation lifecycle metadata management
+
+Architecture:
+- Slicer client authenticates with AdminDashboard to get user role/token
+- Orthanc access uses credentials configured on server side
+- User role determines available workflow actions
 """
 
 import requests
@@ -30,11 +35,13 @@ class AnnotationStatus(Enum):
 
 class OrthancClient:
     """
-    REST client for Orthanc PACS server.
+    REST client for Orthanc PACS server with AdminDashboard authentication.
     
-    Uses Orthanc's built-in HTTP Basic authentication and stores
-    annotation metadata as attachments (JSON) and NIfTI files as
-    binary attachments for MVP simplicity.
+    Authentication Flow:
+        1. Client calls login() with AdminDashboard credentials
+        2. AdminDashboard validates user and returns JWT token + role
+        3. Client uses token for subsequent API calls
+        4. Orthanc access is proxied through AdminDashboard or uses shared creds
     
     Attachment Types Used:
         - 1024: annotation_metadata.json (custom metadata)
@@ -59,60 +66,160 @@ class OrthancClient:
     ATTACHMENT_ENDPOINTS = 1031
     ATTACHMENT_NOTES = 1032
     
-    def __init__(self, server_url: str = "http://localhost:8042"):
+    def __init__(self, orthanc_url: str = "http://localhost:8042",
+                 admin_dashboard_url: str = "http://localhost:7777"):
         """
-        Initialize Orthanc client.
+        Initialize Orthanc client with AdminDashboard integration.
         
         Args:
-            server_url: Base URL of Orthanc server (default: http://localhost:8042)
+            orthanc_url: Base URL of Orthanc server
+            admin_dashboard_url: Base URL of AdminDashboard API
         """
-        self.server_url = server_url.rstrip('/')
-        self.auth: Optional[Tuple[str, str]] = None
+        self.server_url = orthanc_url.rstrip('/')
+        self.admin_url = admin_dashboard_url.rstrip('/')
+        
+        # Authentication state
+        self.auth_token: Optional[str] = None
         self.current_user: Optional[str] = None
+        self.user_role: Optional[str] = None
+        self.user_id: Optional[int] = None
+        self.assigned_series: List[str] = []
+        
+        # Orthanc basic auth (obtained from AdminDashboard or config)
+        self.orthanc_auth: Optional[Tuple[str, str]] = None
+        
         self.session = requests.Session()
         
     def login(self, username: str, password: str) -> Tuple[bool, str]:
         """
-        Authenticate with Orthanc server using HTTP Basic Auth.
+        Authenticate with AdminDashboard to get user role and token.
+        
+        The AdminDashboard validates credentials against its user database
+        and returns the user's role, which determines available actions.
         
         Args:
-            username: Orthanc username
-            password: Orthanc password
+            username: AdminDashboard username
+            password: AdminDashboard password
             
         Returns:
             Tuple of (success: bool, message: str)
         """
-        self.auth = (username, password)
-        self.session.auth = self.auth
-        
         try:
-            response = self.session.get(f"{self.server_url}/system", timeout=10)
+            # Authenticate with AdminDashboard
+            response = requests.post(
+                f"{self.admin_url}/auth/api/login",
+                json={"username": username, "password": password},
+                timeout=10
+            )
+            
             if response.status_code == 200:
-                self.current_user = username
-                system_info = response.json()
-                return True, f"Connected to Orthanc {system_info.get('Version', 'unknown')}"
+                data = response.json()
+                if data.get("success"):
+                    self.auth_token = data["token"]
+                    self.current_user = data["user"]["username"]
+                    self.user_role = data["user"]["role"]
+                    self.user_id = data["user"]["id"]
+                    self.assigned_series = data["user"].get("assigned_series_uids", [])
+                    
+                    # Now verify Orthanc connectivity
+                    orthanc_ok, orthanc_msg = self._verify_orthanc_connection()
+                    if orthanc_ok:
+                        return True, f"Logged in as {self.current_user} ({self.user_role})"
+                    else:
+                        return True, f"Logged in but Orthanc unavailable: {orthanc_msg}"
+                else:
+                    return False, data.get("error", "Authentication failed")
             elif response.status_code == 401:
-                self.auth = None
-                self.current_user = None
-                return False, "Authentication failed: Invalid credentials"
+                return False, "Invalid credentials"
             else:
-                return False, f"Connection failed: HTTP {response.status_code}"
+                return False, f"Server error: HTTP {response.status_code}"
+                
         except requests.exceptions.ConnectionError:
-            return False, f"Cannot connect to Orthanc server at {self.server_url}"
+            return False, f"Cannot connect to AdminDashboard at {self.admin_url}"
         except requests.exceptions.Timeout:
             return False, "Connection timed out"
         except Exception as e:
-            return False, f"Connection error: {str(e)}"
+            return False, f"Login error: {str(e)}"
     
+    def _verify_orthanc_connection(self) -> Tuple[bool, str]:
+        """
+        Verify connectivity to Orthanc server.
+        
+        Orthanc credentials are typically configured on the server side.
+        This method tests if Orthanc is reachable.
+        """
+        try:
+            # Try to connect to Orthanc (may need auth from config)
+            response = self.session.get(f"{self.server_url}/system", timeout=10)
+            if response.status_code == 200:
+                system_info = response.json()
+                return True, f"Orthanc {system_info.get('Version', 'unknown')}"
+            elif response.status_code == 401:
+                # Need to get Orthanc credentials - could be from AdminDashboard config
+                return False, "Orthanc requires authentication"
+            else:
+                return False, f"Orthanc HTTP {response.status_code}"
+        except Exception as e:
+            return False, str(e)
+    
+    def set_orthanc_credentials(self, username: str, password: str):
+        """
+        Set Orthanc server credentials for direct access.
+        
+        In production, these may be obtained from AdminDashboard config
+        or be the same as user credentials.
+        """
+        self.orthanc_auth = (username, password)
+        self.session.auth = self.orthanc_auth
+        
     def logout(self):
         """Clear authentication state."""
-        self.auth = None
+        self.auth_token = None
         self.current_user = None
+        self.user_role = None
+        self.user_id = None
+        self.assigned_series = []
+        self.orthanc_auth = None
         self.session.auth = None
         
     def is_authenticated(self) -> bool:
-        """Check if client is authenticated."""
-        return self.auth is not None and self.current_user is not None
+        """Check if client is authenticated with AdminDashboard."""
+        return self.auth_token is not None and self.current_user is not None
+    
+    def get_role(self) -> Optional[str]:
+        """Get the authenticated user's role from AdminDashboard."""
+        return self.user_role
+    
+    def validate_token(self) -> Tuple[bool, str]:
+        """Validate the current token with AdminDashboard."""
+        if not self.auth_token:
+            return False, "No token"
+        
+        try:
+            response = requests.post(
+                f"{self.admin_url}/auth/api/validate-token",
+                json={"token": self.auth_token},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("valid"):
+                    # Update user info in case it changed
+                    user = data["user"]
+                    self.user_role = user["role"]
+                    self.assigned_series = user.get("assigned_series_uids", [])
+                    return True, "Token valid"
+                return False, data.get("error", "Invalid token")
+            return False, f"Server error: {response.status_code}"
+        except Exception as e:
+            return False, str(e)
+    
+    def _get_auth_headers(self) -> Dict[str, str]:
+        """Get authorization headers for API requests."""
+        headers = {}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        return headers
     
     # -------------------------------------------------------------------------
     # Study/Series Query Methods
@@ -189,7 +296,7 @@ class OrthancClient:
     
     def query_studies_by_status(self, status: AnnotationStatus) -> List[Dict[str, Any]]:
         """
-        Query studies filtered by annotation status.
+        Query studies filtered by annotation status via AdminDashboard.
         
         Args:
             status: AnnotationStatus enum value
@@ -197,108 +304,121 @@ class OrthancClient:
         Returns:
             List of studies matching the status
         """
-        all_studies = self.get_all_studies()
-        return [s for s in all_studies if s.get("annotation_status") == status.value]
+        try:
+            response = requests.get(
+                f"{self.admin_url}/studies/api/by-status/{status.value}",
+                headers=self._get_auth_headers(),
+                timeout=30
+            )
+            if response.status_code == 200:
+                return response.json()
+            else:
+                print(f"[OrthancClient] Failed to query by status: HTTP {response.status_code}")
+                return []
+        except Exception as e:
+            print(f"[OrthancClient] Error querying studies by status: {e}")
+            # Fallback to direct Orthanc query
+            all_studies = self.get_all_studies()
+            return [s for s in all_studies if s.get("annotation_status") == status.value]
     
-    def get_worklist(self, role: str = "annotator") -> List[Dict[str, Any]]:
+    def get_worklist(self, role: str = None) -> List[Dict[str, Any]]:
         """
-        Get worklist based on user role.
+        Get worklist based on user role from AdminDashboard.
+        
+        Uses the authenticated user's role from AdminDashboard database,
+        not a locally selected role.
         
         Args:
-            role: "annotator" or "reviewer"
+            role: Override role (optional, defaults to authenticated role)
             
         Returns:
             List of studies for the worklist
         """
+        effective_role = role or self.user_role
+        
+        try:
+            params = {"role": effective_role} if effective_role else {}
+            response = requests.get(
+                f"{self.admin_url}/studies/api/worklist",
+                headers=self._get_auth_headers(),
+                params=params,
+                timeout=30
+            )
+            if response.status_code == 200:
+                return response.json()
+            else:
+                print(f"[OrthancClient] Failed to get worklist: HTTP {response.status_code}")
+                # Fallback to local filtering
+                return self._get_worklist_fallback(effective_role)
+        except Exception as e:
+            print(f"[OrthancClient] Error fetching worklist: {e}")
+            return self._get_worklist_fallback(effective_role)
+    
+    def _get_worklist_fallback(self, role: str) -> List[Dict[str, Any]]:
+        """Fallback worklist logic when AdminDashboard is unavailable."""
+        if not role:
+            print("[OrthancClient] Warning: No role set, returning all studies")
+            return self.get_all_studies()
+        
         all_studies = self.get_all_studies()
         
         if role == "annotator":
-            # Annotators see: pending, in_progress (their own), rejected
             return [s for s in all_studies 
-                    if s.get("annotation_status") in [
-                        AnnotationStatus.PENDING.value,
-                        AnnotationStatus.REJECTED.value
-                    ] or (
-                        s.get("annotation_status") == AnnotationStatus.IN_PROGRESS.value 
-                        and s.get("annotator") == self.current_user
-                    )]
+                    if s.get("annotation_status") == AnnotationStatus.PENDING.value
+                    or (s.get("annotation_status") == AnnotationStatus.REJECTED.value
+                        and s.get("annotator") == self.current_user)
+                    or (s.get("annotation_status") == AnnotationStatus.IN_PROGRESS.value 
+                        and s.get("annotator") == self.current_user)]
         elif role == "reviewer":
-            # Reviewers see: annotated, in_review (their own)
             return [s for s in all_studies 
                     if s.get("annotation_status") == AnnotationStatus.ANNOTATED.value
-                    or (
-                        s.get("annotation_status") == AnnotationStatus.IN_REVIEW.value
-                        and s.get("reviewer") == self.current_user
-                    )]
+                    or (s.get("annotation_status") == AnnotationStatus.IN_REVIEW.value
+                        and s.get("reviewer") == self.current_user)]
         else:
             return all_studies
     
-    # -------------------------------------------------------------------------
-    # Annotation Metadata Methods
-    # -------------------------------------------------------------------------
-    
-    def get_annotation_metadata(self, study_id: str) -> Optional[Dict[str, Any]]:
+    def claim_study(self, study_id: str, role: str = None) -> Tuple[bool, str]:
         """
-        Get annotation metadata for a study.
+        Claim a study for annotation or review via AdminDashboard.
         
         Args:
             study_id: Orthanc study ID
-            
-        Returns:
-            Metadata dictionary or None
-        """
-        try:
-            response = self.session.get(
-                f"{self.server_url}/studies/{study_id}/attachments/{self.ATTACHMENT_METADATA}/data"
-            )
-            if response.status_code == 200:
-                return json.loads(response.content.decode('utf-8'))
-            return None
-        except Exception as e:
-            print(f"[OrthancClient] Error fetching metadata for {study_id}: {e}")
-            return None
-    
-    def set_annotation_metadata(self, study_id: str, metadata: Dict[str, Any]) -> bool:
-        """
-        Set/update annotation metadata for a study.
-        
-        Args:
-            study_id: Orthanc study ID
-            metadata: Metadata dictionary
-            
-        Returns:
-            Success boolean
-        """
-        try:
-            # Ensure required fields
-            metadata["last_modified"] = datetime.now().isoformat()
-            metadata["last_modified_by"] = self.current_user
-            
-            response = self.session.put(
-                f"{self.server_url}/studies/{study_id}/attachments/{self.ATTACHMENT_METADATA}",
-                data=json.dumps(metadata).encode('utf-8'),
-                headers={"Content-Type": "application/json"}
-            )
-            return response.status_code in [200, 201]
-        except Exception as e:
-            print(f"[OrthancClient] Error setting metadata for {study_id}: {e}")
-            return False
-    
-    def claim_study(self, study_id: str, role: str = "annotator") -> Tuple[bool, str]:
-        """
-        Claim a study for annotation or review.
-        
-        Args:
-            study_id: Orthanc study ID
-            role: "annotator" or "reviewer"
+            role: Override role (optional, defaults to authenticated role)
             
         Returns:
             Tuple of (success, message)
         """
+        effective_role = role or self.user_role
+        if not effective_role:
+            return False, "No role assigned - please contact admin"
+        
+        try:
+            response = requests.post(
+                f"{self.admin_url}/studies/api/{study_id}/claim",
+                headers=self._get_auth_headers(),
+                json={"role": effective_role},
+                timeout=30
+            )
+            data = response.json()
+            
+            if response.status_code == 200 and data.get("success"):
+                return True, data.get("message", "Study claimed successfully")
+            else:
+                return False, data.get("error", f"Claim failed: HTTP {response.status_code}")
+        except Exception as e:
+            print(f"[OrthancClient] Error claiming study via AdminDashboard: {e}")
+            # Fallback to direct Orthanc update
+            return self._claim_study_fallback(study_id, effective_role)
+    
+    def _claim_study_fallback(self, study_id: str, role: str) -> Tuple[bool, str]:
+        """Fallback claim logic when AdminDashboard is unavailable."""
+        if role not in ["annotator", "reviewer", "admin"]:
+            return False, f"Invalid role: {role}"
+        
         metadata = self.get_annotation_metadata(study_id) or {}
         current_status = metadata.get("status", AnnotationStatus.PENDING.value)
         
-        if role == "annotator":
+        if role == "annotator" or (role == "admin" and current_status == AnnotationStatus.PENDING.value):
             if current_status not in [AnnotationStatus.PENDING.value, AnnotationStatus.REJECTED.value]:
                 return False, f"Cannot claim: Study status is '{current_status}'"
             
@@ -306,20 +426,22 @@ class OrthancClient:
             metadata["annotator"] = self.current_user
             metadata["annotation_started"] = datetime.now().isoformat()
             
-        elif role == "reviewer":
+        elif role == "reviewer" or (role == "admin" and current_status == AnnotationStatus.ANNOTATED.value):
             if current_status != AnnotationStatus.ANNOTATED.value:
                 return False, f"Cannot claim for review: Study status is '{current_status}'"
             
             metadata["status"] = AnnotationStatus.IN_REVIEW.value
             metadata["reviewer"] = self.current_user
             metadata["review_started"] = datetime.now().isoformat()
+        else:
+            return False, f"Role '{role}' cannot claim study with status '{current_status}'"
         
-        # Track history
         if "history" not in metadata:
             metadata["history"] = []
         metadata["history"].append({
             "action": f"claimed_by_{role}",
             "user": self.current_user,
+            "user_id": self.user_id,
             "timestamp": datetime.now().isoformat(),
             "previous_status": current_status
         })
@@ -329,35 +451,49 @@ class OrthancClient:
         return False, "Failed to update metadata"
     
     def release_study(self, study_id: str) -> Tuple[bool, str]:
-        """
-        Release a claimed study back to pending.
-        
-        Args:
-            study_id: Orthanc study ID
+        """Release a claimed study back to previous state via AdminDashboard."""
+        try:
+            response = requests.post(
+                f"{self.admin_url}/studies/api/{study_id}/release",
+                headers=self._get_auth_headers(),
+                timeout=30
+            )
+            data = response.json()
             
-        Returns:
-            Tuple of (success, message)
-        """
+            if response.status_code == 200 and data.get("success"):
+                return True, data.get("message", "Study released successfully")
+            else:
+                return False, data.get("error", f"Release failed: HTTP {response.status_code}")
+        except Exception as e:
+            print(f"[OrthancClient] Error releasing study via AdminDashboard: {e}")
+            # Fallback to direct Orthanc update
+            return self._release_study_fallback(study_id)
+    
+    def _release_study_fallback(self, study_id: str) -> Tuple[bool, str]:
+        """Fallback release logic when AdminDashboard is unavailable."""
         metadata = self.get_annotation_metadata(study_id) or {}
         current_status = metadata.get("status")
         
         if current_status == AnnotationStatus.IN_PROGRESS.value:
-            if metadata.get("annotator") != self.current_user:
+            if metadata.get("annotator") != self.current_user and self.user_role != "admin":
                 return False, "Cannot release: Study claimed by different user"
             metadata["status"] = AnnotationStatus.PENDING.value
             metadata["annotator"] = None
             
         elif current_status == AnnotationStatus.IN_REVIEW.value:
-            if metadata.get("reviewer") != self.current_user:
+            if metadata.get("reviewer") != self.current_user and self.user_role != "admin":
                 return False, "Cannot release: Study claimed by different reviewer"
             metadata["status"] = AnnotationStatus.ANNOTATED.value
             metadata["reviewer"] = None
         else:
             return False, f"Cannot release: Status is '{current_status}'"
         
+        if "history" not in metadata:
+            metadata["history"] = []
         metadata["history"].append({
             "action": "released",
             "user": self.current_user,
+            "user_id": self.user_id,
             "timestamp": datetime.now().isoformat(),
             "previous_status": current_status
         })
@@ -367,21 +503,11 @@ class OrthancClient:
         return False, "Failed to update metadata"
     
     # -------------------------------------------------------------------------
-    # NIfTI Attachment Methods
+    # NIfTI Attachment Methods (unchanged)
     # -------------------------------------------------------------------------
     
     def upload_nifti(self, study_id: str, file_path: str, attachment_type: int) -> bool:
-        """
-        Upload a NIfTI file as an attachment to a study.
-        
-        Args:
-            study_id: Orthanc study ID
-            file_path: Local path to NIfTI file
-            attachment_type: Attachment type ID (use class constants)
-            
-        Returns:
-            Success boolean
-        """
+        """Upload a NIfTI file as an attachment to a study."""
         try:
             with open(file_path, 'rb') as f:
                 data = f.read()
@@ -398,17 +524,7 @@ class OrthancClient:
     
     def download_nifti(self, study_id: str, attachment_type: int, 
                        output_path: Optional[str] = None) -> Optional[str]:
-        """
-        Download a NIfTI attachment from a study.
-        
-        Args:
-            study_id: Orthanc study ID
-            attachment_type: Attachment type ID
-            output_path: Optional output path (uses temp file if not provided)
-            
-        Returns:
-            Path to downloaded file or None
-        """
+        """Download a NIfTI attachment from a study."""
         try:
             response = self.session.get(
                 f"{self.server_url}/studies/{study_id}/attachments/{attachment_type}/data"
@@ -416,7 +532,6 @@ class OrthancClient:
             
             if response.status_code == 200:
                 if output_path is None:
-                    # Create temp file with appropriate extension
                     suffix = ".nii.gz" if attachment_type in [
                         self.ATTACHMENT_CT_NIFTI, 
                         self.ATTACHMENT_UNIFIED_MASK,
@@ -430,7 +545,7 @@ class OrthancClient:
                     f.write(response.content)
                 return output_path
             elif response.status_code == 404:
-                return None  # Attachment doesn't exist
+                return None
             else:
                 print(f"[OrthancClient] Download failed: HTTP {response.status_code}")
                 return None
@@ -461,12 +576,7 @@ class OrthancClient:
             return False
     
     def get_study_attachments(self, study_id: str) -> Dict[str, bool]:
-        """
-        Check which standard attachments exist for a study.
-        
-        Returns:
-            Dictionary of attachment names to existence boolean
-        """
+        """Check which standard attachments exist for a study."""
         return {
             "ct_nifti": self.has_attachment(study_id, self.ATTACHMENT_CT_NIFTI),
             "unified_mask": self.has_attachment(study_id, self.ATTACHMENT_UNIFIED_MASK),
@@ -485,21 +595,14 @@ class OrthancClient:
     
     def submit_annotation(self, study_id: str, files: Dict[str, str], 
                           notes: str = "") -> Tuple[bool, str]:
-        """
-        Submit completed annotation for a study.
+        """Submit completed annotation for a study."""
+        # Validate role
+        if self.user_role not in ["annotator", "admin"]:
+            return False, f"Role '{self.user_role}' cannot submit annotations"
         
-        Args:
-            study_id: Orthanc study ID
-            files: Dictionary mapping attachment names to file paths
-                   Keys: "refined_mask", "centerline", "zones", "endpoints"
-            notes: Annotator notes
-            
-        Returns:
-            Tuple of (success, message)
-        """
         metadata = self.get_annotation_metadata(study_id) or {}
         
-        if metadata.get("annotator") != self.current_user:
+        if metadata.get("annotator") != self.current_user and self.user_role != "admin":
             return False, "Cannot submit: Study not claimed by you"
         
         # Upload files
@@ -539,6 +642,7 @@ class OrthancClient:
         metadata["history"].append({
             "action": "annotation_submitted",
             "user": self.current_user,
+            "user_id": self.user_id,
             "timestamp": datetime.now().isoformat(),
             "files_uploaded": uploaded
         })
@@ -548,19 +652,14 @@ class OrthancClient:
         return False, "Failed to update metadata"
     
     def approve_annotation(self, study_id: str, comments: str = "") -> Tuple[bool, str]:
-        """
-        Approve an annotation and promote to ground truth.
+        """Approve an annotation and promote to ground truth."""
+        # Validate role
+        if self.user_role not in ["reviewer", "admin"]:
+            return False, f"Role '{self.user_role}' cannot approve annotations"
         
-        Args:
-            study_id: Orthanc study ID
-            comments: Reviewer comments
-            
-        Returns:
-            Tuple of (success, message)
-        """
         metadata = self.get_annotation_metadata(study_id) or {}
         
-        if metadata.get("reviewer") != self.current_user:
+        if metadata.get("reviewer") != self.current_user and self.user_role != "admin":
             return False, "Cannot approve: Study not claimed by you for review"
         
         metadata["status"] = AnnotationStatus.GROUND_TRUTH.value
@@ -571,6 +670,7 @@ class OrthancClient:
         metadata["history"].append({
             "action": "approved_as_ground_truth",
             "user": self.current_user,
+            "user_id": self.user_id,
             "timestamp": datetime.now().isoformat(),
             "comments": comments
         })
@@ -580,19 +680,14 @@ class OrthancClient:
         return False, "Failed to update metadata"
     
     def reject_annotation(self, study_id: str, reason: str) -> Tuple[bool, str]:
-        """
-        Reject an annotation and send back to annotator.
+        """Reject an annotation and send back to annotator."""
+        # Validate role
+        if self.user_role not in ["reviewer", "admin"]:
+            return False, f"Role '{self.user_role}' cannot reject annotations"
         
-        Args:
-            study_id: Orthanc study ID
-            reason: Rejection reason
-            
-        Returns:
-            Tuple of (success, message)
-        """
         metadata = self.get_annotation_metadata(study_id) or {}
         
-        if metadata.get("reviewer") != self.current_user:
+        if metadata.get("reviewer") != self.current_user and self.user_role != "admin":
             return False, "Cannot reject: Study not claimed by you for review"
         
         if not reason:
@@ -602,11 +697,12 @@ class OrthancClient:
         metadata["review_completed"] = datetime.now().isoformat()
         metadata["rejection_reason"] = reason
         metadata["rejected_by"] = self.current_user
-        metadata["reviewer"] = None  # Clear reviewer so annotator can reclaim
+        metadata["reviewer"] = None
         
         metadata["history"].append({
             "action": "rejected",
             "user": self.current_user,
+            "user_id": self.user_id,
             "timestamp": datetime.now().isoformat(),
             "reason": reason
         })
@@ -621,18 +717,11 @@ class OrthancClient:
     
     def upload_initial_data(self, study_id: str, ct_path: str, 
                             unified_mask_path: str, merged_mask_path: str) -> Tuple[bool, str]:
-        """
-        Upload initial NIfTI data for a study (admin/data prep function).
+        """Upload initial NIfTI data for a study (admin function)."""
+        # Validate role
+        if self.user_role != "admin":
+            return False, "Only admins can upload initial data"
         
-        Args:
-            study_id: Orthanc study ID
-            ct_path: Path to CT NIfTI file
-            unified_mask_path: Path to unified mask NIfTI
-            merged_mask_path: Path to merged mask NIfTI
-            
-        Returns:
-            Tuple of (success, message)
-        """
         uploads = [
             (ct_path, self.ATTACHMENT_CT_NIFTI, "CT"),
             (unified_mask_path, self.ATTACHMENT_UNIFIED_MASK, "unified mask"),
@@ -645,14 +734,14 @@ class OrthancClient:
             if not self.upload_nifti(study_id, path, attachment_type):
                 return False, f"Failed to upload {name}"
         
-        # Initialize metadata
         metadata = {
             "status": AnnotationStatus.PENDING.value,
-            "created": datetime.now().isoformat(),
+            "created": None,
             "created_by": self.current_user,
             "history": [{
                 "action": "data_uploaded",
                 "user": self.current_user,
+                "user_id": self.user_id,
                 "timestamp": datetime.now().isoformat()
             }]
         }
@@ -662,12 +751,7 @@ class OrthancClient:
         return False, "Failed to set metadata"
     
     def get_statistics(self) -> Dict[str, int]:
-        """
-        Get annotation statistics across all studies.
-        
-        Returns:
-            Dictionary of status counts
-        """
+        """Get annotation statistics across all studies."""
         all_studies = self.get_all_studies()
         stats = {status.value: 0 for status in AnnotationStatus}
         
@@ -678,3 +762,64 @@ class OrthancClient:
         
         stats["total"] = len(all_studies)
         return stats
+
+    # -------------------------------------------------------------------------
+    # Annotation Metadata Methods
+    # -------------------------------------------------------------------------
+    
+    def get_annotation_metadata(self, study_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get annotation metadata for a study.
+        
+        Args:
+            study_id: Orthanc study ID
+            
+        Returns:
+            Metadata dictionary or None if not found
+        """
+        try:
+            response = self.session.get(
+                f"{self.server_url}/studies/{study_id}/attachments/{self.ATTACHMENT_METADATA}/data"
+            )
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 404:
+                # No metadata exists yet - return default
+                return {
+                    "status": AnnotationStatus.PENDING.value,
+                    "created": None,
+                    "annotator": None,
+                    "reviewer": None,
+                    "history": []
+                }
+            else:
+                print(f"[OrthancClient] Failed to get metadata: HTTP {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"[OrthancClient] Error getting annotation metadata: {e}")
+            return None
+    
+    def set_annotation_metadata(self, study_id: str, metadata: Dict[str, Any]) -> bool:
+        """
+        Set annotation metadata for a study.
+        
+        Args:
+            study_id: Orthanc study ID
+            metadata: Metadata dictionary to store
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            import json
+            metadata["last_modified"] = datetime.now().isoformat()
+            
+            response = self.session.put(
+                f"{self.server_url}/studies/{study_id}/attachments/{self.ATTACHMENT_METADATA}",
+                data=json.dumps(metadata),
+                headers={"Content-Type": "application/json"}
+            )
+            return response.status_code in [200, 201]
+        except Exception as e:
+            print(f"[OrthancClient] Error setting annotation metadata: {e}")
+            return False

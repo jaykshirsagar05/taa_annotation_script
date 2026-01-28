@@ -4,14 +4,18 @@ import json
 import pydicom
 from pydicom.dataset import FileDataset, FileMetaDataset
 from datetime import datetime
+import argparse
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 # --- CONFIGURATION (CHANGE THIS PATH) ---
-data_folder = r"C:\Users\JayKshirsagar\Documents\taa_ohi_anon\taa_ohi_anon\Scans\Scan_004" 
+data_folder = r"C:\Users\JayKshirsagar\Documents\taa_ohi_anon\taa_ohi_anon\Scans" 
 # C:\Users\JayKshirsagar\Documents\taa_ohi_anon\taa_ohi_anon\Scans\Scan_004
 # Ensure this folder contains: ct_scan_X.nii.gz, X_merged.nii.gz, X_unified_mask_smoothed.nii.gz
 
 ORTHANC_URL = "http://localhost:8042"
-AUTH = ('slicer', 'slicer')
+AUTH = ('orthanc', 'orthanc')
 
 # Attachments IDs from your OrthancClient.py
 IDs = {
@@ -20,6 +24,9 @@ IDs = {
     'MERGED': 1027,
     'METADATA': 1024
 }
+
+# configure basic logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 def create_and_upload_study(folder):
     # 1. Identify Patient ID from filename
@@ -74,7 +81,7 @@ def create_and_upload_study(folder):
     defaults = {
         'CT': os.path.join(folder, ct_file),
         'UNIFIED': os.path.join(folder, f"{patient_id}_unified_mask_smoothed.nii.gz"),
-        'MERGED': os.path.join(folder, f"{patient_id}_merged.nii.gz")
+        'MERGED': os.path.join(folder, f"{patient_id}_merged_mask.nii.gz")
     }
 
     for key, path in defaults.items():
@@ -97,6 +104,25 @@ def create_and_upload_study(folder):
     
     print("✅ Upload Complete!")
 
+def process_folder(folder, dry_run=False, pause=0.5):
+    logging.info(f"Processing folder: {folder}")
+    if dry_run:
+        logging.info("(dry-run) would upload here")
+        return True
+    try:
+        create_and_upload_study(folder)
+        time.sleep(pause)  # small pause to avoid hammering Orthanc
+        return True
+    except Exception:
+        logging.exception(f"Upload failed for {folder}")
+        return False
+
+def find_scan_folders(data_dir, prefix="Scan_"):
+    return sorted([
+        os.path.join(data_dir, name) for name in os.listdir(data_dir)
+        if name.startswith(prefix) and os.path.isdir(os.path.join(data_dir, name))
+    ])
+
 # Run it
 try:
     import pydicom
@@ -106,3 +132,43 @@ except ImportError:
     # slicer.util.pip_install("pydicom")
     # import pydicom
     # create_and_upload_study(data_folder)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Upload multiple scan_{N} folders to Orthanc.")
+    parser.add_argument("--data-dir", default=r"C:\Users\JayKshirsagar\Documents\taa_ohi_anon\taa_ohi_anon\Scans",
+                        help="Root folder containing scan_* subfolders")
+    parser.add_argument("--all", action="store_true", help="Process all scan_* folders")
+    parser.add_argument("--count", type=int, default=0, help="If >0, process only the first N folders (sorted)")
+    parser.add_argument("--scans", nargs="+", help="Specific scan folder names (e.g. scan_000 scan_001)")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel upload workers")
+    parser.add_argument("--dry-run", action="store_true", help="Don't actually upload; just show what would run")
+    parser.add_argument("--pause", type=float, default=0.5, help="Seconds to pause between uploads per worker")
+    args = parser.parse_args()
+
+    if args.scans:
+        folders = [os.path.join(args.data_dir, s) for s in args.scans]
+    else:
+        folders = find_scan_folders(args.data_dir)
+
+    if not args.all and args.count > 0:
+        folders = folders[: args.count]
+
+    if not folders:
+        logging.warning("No scan folders found to process.")
+        exit(0)
+
+    logging.info(f"Found {len(folders)} folders to process (workers={args.workers})")
+
+    successes = 0
+    if args.workers > 1:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = {ex.submit(process_folder, f, args.dry_run, args.pause): f for f in folders}
+            for fut in as_completed(futures):
+                if fut.result():
+                    successes += 1
+    else:
+        for f in folders:
+            if process_folder(f, args.dry_run, args.pause):
+                successes += 1
+
+    logging.info(f"Finished. Successful uploads: {successes}/{len(folders)}")
