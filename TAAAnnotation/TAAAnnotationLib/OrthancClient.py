@@ -93,14 +93,14 @@ class OrthancClient:
     def login(self, username: str, password: str) -> Tuple[bool, str]:
         """
         Authenticate with AdminDashboard to get user role and token.
-        
-        The AdminDashboard validates credentials against its user database
-        and returns the user's role, which determines available actions.
-        
+
+        Falls back to direct Orthanc mode if AdminDashboard is unavailable,
+        using the provided credentials with admin role.
+
         Args:
-            username: AdminDashboard username
-            password: AdminDashboard password
-            
+            username: AdminDashboard username (default: admin)
+            password: AdminDashboard password (default: admin)
+
         Returns:
             Tuple of (success: bool, message: str)
         """
@@ -111,7 +111,7 @@ class OrthancClient:
                 json={"username": username, "password": password},
                 timeout=10
             )
-            
+
             if response.status_code == 200:
                 data = response.json()
                 if data.get("success"):
@@ -120,7 +120,7 @@ class OrthancClient:
                     self.user_role = data["user"]["role"]
                     self.user_id = data["user"]["id"]
                     self.assigned_series = data["user"].get("assigned_series_uids", [])
-                    
+
                     # Now verify Orthanc connectivity
                     orthanc_ok, orthanc_msg = self._verify_orthanc_connection()
                     if orthanc_ok:
@@ -133,13 +133,39 @@ class OrthancClient:
                 return False, "Invalid credentials"
             else:
                 return False, f"Server error: HTTP {response.status_code}"
-                
-        except requests.exceptions.ConnectionError:
-            return False, f"Cannot connect to AdminDashboard at {self.admin_url}"
-        except requests.exceptions.Timeout:
-            return False, "Connection timed out"
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            # AdminDashboard unavailable - fall back to direct Orthanc mode
+            print(f"[OrthancClient] AdminDashboard unavailable, falling back to direct Orthanc mode")
+            return self._login_direct(username, password)
         except Exception as e:
             return False, f"Login error: {str(e)}"
+
+    def _login_direct(self, username: str, password: str) -> Tuple[bool, str]:
+        """
+        Fallback login when AdminDashboard is unavailable.
+
+        Connects directly to Orthanc server with provided credentials
+        and assigns admin role by default.
+        """
+        # Set Orthanc credentials for basic auth
+        self.set_orthanc_credentials(username, password)
+
+        # Verify Orthanc connectivity
+        orthanc_ok, orthanc_msg = self._verify_orthanc_connection()
+        if not orthanc_ok:
+            self.orthanc_auth = None
+            self.session.auth = None
+            return False, f"Cannot connect to Orthanc: {orthanc_msg}"
+
+        # Set user state for offline mode
+        self.auth_token = "offline_mode"
+        self.current_user = username
+        self.user_role = "admin"
+        self.user_id = None
+        self.assigned_series = []
+
+        return True, f"Logged in as {self.current_user} (admin, direct Orthanc mode)"
     
     def _verify_orthanc_connection(self) -> Tuple[bool, str]:
         """
@@ -557,7 +583,7 @@ class OrthancClient:
         """Get file extension for attachment type."""
         extensions = {
             self.ATTACHMENT_REFINED_MASK: ".seg.nrrd",
-            self.ATTACHMENT_CENTERLINE: ".vtk",
+            self.ATTACHMENT_CENTERLINE: ".vtp",
             self.ATTACHMENT_ZONES: ".fcsv",
             self.ATTACHMENT_ENDPOINTS: ".fcsv",
             self.ATTACHMENT_NOTES: ".txt",

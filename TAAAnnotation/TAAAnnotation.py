@@ -13,21 +13,19 @@ import tempfile
 
 class TAAAnnotation(ScriptedLoadableModule):
     """Main module class - defines metadata and help text"""
-    
+
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = "TAA Annotation"
         self.parent.categories = ["Segmentation"]
-        self.parent.dependencies = ["SegmentEditor", "ExtractCenterline"]
+        self.parent.dependencies = ["SegmentEditor"]
         self.parent.contributors = ["University of Ottawa Heart Institute (Canada)"]
         self.parent.helpText = """
         TAA (Thoracic Aortic Aneurysm) Annotation Protocol Module.
         <br><br>
         This module provides a guided workflow for:
         <ul>
-        <li>Loading CT scans from Orthanc PACS or local files</li>
-        <li>Refining segmentation using Segment Editor</li>
-        <li>Extracting centerlines using VMTK</li>
+        <li>Loading CT scans, segmentation masks, and pre-computed centerlines from Orthanc PACS or local files</li>
         <li>Placing zonal landmarks on the centerline</li>
         <li>Exporting and submitting annotated data</li>
         </ul>
@@ -44,27 +42,27 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)
         self.logic = None
-        
+
         # Orthanc integration
         self.orthancClient = OrthancClient()
         self.orthancTempDir = None
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
-        
+
         # Create logic
         self.logic = TAAAnnotationLogic()
-        
+
         # --- Main Layout ---
         mainWidget = qt.QWidget()
         mainLayout = qt.QVBoxLayout(mainWidget)
-        
+
         # --- Header ---
         title = qt.QLabel("TAA Refinement Protocol")
         title.setStyleSheet("font-weight: bold; font-size: 16px; margin-bottom: 10px; color: #333;")
         title.setAlignment(qt.Qt.AlignCenter)
         mainLayout.addWidget(title)
-        
+
         # --- Orthanc Integration Widget ---
         self.orthancWidget = OrthancIntegrationWidget(self.orthancClient)
         self.orthancWidget.studyLoaded.connect(self.onOrthancStudyLoaded)
@@ -73,44 +71,42 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.orthancWidget.annotationRejected.connect(self.onRejectAnnotation)
         self.orthancWidget.loggedOut.connect(self.onOrthancLogout)
         mainLayout.addWidget(self.orthancWidget)
-        
+
         # --- Separator ---
         separator = qt.QFrame()
         separator.setFrameShape(qt.QFrame.HLine)
         separator.setStyleSheet("margin: 10px 0;")
         mainLayout.addWidget(separator)
-        
+
         orLabel = qt.QLabel("— OR load manually below —")
         orLabel.setAlignment(qt.Qt.AlignCenter)
         orLabel.setStyleSheet("color: #999; margin: 5px 0;")
         mainLayout.addWidget(orLabel)
-        
+
         # --- Workflow Widget ---
         self.workflowWidget = WorkflowWidget()
         self.workflowWidget.setLogic(self.logic)
         self.workflowWidget.loadDataRequested.connect(self.onLoadData)
-        self.workflowWidget.refineRequested.connect(self.onRefineSetup)
-        self.workflowWidget.vmtkRequested.connect(self.onVmtkSetup)
         self.workflowWidget.exportRequested.connect(self.onExport)
         self.workflowWidget.quickSaveRequested.connect(self.onQuickSave)
         self.workflowWidget.notesChanged.connect(self.onNotesChanged)
         self.workflowWidget.btnRecover.clicked.connect(self.onRecover)
         self.workflowWidget.btnIgnore.clicked.connect(self.onIgnoreRecovery)
         mainLayout.addWidget(self.workflowWidget)
-        
+
         # Spacer
         mainLayout.addStretch(1)
-        
+
         self.layout.addWidget(mainWidget)
-        
+
         # Initialize autosave
         self.autosaveManager = AutosaveManager(self.logic)
         self.autosaveManager.attemptCrashRecovery(self.workflowWidget.showRecoveryBanner)
-        
+
         # Initialize centerline picker
         self.centerlinePicker = CenterlinePicker(self.logic, self.workflowWidget.updateZoneUI)
         self.workflowWidget.setCenterlinePicker(self.centerlinePicker)
-        
+
         # Initial UI state
         self.workflowWidget.updateUIState(0)
 
@@ -132,18 +128,26 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ct_path = study_info.get('_ct_path')
         unified_path = study_info.get('_unified_path')
         merged_path = study_info.get('_merged_path')
+        centerline_path = study_info.get('_centerline_path')
         self.orthancTempDir = study_info.get('_temp_dir')
-        
+
         # Load using logic
         self.logic.currentId = study_info['patient_id']
         self.logic.rootDir = self.orthancTempDir
-        self.logic.loadProcedureDataFromPaths(ct_path, unified_path, merged_path)
-        
+        self.logic.loadProcedureDataFromPaths(ct_path, unified_path, merged_path, centerline_path)
+
         # Update UI
         self.workflowWidget.setCurrentId(study_info['patient_id'], "from Orthanc")
         self.workflowWidget.markDone(1, "Data Loaded (Orthanc)")
         self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-        
+
+        # Auto-select centerline in combo box if loaded
+        if self.logic.centerlineNode:
+            self.workflowWidget.centerlineCombo.setCurrentNode(self.logic.centerlineNode)
+
+        # Set Orthanc mode (disable local export)
+        self.workflowWidget.setOrthancMode(True)
+
         # Load existing annotations for reviewers
         if self.orthancWidget.getRole() == "reviewer":
             self._loadExistingAnnotations(study_id, self.orthancTempDir)
@@ -158,7 +162,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         )
         if refined_path:
             slicer.util.loadSegmentation(refined_path)
-        
+
         # Download zones
         zones_path = self.orthancClient.download_nifti(
             study_id,
@@ -167,152 +171,227 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         )
         if zones_path:
             slicer.util.loadMarkups(zones_path)
-        
-        # Download centerline
-        centerline_path = self.orthancClient.download_nifti(
-            study_id,
-            OrthancClient.ATTACHMENT_CENTERLINE,
-            os.path.join(temp_dir, f"{self.logic.currentId}_Centerline.vtk")
-        )
-        if centerline_path:
-            slicer.util.loadModel(centerline_path)
+
+        # Download centerline (if not already loaded)
+        if not self.logic.centerlineNode:
+            centerline_path = self.orthancClient.download_nifti(
+                study_id,
+                OrthancClient.ATTACHMENT_CENTERLINE,
+                os.path.join(temp_dir, f"{self.logic.currentId}_Centerline.vtp")
+            )
+            if centerline_path:
+                self.logic.centerlineNode = slicer.util.loadModel(centerline_path)
 
     def onSubmitToOrthanc(self, study_id: str):
-        """Handle annotation submission."""
+        """Handle annotation submission to Orthanc."""
+        print(f"[onSubmitToOrthanc] Called with study_id: {study_id}")
+        
         if not study_id:
             slicer.util.errorDisplay("No Orthanc study loaded")
+            print("[onSubmitToOrthanc] ERROR: study_id is empty")
             return
-        
+
+        # Validate data is loaded
+        if not self.logic.currentId:
+            slicer.util.errorDisplay("No study data loaded")
+            print("[onSubmitToOrthanc] ERROR: logic.currentId is empty")
+            return
+
+        if not self.logic.segNode:
+            slicer.util.errorDisplay("No segmentation loaded")
+            print("[onSubmitToOrthanc] ERROR: segNode is None")
+            return
+
         # Validate zones
         zoneCount = self.logic.zoneNode.GetNumberOfControlPoints() if self.logic.zoneNode else 0
+        print(f"[onSubmitToOrthanc] Zone count: {zoneCount}")
+        
         if zoneCount < 10:
             if not slicer.util.confirmYesNoDisplay(
                 f"Only {zoneCount}/10 zone landmarks placed. Submit anyway?",
                 "Incomplete Zones"
             ):
+                print("[onSubmitToOrthanc] User cancelled submission due to incomplete zones")
                 return
+
+        print("[onSubmitToOrthanc] Starting submission process...")
         
         # Show progress
         progressDialog = slicer.util.createProgressDialog(labelText="Submitting...", maximum=6)
-        
+        progressDialog.setWindowModality(qt.Qt.WindowModal)
+
         try:
             progressDialog.setValue(1)
+            progressDialog.setLabelText("Preparing files...")
             slicer.app.processEvents()
-            
+
             export_dir = tempfile.mkdtemp(prefix="orthanc_submit_")
+            print(f"[onSubmitToOrthanc] Created temp export dir: {export_dir}")
             files = {}
-            
+
             # Save segmentation
             if self.logic.segNode:
                 path = os.path.join(export_dir, f"{self.logic.currentId}_refined_mask.seg.nrrd")
                 slicer.util.saveNode(self.logic.segNode, path)
-                files["refined_mask"] = path
-                print(f"[Submit] Saved refined mask: {path}")
-            
+                if os.path.exists(path):
+                    files["refined_mask"] = path
+                    print(f"[onSubmitToOrthanc] Saved refined mask: {path}")
+                else:
+                    print(f"[onSubmitToOrthanc] WARNING: Failed to save refined mask to {path}")
+
             progressDialog.setValue(2)
+            progressDialog.setLabelText("Saving centerline...")
             slicer.app.processEvents()
-            
-            # Save centerline - use logic node directly
+
+            # Save centerline as .vtp
             if self.logic.centerlineNode:
-                path = os.path.join(export_dir, f"{self.logic.currentId}_Centerline.vtk")
+                path = os.path.join(export_dir, f"{self.logic.currentId}_Centerline.vtp")
                 slicer.util.saveNode(self.logic.centerlineNode, path)
-                files["centerline"] = path
-                print(f"[Submit] Saved centerline: {path}")
+                if os.path.exists(path):
+                    files["centerline"] = path
+                    print(f"[onSubmitToOrthanc] Saved centerline: {path}")
+                else:
+                    print(f"[onSubmitToOrthanc] WARNING: Failed to save centerline to {path}")
             else:
-                print("[Submit] WARNING: No centerline node found in logic")
-            
+                print("[onSubmitToOrthanc] WARNING: No centerline node found in logic")
+
             progressDialog.setValue(3)
+            progressDialog.setLabelText("Saving endpoints...")
             slicer.app.processEvents()
-            
-            # Save endpoints - use logic node directly
+
+            # Save endpoints
             if self.logic.endpointNode:
                 path = os.path.join(export_dir, f"{self.logic.currentId}_Endpoints.fcsv")
                 slicer.util.saveNode(self.logic.endpointNode, path)
-                files["endpoints"] = path
-                print(f"[Submit] Saved endpoints: {path}")
-            else:
-                print("[Submit] WARNING: No endpoints node found in logic")
-            
+                if os.path.exists(path):
+                    files["endpoints"] = path
+                    print(f"[onSubmitToOrthanc] Saved endpoints: {path}")
+                else:
+                    print(f"[onSubmitToOrthanc] WARNING: Failed to save endpoints to {path}")
+
             progressDialog.setValue(4)
+            progressDialog.setLabelText("Saving zones...")
             slicer.app.processEvents()
-            
-            # Save zones
-            if self.logic.zoneNode:
+
+            # Save zones - REQUIRED
+            if self.logic.zoneNode and self.logic.zoneNode.GetNumberOfControlPoints() > 0:
                 path = os.path.join(export_dir, f"{self.logic.currentId}_Zones.fcsv")
                 slicer.util.saveNode(self.logic.zoneNode, path)
-                files["zones"] = path
-                print(f"[Submit] Saved zones: {path}")
-            
+                if os.path.exists(path):
+                    files["zones"] = path
+                    print(f"[onSubmitToOrthanc] Saved zones: {path}")
+                else:
+                    print(f"[onSubmitToOrthanc] WARNING: Failed to save zones to {path}")
+            else:
+                print("[onSubmitToOrthanc] WARNING: No zones to save")
+
+            progressDialog.setValue(5)
+            progressDialog.setLabelText("Getting notes...")
+            slicer.app.processEvents()
+
+            notes = self.workflowWidget.getNotesText()
+            print(f"[onSubmitToOrthanc] Notes length: {len(notes)}")
+
+            progressDialog.setLabelText("Uploading to Orthanc...")
             progressDialog.setValue(5)
             slicer.app.processEvents()
-            
-            notes = self.workflowWidget.getNotesText()
-            
-            progressDialog.setLabelText("Uploading...")
-            slicer.app.processEvents()
-            
+
+            print(f"[onSubmitToOrthanc] Calling submit_annotation with {len(files)} files")
             success, message = self.orthancClient.submit_annotation(study_id, files, notes)
-            
+            print(f"[onSubmitToOrthanc] Submit result: success={success}, message={message}")
+
             progressDialog.close()
-            
+
             if success:
+                print("[onSubmitToOrthanc] Submission successful!")
                 slicer.util.infoDisplay(f"✓ Annotation submitted!\n\n{message}")
                 self.logic.hasUnsavedWork = False
                 self.orthancWidget.markSubmitted()
                 self.orthancWidget.refreshWorklist()
                 # Reset for next study after successful submission
+                print("[onSubmitToOrthanc] Resetting for next study...")
                 self.resetForNextStudy()
+                print("[onSubmitToOrthanc] Reset complete")
             else:
+                print(f"[onSubmitToOrthanc] Submission failed: {message}")
                 slicer.util.errorDisplay(f"Failed: {message}")
-                
+
         except Exception as e:
             progressDialog.close()
-            slicer.util.errorDisplay(f"Error: {str(e)}")
+            error_msg = f"Error: {str(e)}"
+            print(f"[onSubmitToOrthanc] Exception: {error_msg}")
             import traceback
             traceback.print_exc()
+            slicer.util.errorDisplay(error_msg)
 
     def onApproveAnnotation(self, study_id: str):
         """Handle annotation approval."""
+        print(f"[onApproveAnnotation] Called with study_id: {study_id}")
+        
         if not slicer.util.confirmYesNoDisplay(
             "Approve this annotation as ground truth?",
             "Confirm Approval"
         ):
+            print("[onApproveAnnotation] User cancelled approval")
             return
-        
+
         try:
             comments = self.orthancWidget.getReviewComments()
+            print(f"[onApproveAnnotation] Approving with comments: {comments[:50]}...")
             success, message = self.orthancClient.approve_annotation(study_id, comments)
-            
+            print(f"[onApproveAnnotation] Result: success={success}, message={message}")
+
             if success:
+                print("[onApproveAnnotation] Approval successful!")
                 slicer.util.infoDisplay(f"✓ {message}")
                 self.orthancWidget.disableReviewButtons()
                 self.orthancWidget.refreshWorklist()
+                print("[onApproveAnnotation] Resetting for next study...")
                 self.resetForNextStudy()
+                print("[onApproveAnnotation] Reset complete")
             else:
+                print(f"[onApproveAnnotation] Approval failed: {message}")
                 slicer.util.errorDisplay(f"Failed: {message}")
         except Exception as e:
-            slicer.util.errorDisplay(f"Error: {str(e)}")
+            error_msg = f"Error: {str(e)}"
+            print(f"[onApproveAnnotation] Exception: {error_msg}")
+            import traceback
+            traceback.print_exc()
+            slicer.util.errorDisplay(error_msg)
 
     def onRejectAnnotation(self, study_id: str, reason: str):
         """Handle annotation rejection."""
+        print(f"[onRejectAnnotation] Called with study_id: {study_id}")
+        
         if not slicer.util.confirmYesNoDisplay(
             f"Reject this annotation?\n\nReason: {reason[:100]}...",
             "Confirm Rejection"
         ):
+            print("[onRejectAnnotation] User cancelled rejection")
             return
-        
+
         try:
+            print(f"[onRejectAnnotation] Rejecting with reason: {reason[:50]}...")
             success, message = self.orthancClient.reject_annotation(study_id, reason)
-            
+            print(f"[onRejectAnnotation] Result: success={success}, message={message}")
+
             if success:
+                print("[onRejectAnnotation] Rejection successful!")
                 slicer.util.infoDisplay(f"✓ {message}")
                 self.orthancWidget.disableReviewButtons()
                 self.orthancWidget.refreshWorklist()
+                print("[onRejectAnnotation] Resetting for next study...")
                 self.resetForNextStudy()
+                print("[onRejectAnnotation] Reset complete")
             else:
+                print(f"[onRejectAnnotation] Rejection failed: {message}")
                 slicer.util.errorDisplay(f"Failed: {message}")
         except Exception as e:
-            slicer.util.errorDisplay(f"Error: {str(e)}")
+            error_msg = f"Error: {str(e)}"
+            print(f"[onRejectAnnotation] Exception: {error_msg}")
+            import traceback
+            traceback.print_exc()
+            slicer.util.errorDisplay(error_msg)
 
     def onOrthancLogout(self):
         """Handle Orthanc logout."""
@@ -328,24 +407,41 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def resetForNextStudy(self):
         """Reset for next study."""
-        slicer.mrmlScene.Clear(0)
-        self.logic.reset()
-        self.workflowWidget.resetUI()
-        self.workflowWidget.setOrthancMode(False)  # Reset Orthanc mode
-        self.orthancWidget.resetForNextStudy()
-        self.workflowWidget.setStatus("Ready for next study")
+        print("[resetForNextStudy] Starting reset...")
+        try:
+            print("[resetForNextStudy] Disabling centerline picker...")
+            if self.centerlinePicker:
+                self.centerlinePicker.disable()
+            
+            print("[resetForNextStudy] Clearing MRML scene...")
+            slicer.mrmlScene.Clear(0)
+            
+            print("[resetForNextStudy] Resetting logic...")
+            self.logic.reset()
+            
+            print("[resetForNextStudy] Resetting workflow UI...")
+            self.workflowWidget.resetUI()
+            
+            print("[resetForNextStudy] Disabling Orthanc mode...")
+            self.workflowWidget.setOrthancMode(False)
+            
+            print("[resetForNextStudy] Updating UI state...")
+            self.workflowWidget.updateUIState(0)
+            
+            print("[resetForNextStudy] Resetting Orthanc widget...")
+            self.orthancWidget.resetForNextStudy()
+            
+            print("[resetForNextStudy] Setting status message...")
+            self.workflowWidget.setStatus("Ready for next study")
+            
+            print("[resetForNextStudy] Reset complete!")
+        except Exception as e:
+            print(f"[resetForNextStudy] ERROR during reset: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            slicer.util.errorDisplay(f"Error during reset: {str(e)}")
 
     # --- Workflow Handlers ---
-    def onRefineSetup(self):
-        if self.logic.setupRefinement():
-            self.workflowWidget.markDone(2, "Refine Mode")
-            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-
-    def onVmtkSetup(self):
-        if self.logic.setupVMTK():
-            self.workflowWidget.markDone(3, "VMTK Ready")
-            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-
     def onQuickSave(self):
         self.autosaveManager.quickSave()
         self.workflowWidget.setStatus(f"✓ Quick saved at {self.logic.getTimestamp()}")
@@ -428,211 +524,143 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         return filename.replace("ct_scan_", "").replace(".nii.gz", "")
 
     def loadData(self, folderPath):
-        """Load all data for a subject"""
-        import numpy as np
-        
+        """Load all data for a subject from local filesystem."""
         try:
             self.rootDir = folderPath
             detectedId = self.getIdFromFiles(folderPath)
-            
+
             if not detectedId:
                 slicer.util.errorDisplay("Could not find 'ct_scan_*.nii.gz' in folder")
                 return False
-            
+
             self.currentId = detectedId
-            
+
             # Clear scene
             if slicer.mrmlScene.GetNumberOfNodes() > 0:
                 slicer.mrmlScene.Clear(0)
-            
+
             # Define paths
             volPath = os.path.join(folderPath, f"ct_scan_{self.currentId}.nii.gz")
             segPath = os.path.join(folderPath, f"{self.currentId}_unified_mask_smoothed.nii.gz")
             refPath = os.path.join(folderPath, f"{self.currentId}_merged_mask.nii.gz")
-            
+
             # Validate files
-            for path, name in [(volPath, "CT scan"), (segPath, "unified segmentation"), (refPath, "merged segmentation")]:
+            for path, name in [(volPath, "CT scan"), (segPath, "unified segmentation")]:
                 if not os.path.exists(path):
                     slicer.util.errorDisplay(f"Missing {name}: {path}")
                     return False
-            
+
             # Load CT volume
             self.volNode = slicer.util.loadVolume(volPath)
-            
+
             # Load unified segmentation
             tempUnified = slicer.util.loadLabelVolume(segPath)
             self.segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.currentId}_unified")
             slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tempUnified, self.segNode)
             slicer.mrmlScene.RemoveNode(tempUnified)
             self.segNode.CreateClosedSurfaceRepresentation()
-            
-            # Load merged segmentation
-            tempMerged = slicer.util.loadLabelVolume(refPath)
-            self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.currentId}_merged")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tempMerged, self.refNode)
-            slicer.mrmlScene.RemoveNode(tempMerged)
-            self.refNode.CreateClosedSurfaceRepresentation()
-            
-            # Create binarized merged
-            tempMergedBinary = slicer.util.loadLabelVolume(refPath)
-            array = slicer.util.arrayFromVolume(tempMergedBinary)
-            array[array > 0] = 1
-            slicer.util.updateVolumeFromArray(tempMergedBinary, array)
-            
-            self.binarizedMergedNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.currentId}_merged_binary")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tempMergedBinary, self.binarizedMergedNode)
-            slicer.mrmlScene.RemoveNode(tempMergedBinary)
-            self.binarizedMergedNode.CreateClosedSurfaceRepresentation()
-            
+
+            # Load merged segmentation (optional)
+            if os.path.exists(refPath):
+                tempMerged = slicer.util.loadLabelVolume(refPath)
+                self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.currentId}_merged")
+                slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tempMerged, self.refNode)
+                slicer.mrmlScene.RemoveNode(tempMerged)
+                self.refNode.CreateClosedSurfaceRepresentation()
+                self.refNode.GetDisplayNode().SetVisibility(False)
+
             # Set visibility
             self.segNode.GetDisplayNode().SetVisibility(True)
-            self.refNode.GetDisplayNode().SetVisibility(False)
-            self.binarizedMergedNode.GetDisplayNode().SetVisibility(False)
-            
+
+            # Try to load a local centerline file if present
+            import glob
+            centerline_patterns = [
+                os.path.join(folderPath, f"{self.currentId}_Centerline.vtp"),
+                os.path.join(folderPath, f"{self.currentId}_centerline.vtp"),
+            ]
+            for cl_path in centerline_patterns:
+                if os.path.exists(cl_path):
+                    self.centerlineNode = slicer.util.loadModel(cl_path)
+                    print(f"[Loading] Centerline loaded from: {cl_path}")
+                    break
+
             # Setup view
             slicer.app.layoutManager().sliceWidget('Red').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(self.volNode.GetID())
             slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
-            
+
             self.workflowState["phase"] = 1
             self.hasUnsavedWork = True
             return True
-            
+
         except Exception as e:
             slicer.util.errorDisplay(f"Failed to load data: {str(e)}")
             import traceback
             traceback.print_exc()
             return False
 
-    def setupRefinement(self):
-        """Setup segment editor for refinement"""
-        try:
-            if not self.segNode:
-                slicer.util.errorDisplay("No segmentation loaded")
-                return False
-            
-            slicer.util.selectModule("SegmentEditor")
-            
-            segmentEditorNode = slicer.mrmlScene.GetSingletonNode("SegmentEditor", "vtkMRMLSegmentEditorNode")
-            if segmentEditorNode:
-                segmentEditorNode.SetAndObserveSegmentationNode(self.segNode)
-                segmentEditorNode.SetAndObserveSourceVolumeNode(self.volNode)
-            
-            if self.refNode:
-                self.refNode.GetDisplayNode().SetVisibility(False)
-            self.segNode.GetDisplayNode().SetVisibility(True)
-            
-            self.workflowState["phase"] = 2
-            return True
-            
-        except Exception as e:
-            slicer.util.errorDisplay(f"Failed to setup refinement: {str(e)}")
-            return False
+    def loadProcedureDataFromPaths(self, ct_path: str, unified_path: str,
+                                    merged_path: str, centerline_path: str = None):
+        """
+        Load procedure data from explicit file paths (for Orthanc integration).
 
-    def setupVMTK(self):
-        """Setup VMTK centerline extraction"""
-        import vtk
-        import numpy as np
-        
-        try:
-            if not hasattr(slicer.modules, 'extractcenterline'):
-                slicer.util.errorDisplay("VMTK Extension not installed")
-                return False
-            
-            # Export refined segmentation to temporary label volume
-            if not self.segNode:
-                slicer.util.errorDisplay("No refined segmentation available")
-                return False
-            
-            # Create temporary label volume from refined segmentation
-            tempRefinedLabel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "temp_refined_label")
-            slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
-                self.segNode, tempRefinedLabel, slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
-            )
-            
-            # Binarize - merge all labels into single mask
-            array = slicer.util.arrayFromVolume(tempRefinedLabel)
-            array[array > 0] = 1
-            slicer.util.updateVolumeFromArray(tempRefinedLabel, array)
-            
-            # Create segmentation node from binarized volume
-            binarizedRefinedNode = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLSegmentationNode", 
-                f"{self.currentId}_refined_binary"
-            )
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-                tempRefinedLabel, binarizedRefinedNode
-            )
-            binarizedRefinedNode.CreateClosedSurfaceRepresentation()
-            
-            # Clean up temporary label volume
-            slicer.mrmlScene.RemoveNode(tempRefinedLabel)
-            
-            # Setup VMTK module
-            slicer.util.selectModule("ExtractCenterline")
-            slicer.app.processEvents()
-            
-            vmtkWidget = slicer.modules.extractcenterline.widgetRepresentation()
-            if not vmtkWidget:
-                raise RuntimeError("Failed to get VMTK widget")
-            
-            widgetSelf = vmtkWidget.self()
-            parameterNode = widgetSelf._parameterNode
-            
-            if not parameterNode:
-                logic = widgetSelf.logic
-                parameterNode = logic.getParameterNode()
-            
-            # Create output nodes
-            self.networkNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{self.currentId}_Network")
-            self.endpointNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", f"{self.currentId}_Endpoints")
-            self.centerlineNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{self.currentId}_Centerline")
-            
-            # Create surface model from binarized refined mask
-            inputSurfaceModel = None
-            if binarizedRefinedNode:
-                inputSurfaceModel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{self.currentId}_refined_binary_surface")
-                segmentation = binarizedRefinedNode.GetSegmentation()
-                segmentId = segmentation.GetNthSegmentID(0)
-                binarizedRefinedNode.CreateClosedSurfaceRepresentation()
-                polyData = vtk.vtkPolyData()
-                binarizedRefinedNode.GetClosedSurfaceRepresentation(segmentId, polyData)
-                
-                if polyData.GetNumberOfPoints() > 0:
-                    inputSurfaceModel.SetAndObservePolyData(polyData)
-                    inputSurfaceModel.CreateDefaultDisplayNodes()
-                    displayNode = inputSurfaceModel.GetDisplayNode()
-                    if displayNode:
-                        displayNode.SetVisibility(True)
-                        displayNode.SetOpacity(0.3)
-                        displayNode.SetColor(0.8, 0.8, 0.0)
-        
-            # Set node references
-            if inputSurfaceModel:
-                parameterNode.SetNodeReferenceID("InputSurface", inputSurfaceModel.GetID())
-            parameterNode.SetNodeReferenceID("OutputCenterlineModel", self.centerlineNode.GetID())
-            parameterNode.SetNodeReferenceID("NetworkModel", self.networkNode.GetID())
-            parameterNode.SetNodeReferenceID("EndPoints", self.endpointNode.GetID())
-            
-            # Hide other segmentations
-            for node in [self.segNode, self.refNode, self.binarizedMergedNode]:
-                if node:
-                    node.GetDisplayNode().SetVisibility(False)
-            
-            # Hide the temporary binarized node as well (keep only surface visible)
-            if binarizedRefinedNode:
-                binarizedRefinedNode.GetDisplayNode().SetVisibility(False)
-            
-            widgetSelf.updateGUIFromParameterNode()
-            slicer.app.processEvents()
-            
-            self.workflowState["phase"] = 3
-            return True
-        
-        except Exception as e:
-            slicer.util.errorDisplay(f"Failed to setup VMTK: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return False
+        Args:
+            ct_path: Path to CT NIfTI file
+            unified_path: Path to unified mask NIfTI file
+            merged_path: Path to merged mask NIfTI file
+            centerline_path: Path to pre-computed centerline .vtp file (optional)
+        """
+        slicer.mrmlScene.Clear(0)
+
+        # Load CT volume
+        print(f"[Loading] CT from: {ct_path}")
+        self.volNode = slicer.util.loadVolume(ct_path)
+        if not self.volNode:
+            raise RuntimeError(f"Failed to load CT volume from {ct_path}")
+
+        # Load unified segmentation (for editing)
+        print(f"[Loading] Unified mask from: {unified_path}")
+        self.segNode = slicer.util.loadSegmentation(unified_path)
+        if not self.segNode:
+            raise RuntimeError(f"Failed to load unified mask from {unified_path}")
+        self.segNode.SetName(f"{self.currentId}_Segmentation")
+        self.segNode.CreateClosedSurfaceRepresentation()
+
+        # Load merged segmentation (reference, optional)
+        if merged_path and os.path.exists(merged_path):
+            print(f"[Loading] Merged mask from: {merged_path}")
+            mergedLabelNode = slicer.util.loadLabelVolume(merged_path)
+            if mergedLabelNode:
+                self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode",
+                                                                        f"{self.currentId}_Merged")
+                slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                    mergedLabelNode, self.refNode)
+                slicer.mrmlScene.RemoveNode(mergedLabelNode)
+                self.refNode.CreateClosedSurfaceRepresentation()
+                self.refNode.GetDisplayNode().SetVisibility(False)
+
+        # Load pre-computed centerline if provided
+        if centerline_path and os.path.exists(centerline_path):
+            print(f"[Loading] Centerline from: {centerline_path}")
+            self.centerlineNode = slicer.util.loadModel(centerline_path)
+            if self.centerlineNode:
+                self.centerlineNode.SetName(f"{self.currentId}_Centerline")
+                print(f"[Loading] Centerline loaded successfully")
+            else:
+                print(f"[Loading] WARNING: Failed to load centerline from {centerline_path}")
+
+        # Setup views
+        self._setupViews()
+
+        self.workflowState["phase"] = 1
+        self.hasUnsavedWork = False
+
+        print(f"[Loading] Complete - ready for zone landmark placement")
+
+    def _setupViews(self):
+        """Configure 4-up view and background volume."""
+        if self.volNode:
+            slicer.app.layoutManager().sliceWidget('Red').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(self.volNode.GetID())
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
 
     def createZoneNode(self):
         """Create zone fiducial node if needed"""
@@ -653,12 +681,14 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         zoneNode = self.createZoneNode()
         n = zoneNode.GetNumberOfControlPoints()
         zoneNode.AddControlPoint(worldPos[0], worldPos[1], worldPos[2])
-        
+
         label = f"Zone_{n+1}"
-        if pointId >= 0:
+        if isinstance(pointId, int) and pointId >= 0:
             label += f"_P{pointId}"
+        elif isinstance(pointId, str):
+            label = pointId
         zoneNode.SetNthControlPointLabel(n, label)
-        
+
         self.workflowState["zoneCount"] = n + 1
         self.hasUnsavedWork = True
         return label
@@ -686,146 +716,16 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         if self.zoneNode and 0 <= index < self.zoneNode.GetNumberOfControlPoints():
             pos = [0, 0, 0]
             self.zoneNode.GetNthControlPointPosition(index, pos)
-            
+
             for color in ['Red', 'Yellow', 'Green']:
                 sliceWidget = slicer.app.layoutManager().sliceWidget(color)
                 if sliceWidget:
                     offset = pos[2] if color == 'Red' else (pos[1] if color == 'Green' else pos[0])
                     sliceWidget.sliceLogic().SetSliceOffset(offset)
-            
+
             threeDWidget = slicer.app.layoutManager().threeDWidget(0)
             if threeDWidget:
                 threeDWidget.threeDView().setFocalPoint(pos[0], pos[1], pos[2])
-    
-    def loadProcedureDataFromPaths(self, ct_path: str, unified_path: str, merged_path: str):
-        """
-        Load procedure data from explicit file paths (for Orthanc integration).
-        
-        Args:
-            ct_path: Path to CT NIfTI file
-            unified_path: Path to unified mask NIfTI file  
-            merged_path: Path to merged mask NIfTI file
-        """
-        slicer.mrmlScene.Clear(0)
-        
-        # Load CT volume
-        print(f"[Loading] CT from: {ct_path}")
-        self.volNode = slicer.util.loadVolume(ct_path)
-        if not self.volNode:
-            raise RuntimeError(f"Failed to load CT volume from {ct_path}")
-        
-        # Load unified segmentation (for editing)
-        print(f"[Loading] Unified mask from: {unified_path}")
-        unifiedLabelNode = slicer.util.loadLabelVolume(unified_path)
-        if not unifiedLabelNode:
-            raise RuntimeError(f"Failed to load unified mask from {unified_path}")
-        
-        self.segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", 
-                                                        f"{self.currentId}_Segmentation")
-        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-            unifiedLabelNode, self.segNode)
-        slicer.mrmlScene.RemoveNode(unifiedLabelNode)
-        self.segNode.CreateClosedSurfaceRepresentation()
-        
-        # Load merged segmentation (reference)
-        print(f"[Loading] Merged mask from: {merged_path}")
-        mergedLabelNode = slicer.util.loadLabelVolume(merged_path)
-        if mergedLabelNode:
-            # FIXED: Use self.refNode to be compatible with setupRefinement()
-            self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode",
-                                                                    f"{self.currentId}_Merged")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-                mergedLabelNode, self.refNode)
-            slicer.mrmlScene.RemoveNode(mergedLabelNode)
-            self.refNode.CreateClosedSurfaceRepresentation()
-            self.refNode.GetDisplayNode().SetVisibility(False)
-        
-        # Create binarized version for centerline
-        self._createBinarizedMask(merged_path)
-        
-        # Setup views
-        self._setupViews()
-        
-        self.workflowState["phase"] = 1
-        self.hasUnsavedWork = False
-        
-        print(f"[Loading] Complete - ready for annotation")
-
-    def _createBinarizedMask(self, merged_path):
-        """Create binarized mask for centerline extraction from merged mask path."""
-        if not os.path.exists(merged_path):
-            return
-
-        tempMergedBinary = slicer.util.loadLabelVolume(merged_path)
-        array = slicer.util.arrayFromVolume(tempMergedBinary)
-        array[array > 0] = 1
-        slicer.util.updateVolumeFromArray(tempMergedBinary, array)
-            
-        self.binarizedMergedNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.currentId}_merged_binary")
-        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tempMergedBinary, self.binarizedMergedNode)
-        slicer.mrmlScene.RemoveNode(tempMergedBinary)
-        self.binarizedMergedNode.CreateClosedSurfaceRepresentation()
-        self.binarizedMergedNode.GetDisplayNode().SetVisibility(False)
-
-    def _setupViews(self):
-        """Configure 4-up view and background volume."""
-        if self.volNode:
-            slicer.app.layoutManager().sliceWidget('Red').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(self.volNode.GetID())
-        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
-
-    def loadProcedureDataFromPaths(self, ct_path: str, unified_path: str, merged_path: str):
-        """
-        Load procedure data from explicit file paths (for Orthanc integration).
-        
-        Args:
-            ct_path: Path to CT NIfTI file
-            unified_path: Path to unified mask NIfTI file  
-            merged_path: Path to merged mask NIfTI file
-        """
-        slicer.mrmlScene.Clear(0)
-        
-        # Load CT volume
-        print(f"[Loading] CT from: {ct_path}")
-        self.volNode = slicer.util.loadVolume(ct_path)
-        if not self.volNode:
-            raise RuntimeError(f"Failed to load CT volume from {ct_path}")
-        
-        # Load unified segmentation (for editing)
-        print(f"[Loading] Unified mask from: {unified_path}")
-        unifiedLabelNode = slicer.util.loadLabelVolume(unified_path)
-        if not unifiedLabelNode:
-            raise RuntimeError(f"Failed to load unified mask from {unified_path}")
-        
-        self.segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", 
-                                                        f"{self.currentId}_Segmentation")
-        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-            unifiedLabelNode, self.segNode)
-        slicer.mrmlScene.RemoveNode(unifiedLabelNode)
-        self.segNode.CreateClosedSurfaceRepresentation()
-        
-        # Load merged segmentation (reference)
-        print(f"[Loading] Merged mask from: {merged_path}")
-        mergedLabelNode = slicer.util.loadLabelVolume(merged_path)
-        if mergedLabelNode:
-            # FIXED: Use self.refNode to be compatible with setupRefinement()
-            self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode",
-                                                                    f"{self.currentId}_Merged")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-                mergedLabelNode, self.refNode)
-            slicer.mrmlScene.RemoveNode(mergedLabelNode)
-            self.refNode.CreateClosedSurfaceRepresentation()
-            self.refNode.GetDisplayNode().SetVisibility(False)
-        
-        # Create binarized version for centerline
-        self._createBinarizedMask(merged_path)
-        
-        # Setup views
-        self._setupViews()
-        
-        self.workflowState["phase"] = 1
-        self.hasUnsavedWork = False
-        
-        print(f"[Loading] Complete - ready for annotation")
 
 
 #

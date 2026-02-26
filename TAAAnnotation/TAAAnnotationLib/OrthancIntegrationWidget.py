@@ -209,58 +209,65 @@ class OrthancIntegrationWidget(qt.QWidget):
         """Handle study selection from worklist."""
         self.currentStudyId = study_id
         self.currentStudyInfo = study_info
-        
+
         try:
             slicer.util.showStatusMessage("Downloading data from Orthanc...")
             slicer.app.processEvents()
-            
+
             # Create temp directory
             self.tempDir = tempfile.mkdtemp(prefix=f"orthanc_{study_info['patient_id']}_")
-            
+
             # Download files
             ct_path = self.orthancClient.download_nifti(
                 study_id,
                 OrthancClient.ATTACHMENT_CT_NIFTI,
                 os.path.join(self.tempDir, f"ct_scan_{study_info['patient_id']}.nii.gz")
             )
-            
+
             unified_path = self.orthancClient.download_nifti(
                 study_id,
                 OrthancClient.ATTACHMENT_UNIFIED_MASK,
-                os.path.join(self.tempDir, f"{study_info['patient_id']}_unified_mask_smoothed.nii.gz")
+                os.path.join(self.tempDir, f"{study_info['patient_id']}_unified_mask.seg.nrrd")
             )
-            
+
             merged_path = self.orthancClient.download_nifti(
                 study_id,
                 OrthancClient.ATTACHMENT_MERGED_MASK,
                 os.path.join(self.tempDir, f"{study_info['patient_id']}_merged.nii.gz")
             )
-            
-            if not all([ct_path, unified_path, merged_path]):
+
+            # Download pre-computed centerline (.vtp)
+            centerline_path = self.orthancClient.download_nifti(
+                study_id,
+                OrthancClient.ATTACHMENT_CENTERLINE,
+                os.path.join(self.tempDir, f"{study_info['patient_id']}_Centerline.vtp")
+            )
+
+            if not all([ct_path, unified_path]):
                 missing = []
                 if not ct_path: missing.append("CT scan")
                 if not unified_path: missing.append("unified mask")
-                if not merged_path: missing.append("merged mask")
                 slicer.util.errorDisplay(f"Missing required files: {', '.join(missing)}")
                 return
-            
+
             # Enable action buttons
             if self.userRole == "annotator":
                 self.btnSubmit.setEnabled(True)
             else:
                 self.btnApprove.setEnabled(True)
                 self.btnReject.setEnabled(True)
-            
+
             # Emit signal with paths
             study_info['_ct_path'] = ct_path
             study_info['_unified_path'] = unified_path
             study_info['_merged_path'] = merged_path
+            study_info['_centerline_path'] = centerline_path
             study_info['_temp_dir'] = self.tempDir
-            
+
             self.studyLoaded.emit(study_id, study_info)
-            
+
             slicer.util.showStatusMessage(f"Loaded {study_info['patient_id']} from Orthanc", 3000)
-            
+
         except Exception as e:
             slicer.util.errorDisplay(f"Failed to load study: {str(e)}")
             import traceback
@@ -268,7 +275,14 @@ class OrthancIntegrationWidget(qt.QWidget):
             
     def _onSubmit(self):
         """Submit annotation to Orthanc."""
+        print("[Button] Submit button clicked")
+        if not self.currentStudyId:
+            slicer.util.errorDisplay("No study loaded")
+            print("[Button] ERROR: No study loaded")
+            return
+        print(f"[Button] Emitting annotationSubmitted signal with study_id: {self.currentStudyId}")
         self.annotationSubmitted.emit(self.currentStudyId)
+        print("[Button] Signal emitted")
         
     def _onApprove(self):
         """Approve annotation."""

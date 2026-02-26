@@ -43,11 +43,11 @@ class OrthancLoginWidget(qt.QWidget):
         credGroup = qt.QGroupBox("Credentials")
         credLayout = qt.QFormLayout(credGroup)
         
-        self.usernameEdit = qt.QLineEdit()
+        self.usernameEdit = qt.QLineEdit("admin")
         self.usernameEdit.setPlaceholderText("Username")
         credLayout.addRow("Username:", self.usernameEdit)
-        
-        self.passwordEdit = qt.QLineEdit()
+
+        self.passwordEdit = qt.QLineEdit("admin")
         self.passwordEdit.setPlaceholderText("Password")
         self.passwordEdit.setEchoMode(qt.QLineEdit.Password)
         credLayout.addRow("Password:", self.passwordEdit)
@@ -87,7 +87,7 @@ class OrthancLoginWidget(qt.QWidget):
             return
         
         self.loginButton.setEnabled(False)
-        self.statusLabel.setText("Connecting to AdminDashboard...")
+        self.statusLabel.setText("Connecting...")
         self.statusLabel.setStyleSheet("color: gray;")
         
         # Update URLs
