@@ -417,9 +417,12 @@ class OrthancWorklistWidget(qt.QWidget):
             self.studySelected.emit(study_id, study_info)
         elif self.role == "reviewer" and status == "in_review" and reviewer == current_user:
             self.studySelected.emit(study_id, study_info)
+        elif self.role == "admin" and status in ["in_progress", "in_review"]:
+            self.studySelected.emit(study_id, study_info)
         # Otherwise, try to claim first
         elif (self.role == "annotator" and status in ["pending", "rejected"]) or \
-             (self.role == "reviewer" and status == "annotated"):
+             (self.role == "reviewer" and status == "annotated") or \
+             (self.role == "admin" and status in ["pending", "rejected", "annotated"]):
             success, message = self.orthancClient.claim_study(study_id, self.role)
             if success:
                 self.refreshWorklist()

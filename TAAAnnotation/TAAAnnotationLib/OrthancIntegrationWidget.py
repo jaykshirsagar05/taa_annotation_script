@@ -250,10 +250,10 @@ class OrthancIntegrationWidget(qt.QWidget):
                 slicer.util.errorDisplay(f"Missing required files: {', '.join(missing)}")
                 return
 
-            # Enable action buttons
-            if self.userRole == "annotator":
+            # Enable action buttons based on role
+            if self.userRole in ("annotator", "admin"):
                 self.btnSubmit.setEnabled(True)
-            else:
+            if self.userRole in ("reviewer", "admin"):
                 self.btnApprove.setEnabled(True)
                 self.btnReject.setEnabled(True)
 

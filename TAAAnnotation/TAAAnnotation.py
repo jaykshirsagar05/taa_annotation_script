@@ -324,10 +324,78 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             traceback.print_exc()
             slicer.util.errorDisplay(error_msg)
 
+    def _uploadAnnotationFiles(self, study_id: str):
+        """Save annotation data to temp files and upload to Orthanc.
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        export_dir = tempfile.mkdtemp(prefix="orthanc_upload_")
+        uploaded = []
+
+        # Save and upload segmentation
+        if self.logic.segNode:
+            path = os.path.join(export_dir, f"{self.logic.currentId}_refined_mask.seg.nrrd")
+            slicer.util.saveNode(self.logic.segNode, path)
+            if os.path.exists(path):
+                if self.orthancClient.upload_nifti(study_id, path, OrthancClient.ATTACHMENT_REFINED_MASK):
+                    uploaded.append("refined_mask")
+                    print(f"[Upload] Uploaded refined mask")
+                else:
+                    return False, "Failed to upload refined mask"
+
+        # Save and upload centerline
+        if self.logic.centerlineNode:
+            path = os.path.join(export_dir, f"{self.logic.currentId}_Centerline.vtp")
+            slicer.util.saveNode(self.logic.centerlineNode, path)
+            if os.path.exists(path):
+                if self.orthancClient.upload_nifti(study_id, path, OrthancClient.ATTACHMENT_CENTERLINE):
+                    uploaded.append("centerline")
+                    print(f"[Upload] Uploaded centerline")
+                else:
+                    return False, "Failed to upload centerline"
+
+        # Save and upload endpoints
+        if self.logic.endpointNode:
+            path = os.path.join(export_dir, f"{self.logic.currentId}_Endpoints.fcsv")
+            slicer.util.saveNode(self.logic.endpointNode, path)
+            if os.path.exists(path):
+                if self.orthancClient.upload_nifti(study_id, path, OrthancClient.ATTACHMENT_ENDPOINTS):
+                    uploaded.append("endpoints")
+                    print(f"[Upload] Uploaded endpoints")
+                else:
+                    return False, "Failed to upload endpoints"
+
+        # Save and upload zones
+        if self.logic.zoneNode and self.logic.zoneNode.GetNumberOfControlPoints() > 0:
+            path = os.path.join(export_dir, f"{self.logic.currentId}_Zones.fcsv")
+            slicer.util.saveNode(self.logic.zoneNode, path)
+            if os.path.exists(path):
+                if self.orthancClient.upload_nifti(study_id, path, OrthancClient.ATTACHMENT_ZONES):
+                    uploaded.append("zones")
+                    print(f"[Upload] Uploaded zones ({self.logic.zoneNode.GetNumberOfControlPoints()} points)")
+                else:
+                    return False, "Failed to upload zones"
+
+        # Upload notes
+        notes = self.workflowWidget.getNotesText()
+        if notes:
+            try:
+                self.orthancClient.session.put(
+                    f"{self.orthancClient.server_url}/studies/{study_id}/attachments/{OrthancClient.ATTACHMENT_NOTES}",
+                    data=notes.encode('utf-8'),
+                    headers={"Content-Type": "text/plain"}
+                )
+                uploaded.append("notes")
+            except Exception as e:
+                print(f"[Upload] Warning: Failed to upload notes: {e}")
+
+        return True, f"{len(uploaded)} files uploaded: {', '.join(uploaded)}"
+
     def onApproveAnnotation(self, study_id: str):
-        """Handle annotation approval."""
+        """Handle annotation approval. For admin with local data, uploads files first."""
         print(f"[onApproveAnnotation] Called with study_id: {study_id}")
-        
+
         if not slicer.util.confirmYesNoDisplay(
             "Approve this annotation as ground truth?",
             "Confirm Approval"
@@ -336,6 +404,16 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
 
         try:
+            # If there's local annotation data loaded (admin acting as
+            # annotator+reviewer), upload annotation files before approving
+            if self.logic.currentId:
+                print("[onApproveAnnotation] Uploading annotation files before approval...")
+                upload_ok, upload_msg = self._uploadAnnotationFiles(study_id)
+                if not upload_ok:
+                    slicer.util.errorDisplay(f"Failed to upload annotation files: {upload_msg}")
+                    return
+                print(f"[onApproveAnnotation] {upload_msg}")
+
             comments = self.orthancWidget.getReviewComments()
             print(f"[onApproveAnnotation] Approving with comments: {comments[:50]}...")
             success, message = self.orthancClient.approve_annotation(study_id, comments)

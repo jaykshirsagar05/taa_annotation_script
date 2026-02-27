@@ -18,6 +18,7 @@ class CenterlinePicker:
         self.clickObserverTag = None
         self.originalPicker = None
         self.originalCenterlineColor = None
+        self.originalSegOpacity3D = None
         self.cellPicker = None
 
     def toggleClickMode(self, centerlineNode):
@@ -58,7 +59,14 @@ class CenterlinePicker:
             self.originalCenterlineColor = displayNode.GetColor()
             displayNode.SetColor(0, 1, 0)
             displayNode.SetLineWidth(3)
-        
+
+        # Reduce segmentation 3D opacity for better centerline visibility
+        if self.logic.segNode:
+            segDisplay = self.logic.segNode.GetDisplayNode()
+            if segDisplay:
+                self.originalSegOpacity3D = segDisplay.GetOpacity3D()
+                segDisplay.SetOpacity3D(0.5)
+
         # Setup picking
         self._setupPointPicking()
         
@@ -73,7 +81,14 @@ class CenterlinePicker:
             if displayNode:
                 displayNode.SetColor(self.originalCenterlineColor)
                 displayNode.SetLineWidth(1)
-        
+
+        # Restore segmentation 3D opacity
+        if self.logic.segNode and self.originalSegOpacity3D is not None:
+            segDisplay = self.logic.segNode.GetDisplayNode()
+            if segDisplay:
+                segDisplay.SetOpacity3D(self.originalSegOpacity3D)
+            self.originalSegOpacity3D = None
+
         # Remove observer
         self._removePointPicking()
         
@@ -204,7 +219,16 @@ class CenterlinePicker:
             pos[0], pos[1], pos[2], 0
         )
         yellowSlice.sliceLogic().GetSliceNode().SetSliceVisible(False)
-        
+
+        # Jump Red (axial) and Green (coronal) slices to the clicked point
+        redSlice = slicer.app.layoutManager().sliceWidget('Red')
+        if redSlice:
+            redSlice.sliceLogic().SetSliceOffset(pos[2])
+
+        greenSlice = slicer.app.layoutManager().sliceWidget('Green')
+        if greenSlice:
+            greenSlice.sliceLogic().SetSliceOffset(pos[1])
+
         # Create preview plane
         self._createOrUpdatePreviewPlane(pos, n, t1)
 
@@ -215,11 +239,18 @@ class CenterlinePicker:
         if tangents:
             return tangents.GetTuple3(pointId)
         
-        # Fallback: geometric calculation
+        # Fallback: Use immediate neighbors for accurate local tangent
+        # (avoids smoothing over many points which causes misalignment on curved sections)
         nPoints = polydata.GetNumberOfPoints()
+        
+        # Use immediate neighbors (1 point away) for most accurate local tangent
         idxPrev = max(0, pointId - 1)
         idxNext = min(nPoints - 1, pointId + 1)
-        
+
+        if idxPrev == idxNext:
+            # Edge case: only one point
+            return [0, 0, 1]
+
         pPrev = list(polydata.GetPoint(idxPrev))
         pNext = list(polydata.GetPoint(idxNext))
         
@@ -243,9 +274,15 @@ class CenterlinePicker:
         disk.SetRadialResolution(30)
         disk.SetCircumferentialResolution(30)
         
+        # Calculate perpendicular axes
+        # The disk will lie in the xAxis-yAxis plane with normal pointing along 'normal' (tangent)
         yAxis = np.cross(normal, xAxis)
         yAxis = yAxis / np.linalg.norm(yAxis)
         
+        # Build transformation matrix where disk plane is perpendicular to tangent
+        # vtkDiskSource creates disk in XY plane, so we map:
+        # - X and Y axes to directions perpendicular to tangent (in the cutting plane)
+        # - Z axis to the tangent direction (disk normal)
         matrix = vtk.vtkMatrix4x4()
         for i in range(3):
             matrix.SetElement(i, 0, xAxis[i])

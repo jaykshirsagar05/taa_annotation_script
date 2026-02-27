@@ -7,20 +7,19 @@ import json
 DOWNLOAD_FOLDER = r"C:\Users\JayKshirsagar\Downloads\TAA_Review_Exports"
 
 # The Patient ID to search for (make sure this matches your uploaded patient)
-PATIENT_ID = "004"
+PATIENT_ID = "subject001"
 
 ORTHANC_URL = "http://localhost:8042"
 AUTH = ('slicer', 'slicer')
 
-# Attachments IDs from OrthancClient.py
-# These correspond to the artifacts created during the annotation/review cycle
-ATTACHMENTS = {
+# Attachment ID to filename mapping
+ATTACHMENT_NAMES = {
     1024: "annotation_metadata.json",
     1025: "ct_scan.nii.gz",
     1026: "unified_mask_smoothed.nii.gz",
     1027: "merged_mask.nii.gz",
     1028: "refined_mask.seg.nrrd",
-    1029: "centerline.vtk",
+    1029: "centerline.vtp",
     1030: "zones.fcsv",
     1031: "endpoints.fcsv",
     1032: "notes.txt"
@@ -58,11 +57,31 @@ def download_data(download_folder, patient_id):
     study_id = study_ids[-1]
     print(f"Found Study ID: {study_id}")
 
-    # 2. Download Attachments
-    print("Downloading artifacts...")
+    # 2. Query available attachments
+    print("Querying available attachments...")
+    try:
+        resp = requests.get(f"{ORTHANC_URL}/studies/{study_id}/attachments", auth=AUTH)
+        if resp.status_code != 200:
+            print(f"Error querying attachments: {resp.text}")
+            return
+        available_ids = resp.json()
+    except Exception as e:
+        print(f"Error querying attachments: {e}")
+        return
+
+    if not available_ids:
+        print("No attachments found for this study.")
+        return
+
+    # 3. Download available attachments
+    print(f"Downloading {len(available_ids)} artifacts...")
     download_count = 0
     
-    for att_id, filename in ATTACHMENTS.items():
+    for att_id in available_ids:
+        att_id = int(att_id)
+        # Use mapped name or generate a default one
+        filename = ATTACHMENT_NAMES.get(att_id, f"attachment_{att_id}")
+        
         # URL pattern to retrieve attachment content: .../attachments/{id}/data
         url = f"{ORTHANC_URL}/studies/{study_id}/attachments/{att_id}/data"
         
@@ -70,26 +89,18 @@ def download_data(download_folder, patient_id):
         save_name = f"{patient_id}_{filename}"
         save_path = os.path.join(download_folder, save_name)
 
-        r = requests.get(url, auth=AUTH)
-        
-        if r.status_code == 200:
-            with open(save_path, 'wb') as f:
-                f.write(r.content)
-            print(f" [OK] {save_name}")
-            download_count += 1
+        try:
+            r = requests.get(url, auth=AUTH)
             
-            # If it's the metadata JSON, inspect it briefly
-            if att_id == 1024:
-                try:
-                    meta = json.loads(r.content)
-                    print(f"      Current Status: {meta.get('status', 'unknown')}")
-                    print(f"      History Count: {len(meta.get('history', []))}")
-                except: pass
-
-        elif r.status_code == 404:
-            print(f" [MISSING] Attachment {att_id} ({filename}) - Not uploaded yet?")
-        else:
-            print(f" [ERROR] Attachment {att_id}: HTTP {r.status_code}")
+            if r.status_code == 200:
+                with open(save_path, 'wb') as f:
+                    f.write(r.content)
+                print(f" [OK] {save_name}")
+                download_count += 1
+            else:
+                print(f" [ERROR] Attachment {att_id}: HTTP {r.status_code}")
+        except Exception as e:
+            print(f" [ERROR] Attachment {att_id}: {e}")
 
     print(f"\nDownload complete! {download_count} files saved to:\n{download_folder}")
 

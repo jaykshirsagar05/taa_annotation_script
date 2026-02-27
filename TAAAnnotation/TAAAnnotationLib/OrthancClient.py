@@ -664,7 +664,8 @@ class OrthancClient:
         metadata["annotation_completed"] = datetime.now().isoformat()
         metadata["uploaded_files"] = uploaded
         metadata["has_notes"] = bool(notes)
-        
+
+        metadata.setdefault("history", [])
         metadata["history"].append({
             "action": "annotation_submitted",
             "user": self.current_user,
@@ -692,7 +693,8 @@ class OrthancClient:
         metadata["review_completed"] = datetime.now().isoformat()
         metadata["reviewer_comments"] = comments
         metadata["approved_by"] = self.current_user
-        
+
+        metadata.setdefault("history", [])
         metadata["history"].append({
             "action": "approved_as_ground_truth",
             "user": self.current_user,
@@ -724,7 +726,8 @@ class OrthancClient:
         metadata["rejection_reason"] = reason
         metadata["rejected_by"] = self.current_user
         metadata["reviewer"] = None
-        
+
+        metadata.setdefault("history", [])
         metadata["history"].append({
             "action": "rejected",
             "user": self.current_user,
