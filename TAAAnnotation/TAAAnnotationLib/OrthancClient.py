@@ -639,6 +639,8 @@ class OrthancClient:
         metadata["uploaded_files"] = uploaded
         metadata["has_notes"] = bool(notes)
         
+        if "history" not in metadata:
+            metadata["history"] = []
         metadata["history"].append({
             "action": "annotation_submitted",
             "user": self.current_user,
@@ -667,6 +669,8 @@ class OrthancClient:
         metadata["reviewer_comments"] = comments
         metadata["approved_by"] = self.current_user
         
+        if "history" not in metadata:
+            metadata["history"] = []
         metadata["history"].append({
             "action": "approved_as_ground_truth",
             "user": self.current_user,
@@ -699,6 +703,8 @@ class OrthancClient:
         metadata["rejected_by"] = self.current_user
         metadata["reviewer"] = None
         
+        if "history" not in metadata:
+            metadata["history"] = []
         metadata["history"].append({
             "action": "rejected",
             "user": self.current_user,

@@ -117,14 +117,27 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # --- Manual Load Handler ---
     def onLoadData(self):
         """Handle manual data loading from folder."""
+        # Warn if there's unsaved work
+        if self.logic.hasUnsavedWork:
+            if not slicer.util.confirmYesNoDisplay(
+                "You have unsaved work. Loading new data will discard it.\n\nContinue?",
+                "Unsaved Work"
+            ):
+                return
+        
         folderPath = qt.QFileDialog.getExistingDirectory(self.parent, "Select Subject Directory")
         if folderPath:
-            success = self.logic.loadData(folderPath)
-            if success:
-                self.workflowWidget.markDone(1, "Data Loaded")
-                self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-                self.workflowWidget.setStatus(f"✓ Loaded: {self.logic.currentId}")
-                self.workflowWidget.setCurrentId(self.logic.currentId)
+            # Disable buttons during load to prevent double-clicks
+            self.workflowWidget.setButtonsEnabled(False)
+            try:
+                success = self.logic.loadData(folderPath)
+                if success:
+                    self.workflowWidget.markDone(1, "Data Loaded")
+                    self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+                    self.workflowWidget.setStatus(f"✓ Loaded: {self.logic.currentId}")
+                    self.workflowWidget.setCurrentId(self.logic.currentId)
+            finally:
+                self.workflowWidget.setButtonsEnabled(True)
 
     # --- Orthanc Handlers ---
     def onOrthancStudyLoaded(self, study_id: str, study_info: dict):
@@ -181,6 +194,11 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Handle annotation submission."""
         if not study_id:
             slicer.util.errorDisplay("No Orthanc study loaded")
+            return
+        
+        # Validate segmentation exists
+        if not self.logic.segNode:
+            slicer.util.errorDisplay("No segmentation to submit. Please complete refinement first.")
             return
         
         # Validate zones
@@ -337,14 +355,22 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     # --- Workflow Handlers ---
     def onRefineSetup(self):
-        if self.logic.setupRefinement():
-            self.workflowWidget.markDone(2, "Refine Mode")
-            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+        self.workflowWidget.setButtonsEnabled(False)
+        try:
+            if self.logic.setupRefinement():
+                self.workflowWidget.markDone(2, "Refine Mode")
+                self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+        finally:
+            self.workflowWidget.setButtonsEnabled(True)
 
     def onVmtkSetup(self):
-        if self.logic.setupVMTK():
-            self.workflowWidget.markDone(3, "VMTK Ready")
-            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+        self.workflowWidget.setButtonsEnabled(False)
+        try:
+            if self.logic.setupVMTK():
+                self.workflowWidget.markDone(3, "VMTK Ready")
+                self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+        finally:
+            self.workflowWidget.setButtonsEnabled(True)
 
     def onQuickSave(self):
         self.autosaveManager.quickSave()
@@ -393,8 +419,13 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         ScriptedLoadableModuleLogic.__init__(self)
         self.reset()
 
-    def reset(self):
-        """Reset all state"""
+    def reset(self, clearScene=True):
+        """Reset all state.
+        
+        Args:
+            clearScene: If True, clears the MRML scene. Set to False if 
+                        the caller will clear the scene separately.
+        """
         self.currentId = ""
         self.rootDir = ""
         self.volNode = None
@@ -411,7 +442,8 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             "lastSave": None,
             "zoneCount": 0
         }
-        slicer.mrmlScene.Clear(0)
+        if clearScene:
+            slicer.mrmlScene.Clear(0)
 
     def getTimestamp(self):
         from datetime import datetime
@@ -432,18 +464,16 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         import numpy as np
         
         try:
-            self.rootDir = folderPath
             detectedId = self.getIdFromFiles(folderPath)
             
             if not detectedId:
                 slicer.util.errorDisplay("Could not find 'ct_scan_*.nii.gz' in folder")
                 return False
             
+            # Reset state (which also clears scene), then set new ID/dir
+            self.reset()
+            self.rootDir = folderPath
             self.currentId = detectedId
-            
-            # Clear scene
-            if slicer.mrmlScene.GetNumberOfNodes() > 0:
-                slicer.mrmlScene.Clear(0)
             
             # Define paths
             volPath = os.path.join(folderPath, f"ct_scan_{self.currentId}.nii.gz")
@@ -648,15 +678,25 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                 display.SetTextScale(4.0)
         return self.zoneNode
 
-    def addZonePoint(self, worldPos, pointId=-1):
-        """Add a zone point"""
+    def addZonePoint(self, worldPos, zoneName=None):
+        """Add a zone point.
+        
+        Args:
+            worldPos: 3D position (x, y, z)
+            zoneName: Optional label for the zone point
+        
+        Returns:
+            Label string, or None if max zones reached
+        """
         zoneNode = self.createZoneNode()
         n = zoneNode.GetNumberOfControlPoints()
+        
+        if n >= 10:
+            return None
+        
         zoneNode.AddControlPoint(worldPos[0], worldPos[1], worldPos[2])
         
-        label = f"Zone_{n+1}"
-        if pointId >= 0:
-            label += f"_P{pointId}"
+        label = zoneName if zoneName else f"Zone_{n+1}"
         zoneNode.SetNthControlPointLabel(n, label)
         
         self.workflowState["zoneCount"] = n + 1
@@ -772,60 +812,6 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         if self.volNode:
             slicer.app.layoutManager().sliceWidget('Red').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(self.volNode.GetID())
         slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
-
-    def loadProcedureDataFromPaths(self, ct_path: str, unified_path: str, merged_path: str):
-        """
-        Load procedure data from explicit file paths (for Orthanc integration).
-        
-        Args:
-            ct_path: Path to CT NIfTI file
-            unified_path: Path to unified mask NIfTI file  
-            merged_path: Path to merged mask NIfTI file
-        """
-        slicer.mrmlScene.Clear(0)
-        
-        # Load CT volume
-        print(f"[Loading] CT from: {ct_path}")
-        self.volNode = slicer.util.loadVolume(ct_path)
-        if not self.volNode:
-            raise RuntimeError(f"Failed to load CT volume from {ct_path}")
-        
-        # Load unified segmentation (for editing)
-        print(f"[Loading] Unified mask from: {unified_path}")
-        unifiedLabelNode = slicer.util.loadLabelVolume(unified_path)
-        if not unifiedLabelNode:
-            raise RuntimeError(f"Failed to load unified mask from {unified_path}")
-        
-        self.segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", 
-                                                        f"{self.currentId}_Segmentation")
-        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-            unifiedLabelNode, self.segNode)
-        slicer.mrmlScene.RemoveNode(unifiedLabelNode)
-        self.segNode.CreateClosedSurfaceRepresentation()
-        
-        # Load merged segmentation (reference)
-        print(f"[Loading] Merged mask from: {merged_path}")
-        mergedLabelNode = slicer.util.loadLabelVolume(merged_path)
-        if mergedLabelNode:
-            # FIXED: Use self.refNode to be compatible with setupRefinement()
-            self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode",
-                                                                    f"{self.currentId}_Merged")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-                mergedLabelNode, self.refNode)
-            slicer.mrmlScene.RemoveNode(mergedLabelNode)
-            self.refNode.CreateClosedSurfaceRepresentation()
-            self.refNode.GetDisplayNode().SetVisibility(False)
-        
-        # Create binarized version for centerline
-        self._createBinarizedMask(merged_path)
-        
-        # Setup views
-        self._setupViews()
-        
-        self.workflowState["phase"] = 1
-        self.hasUnsavedWork = False
-        
-        print(f"[Loading] Complete - ready for annotation")
 
 
 #

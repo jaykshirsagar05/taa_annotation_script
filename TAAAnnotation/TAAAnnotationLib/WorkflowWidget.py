@@ -125,11 +125,13 @@ class WorkflowWidget(qt.QWidget):
         layout.addWidget(self.notesEdit)
         
     def _createZonesGroup(self, parentLayout):
-        """Create the zones picking group."""
-        self.groupZones = qt.QGroupBox("4. Zonal Landmarks (Preview & Confirm)")
+        """Create the SVS/STS zone landmark picking group."""
+        from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
+
+        self.groupZones = qt.QGroupBox("4. SVS/STS Zonal Landmarks")
         zonesLayout = qt.QVBoxLayout(self.groupZones)
-        
-        # Centerline selector
+
+        # --- Centerline selector ---
         clLayout = qt.QHBoxLayout()
         clLabel = qt.QLabel("Centerline:")
         self.centerlineCombo = slicer.qMRMLNodeComboBox()
@@ -144,53 +146,148 @@ class WorkflowWidget(qt.QWidget):
         clLayout.addWidget(clLabel)
         clLayout.addWidget(self.centerlineCombo)
         zonesLayout.addLayout(clLayout)
-        
-        # Picker buttons
+
+        # --- Zone selector dropdown ---
+        zoneSelLayout = qt.QHBoxLayout()
+        zoneSelLabel = qt.QLabel("Placing:")
+        zoneSelLabel.setStyleSheet("font-weight: bold;")
+        self.zoneSelector = qt.QComboBox()
+        for lm in SVS_STS_LANDMARKS:
+            self.zoneSelector.addItem(
+                f"{lm['id']}: {lm['label']}  \u2014  {lm['name']}"
+            )
+        self.zoneSelector.currentIndexChanged.connect(self._onZoneSelectionChanged)
+        zoneSelLayout.addWidget(zoneSelLabel)
+        zoneSelLayout.addWidget(self.zoneSelector)
+        zonesLayout.addLayout(zoneSelLayout)
+
+        # --- Anatomical instruction panel ---
+        self.lblInstruction = qt.QLabel()
+        self.lblInstruction.setWordWrap(True)
+        self.lblInstruction.setStyleSheet(
+            "background-color: #e8f4fd; border: 1px solid #b8daff; "
+            "border-radius: 4px; padding: 8px; font-size: 12px; color: #004085;"
+        )
+        self._updateInstructionLabel(0)
+        zonesLayout.addWidget(self.lblInstruction)
+
+        # --- Picker / Confirm / Undo buttons ---
         btnLayout = qt.QHBoxLayout()
-        self.btnClickMode = qt.QPushButton("🎯 Start Zone Picker")
-        self.btnClickMode.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;")
+        self.btnClickMode = qt.QPushButton("\U0001f3af Start Zone Picker")
+        self.btnClickMode.setStyleSheet(
+            "background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;"
+        )
         self.btnClickMode.setEnabled(False)
         self.btnClickMode.clicked.connect(self.onToggleClickMode)
         btnLayout.addWidget(self.btnClickMode)
-        
-        self.btnConfirmPoint = qt.QPushButton("✅ Confirm Zone")
-        self.btnConfirmPoint.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; padding: 10px;")
+
+        self.btnConfirmPoint = qt.QPushButton("\u2705 Confirm")
+        self.btnConfirmPoint.setStyleSheet(
+            "background-color: #28a745; color: white; font-weight: bold; padding: 10px;"
+        )
         self.btnConfirmPoint.setEnabled(False)
         self.btnConfirmPoint.clicked.connect(self.onConfirmZone)
         btnLayout.addWidget(self.btnConfirmPoint)
+
+        self.btnUndoPoint = qt.QPushButton("\u21a9 Undo")
+        self.btnUndoPoint.setStyleSheet("padding: 10px;")
+        self.btnUndoPoint.setEnabled(False)
+        self.btnUndoPoint.clicked.connect(self.onUndoZone)
+        btnLayout.addWidget(self.btnUndoPoint)
         zonesLayout.addLayout(btnLayout)
-        
-        # Status labels
+
+        # --- Picker status ---
         self.lblClickStatus = qt.QLabel("Picker: OFF")
         self.lblClickStatus.setStyleSheet("color: #666; font-style: italic;")
         zonesLayout.addWidget(self.lblClickStatus)
-        
-        # Current zone picker instruction
-        self.lblCurrentZone = qt.QLabel("Ready to pick: Zone 0 start")
-        self.lblCurrentZone.setStyleSheet("font-weight: bold; color: #ff6b6b; font-size: 13px; background-color: #fff3cd; padding: 8px; border-radius: 4px;")
-        zonesLayout.addWidget(self.lblCurrentZone)
-        
-        self.btnUndoPoint = qt.QPushButton("↩ Undo Last Point")
-        self.btnUndoPoint.setEnabled(False)
-        self.btnUndoPoint.clicked.connect(self.onUndoZone)
-        zonesLayout.addWidget(self.btnUndoPoint)
-        
-        self.lblZoneCount = qt.QLabel("Zone Points: 0 / 10")
+
+        # --- Progress counter ---
+        self.lblZoneCount = qt.QLabel("Landmarks: 0 / 10")
         self.lblZoneCount.setStyleSheet("font-weight: bold; color: #17a2b8;")
         zonesLayout.addWidget(self.lblZoneCount)
-        
-        # Zone list
-        self.zoneList = qt.QListWidget()
-        self.zoneList.setMaximumHeight(120)
-        self.zoneList.setToolTip("Double-click to jump, right-click to delete")
-        self.zoneList.setContextMenuPolicy(qt.Qt.CustomContextMenu)
-        self.zoneList.itemDoubleClicked.connect(self.onJumpToZone)
-        self.zoneList.customContextMenuRequested.connect(self.onZoneContextMenu)
-        zonesLayout.addWidget(self.zoneList)
-        
+
+        # --- Zone progress table ---
+        self.zoneTable = qt.QTableWidget(10, 3)
+        self.zoneTable.setHorizontalHeaderLabels(["Landmark", "Status", "Position"])
+        self.zoneTable.horizontalHeader().setStretchLastSection(True)
+        self.zoneTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
+        self.zoneTable.setSelectionMode(qt.QAbstractItemView.SingleSelection)
+        self.zoneTable.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
+        self.zoneTable.setMaximumHeight(260)
+        self.zoneTable.verticalHeader().hide()
+        self.zoneTable.setToolTip(
+            "Double-click a row to jump to that landmark.\n"
+            "Right-click for delete / re-place options."
+        )
+        self.zoneTable.itemDoubleClicked.connect(self._onJumpToZoneFromTable)
+        self.zoneTable.setContextMenuPolicy(qt.Qt.CustomContextMenu)
+        self.zoneTable.customContextMenuRequested.connect(self._onZoneTableContextMenu)
+        self.zoneTable.currentCellChanged.connect(self._onZoneTableRowChanged)
+
+        # Populate skeleton rows
+        for i, lm in enumerate(SVS_STS_LANDMARKS):
+            # Column 0 — Landmark abbreviation (coloured + bold)
+            nameItem = qt.QTableWidgetItem(f"{lm['label']}  ({lm['name']})")
+            nameItem.setToolTip(f"{lm['name']}\n{lm['description']}")
+            c = lm["color"]
+            nameItem.setForeground(
+                qt.QColor(int(c[0] * 255), int(c[1] * 255), int(c[2] * 255))
+            )
+            font = nameItem.font()
+            font.setBold(True)
+            nameItem.setFont(font)
+            self.zoneTable.setItem(i, 0, nameItem)
+
+            # Column 1 — Status
+            statusItem = qt.QTableWidgetItem("\u25cb Not placed")
+            statusItem.setForeground(qt.QColor(150, 150, 150))
+            self.zoneTable.setItem(i, 1, statusItem)
+
+            # Column 2 — Coordinates
+            self.zoneTable.setItem(i, 2, qt.QTableWidgetItem("\u2014"))
+
+        self.zoneTable.resizeColumnsToContents()
+        zonesLayout.addWidget(self.zoneTable)
+
         parentLayout.addWidget(self.groupZones)
+
+    # --- Zone instruction helpers ---
+
+    def _updateInstructionLabel(self, zoneIndex):
+        """Update the anatomical instruction for the selected zone."""
+        from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
+        if 0 <= zoneIndex < len(SVS_STS_LANDMARKS):
+            lm = SVS_STS_LANDMARKS[zoneIndex]
+            zone_text = f"  \u2192  <i>{lm['zone_after']}</i>" if lm.get("zone_after") else ""
+            self.lblInstruction.setText(
+                f"<b>\U0001f4cd {lm['name']}</b>{zone_text}<br>"
+                f"<span style='color:#555;'>{lm['description']}</span>"
+            )
+        else:
+            self.lblInstruction.setText("")
+
+    def _onZoneSelectionChanged(self, index):
+        """Zone selector dropdown changed."""
+        self._updateInstructionLabel(index)
+        if self.centerlinePicker:
+            self.centerlinePicker.setSelectedZone(index)
+
+    def _onZoneTableRowChanged(self, row, col, prevRow, prevCol):
+        """Clicking a table row auto-selects that zone in the dropdown."""
+        if 0 <= row < 10:
+            self.zoneSelector.setCurrentIndex(row)
         
     # --- Public Methods ---
+    
+    def setButtonsEnabled(self, enabled: bool):
+        """Enable/disable all workflow buttons to prevent double-clicks during operations."""
+        self.btnLoad.setEnabled(enabled)
+        self.btnSeg.setEnabled(enabled)
+        self.btnVmtk.setEnabled(enabled)
+        self.btnExport.setEnabled(enabled)
+        self.btnQuickSave.setEnabled(enabled)
+        self.btnClickMode.setEnabled(enabled)
+        slicer.app.processEvents()
     
     def updateUIState(self, phase: int, orthancMode: bool = False):
         """Update UI based on workflow phase."""
@@ -243,22 +340,29 @@ class WorkflowWidget(qt.QWidget):
         
     def resetUI(self):
         """Reset UI to initial state."""
+        from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
+
         self.btnLoad.setStyleSheet(self.defaultStyle)
         self.btnLoad.setText("1. Load Data & Initialize")
         self.btnSeg.setStyleSheet(self.defaultStyle)
         self.btnSeg.setText("2. Refine Mask")
         self.btnVmtk.setStyleSheet(self.defaultStyle)
         self.btnVmtk.setText("3. Extract VMTK Centerline")
-        self.btnClickMode.setText("🎯 Start Zone Picker")
-        self.btnClickMode.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;")
+        self._setPickerButtonOff()
         self.btnConfirmPoint.setEnabled(False)
         self.centerlineCombo.setCurrentNode(None)
         self.centerlineCombo.setMRMLScene(slicer.mrmlScene)
-        
-        self.zoneList.clear()
-        self.lblZoneCount.setText("Zone Points: 0 / 10")
-        self.lblCurrentZone.setText("Ready to pick: Zone 0 start")
-        self.lblCurrentZone.setStyleSheet("font-weight: bold; color: #ff6b6b; font-size: 13px; background-color: #fff3cd; padding: 8px; border-radius: 4px;")
+
+        # Reset zone table
+        for i in range(len(SVS_STS_LANDMARKS)):
+            self.zoneTable.item(i, 1).setText("\u25cb Not placed")
+            self.zoneTable.item(i, 1).setForeground(qt.QColor(150, 150, 150))
+            self.zoneTable.item(i, 2).setText("\u2014")
+
+        self.zoneSelector.setCurrentIndex(0)
+        self._updateInstructionLabel(0)
+        self.lblZoneCount.setText("Landmarks: 0 / 10")
+        self.lblZoneCount.setStyleSheet("font-weight: bold; color: #17a2b8;")
         self.lblClickStatus.setText("Picker: OFF")
         self.lblClickStatus.setStyleSheet("color: #666; font-style: italic;")
         self.notesEdit.setPlainText("")
@@ -266,129 +370,219 @@ class WorkflowWidget(qt.QWidget):
         self.lblStatus.setText("Status: Ready for Scan")
         
     def updateZoneUI(self):
-        """Update zone-related UI elements."""
+        """Update the zone progress table and counters."""
+        from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
+
         if not self.logic or not self.logic.zoneNode:
             return
-            
-        count = self.logic.zoneNode.GetNumberOfControlPoints()
-        self.lblZoneCount.setText(f"Zone Points: {count} / 10")
-        self.btnUndoPoint.setEnabled(count > 0)
-        
-        # Update current zone instruction
-        if count < 10:
-            self.lblCurrentZone.setText(f"Ready to pick: Zone {count} start")
-            self.lblCurrentZone.setStyleSheet("font-weight: bold; color: #ff6b6b; font-size: 13px; background-color: #fff3cd; padding: 8px; border-radius: 4px;")
-        else:
-            self.lblCurrentZone.setText("✓ All 10 zones picked!")
-            self.lblCurrentZone.setStyleSheet("font-weight: bold; color: #28a745; font-size: 13px; background-color: #d4edda; padding: 8px; border-radius: 4px;")
-            # Disable picker when all zones are picked
-            if self.centerlinePicker and self.centerlinePicker.isActive:
-                self.centerlinePicker.disable()
-                self.btnClickMode.setText("🎯 Start Zone Picker")
-                self.btnClickMode.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;")
-                self.lblClickStatus.setText("Picker: OFF - All zones complete")
-                self.lblClickStatus.setStyleSheet("color: #28a745; font-weight: bold;")
-        
-        # Update list
-        self.zoneList.clear()
-        for i in range(count):
+
+        totalCPs = self.logic.zoneNode.GetNumberOfControlPoints()
+        self.btnUndoPoint.setEnabled(totalCPs > 0)
+
+        # Build label -> position map for quick lookup
+        labelPosMap = {}
+        for i in range(totalCPs):
             label = self.logic.zoneNode.GetNthControlPointLabel(i)
             pos = [0, 0, 0]
             self.logic.zoneNode.GetNthControlPointPosition(i, pos)
-            self.zoneList.addItem(f"{label}: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
-    
-        # Enable Confirm button if there's a preview point AND we haven't picked all zones yet
-        if self.centerlinePicker and self.centerlinePicker.currentPreviewPos is not None and count < 10:
+            labelPosMap[label] = pos
+
+        # Update table rows
+        placedCount = 0
+        for idx, lm in enumerate(SVS_STS_LANDMARKS):
+            if lm["label"] in labelPosMap:
+                pos = labelPosMap[lm["label"]]
+                self.zoneTable.item(idx, 1).setText("\u2713 Placed")
+                self.zoneTable.item(idx, 1).setForeground(qt.QColor(40, 167, 69))
+                self.zoneTable.item(idx, 2).setText(
+                    f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+                )
+                placedCount += 1
+            else:
+                self.zoneTable.item(idx, 1).setText("\u25cb Not placed")
+                self.zoneTable.item(idx, 1).setForeground(qt.QColor(150, 150, 150))
+                self.zoneTable.item(idx, 2).setText("\u2014")
+
+        # Progress counter
+        self.lblZoneCount.setText(f"Landmarks: {placedCount} / 10")
+
+        if placedCount >= 10:
+            self.lblZoneCount.setStyleSheet("font-weight: bold; color: #28a745;")
+            self.lblZoneCount.setText("\u2713 All 10 landmarks placed!")
+            if self.centerlinePicker and self.centerlinePicker.isActive:
+                self.centerlinePicker.disable()
+                self._setPickerButtonOff()
+                self.lblClickStatus.setText("Picker: OFF \u2014 All zones complete")
+                self.lblClickStatus.setStyleSheet("color: #28a745; font-weight: bold;")
+        else:
+            self.lblZoneCount.setStyleSheet("font-weight: bold; color: #17a2b8;")
+
+        # Enable Confirm button if there is a preview position
+        if (
+            self.centerlinePicker
+            and self.centerlinePicker.currentPreviewPos is not None
+        ):
             self.btnConfirmPoint.setEnabled(True)
         else:
             self.btnConfirmPoint.setEnabled(False)
     
     # --- Zone Event Handlers ---
     
+    # --- Picker button helpers ---
+
+    def _setPickerButtonOn(self):
+        self.btnClickMode.setText("\u23f8 Stop Picker")
+        self.btnClickMode.setStyleSheet(
+            "background-color: #dc3545; color: white; font-weight: bold; padding: 10px;"
+        )
+
+    def _setPickerButtonOff(self):
+        self.btnClickMode.setText("\U0001f3af Start Zone Picker")
+        self.btnClickMode.setStyleSheet(
+            "background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;"
+        )
+
+    # --- Zone Event Handlers ---
+
     def onToggleClickMode(self):
         """Toggle zone picker mode."""
         if not self.centerlinePicker:
             slicer.util.errorDisplay("Centerline picker not initialized")
             return
-            
+
         try:
             centerlineNode = self.centerlineCombo.currentNode()
-            currentCount = self.logic.zoneNode.GetNumberOfControlPoints() if self.logic and self.logic.zoneNode else 0
-            
-            if currentCount >= 10:
-                slicer.util.warningDisplay("All 10 zone landmarks have been picked. Use Undo to remove points if needed.")
+            placedCount = (
+                self.centerlinePicker.getPlacedCount()
+                if self.centerlinePicker
+                else 0
+            )
+
+            if placedCount >= 10:
+                slicer.util.warningDisplay(
+                    "All 10 zone landmarks have been placed.\n"
+                    "Use Undo or right-click a row to modify."
+                )
                 return
-            
+
             result = self.centerlinePicker.toggleClickMode(centerlineNode)
             if result:
+                from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
+
                 if self.centerlinePicker.isActive:
-                    self.btnClickMode.setText("⏸ Stop Picker")
-                    self.btnClickMode.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; padding: 10px;")
-                    self.lblClickStatus.setText(f"Picker: ACTIVE - Click centerline to pick Zone {currentCount} start")
-                    self.lblClickStatus.setStyleSheet("color: #28a745; font-weight: bold;")
+                    self._setPickerButtonOn()
+                    zIdx = self.zoneSelector.currentIndex
+                    lm = SVS_STS_LANDMARKS[zIdx]
+                    self.lblClickStatus.setText(
+                        f"Picker: ACTIVE \u2014 Click centerline to place {lm['label']} ({lm['name']})"
+                    )
+                    self.lblClickStatus.setStyleSheet(
+                        "color: #28a745; font-weight: bold;"
+                    )
                 else:
-                    self.btnClickMode.setText("🎯 Start Zone Picker")
-                    self.btnClickMode.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 10px;")
+                    self._setPickerButtonOff()
                     self.lblClickStatus.setText("Picker: OFF")
-                    self.lblClickStatus.setStyleSheet("color: #666; font-style: italic;")
+                    self.lblClickStatus.setStyleSheet(
+                        "color: #666; font-style: italic;"
+                    )
         except Exception as e:
             slicer.util.errorDisplay(f"Error toggling click mode: {str(e)}")
             import traceback
             traceback.print_exc()
 
     def onConfirmZone(self):
-        """Confirm the current zone point."""
-        if not self.logic:
+        """Confirm the current zone point using the zone selector index."""
+        if not self.logic or not self.centerlinePicker:
             return
-        currentCount = self.logic.zoneNode.GetNumberOfControlPoints() if self.logic.zoneNode else 0
-        zoneName = f"Zone_{currentCount}_start"
-        self.centerlinePicker.confirmZonePoint(zoneName)
-        self.updateZoneUI()
-        self.btnConfirmPoint.setEnabled(False)
-        
-        # Update status
-        newCount = currentCount + 1
-        if newCount < 10:
-            self.lblStatus.setText(f"✓ {zoneName} confirmed. Next: Zone {newCount} start")
-        else:
-            self.lblStatus.setText(f"✓ All 10 zone landmarks complete!")
+
+        from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
+
+        zoneIndex = self.zoneSelector.currentIndex
+        label = self.centerlinePicker.confirmZonePoint(zoneIndex)
+
+        if label:
+            self.updateZoneUI()
+            self.btnConfirmPoint.setEnabled(False)
+
+            # Auto-advance to next unplaced zone
+            nextIdx = self.centerlinePicker.getNextUnplacedZone()
+            if nextIdx >= 0:
+                self.zoneSelector.setCurrentIndex(nextIdx)
+                lm = SVS_STS_LANDMARKS[nextIdx]
+                self.lblStatus.setText(
+                    f"\u2713 {label} confirmed.  Next: {lm['label']} ({lm['name']})"
+                )
+            else:
+                self.lblStatus.setText("\u2713 All 10 zone landmarks complete!")
 
     def onUndoZone(self):
         """Undo last zone point."""
-        if self.logic:
-            self.logic.undoLastZonePoint()
-            self.updateZoneUI()
-
-    def onJumpToZone(self, item):
-        """Jump to zone point on double-click."""
-        if self.logic:
-            index = self.zoneList.row(item)
-            self.logic.jumpToZonePoint(index)
-
-    def onZoneContextMenu(self, position):
-        """Handle zone list context menu."""
-        item = self.zoneList.itemAt(position)
-        if not item or not self.logic:
+        if not self.logic or not self.logic.zoneNode:
             return
-        
-        menu = qt.QMenu()
-        deleteAction = menu.addAction("Delete Point")
-        renameAction = menu.addAction("Rename Point")
-        
-        action = menu.exec_(self.zoneList.mapToGlobal(position))
-        index = self.zoneList.row(item)
-        
-        if action == deleteAction:
-            self.logic.deleteZonePoint(index)
+        n = self.logic.zoneNode.GetNumberOfControlPoints()
+        if n > 0:
+            label = self.logic.zoneNode.GetNthControlPointLabel(n - 1)
+            self.logic.undoLastZonePoint()
+            if self.centerlinePicker:
+                self.centerlinePicker.onLandmarkRemoved(label)
             self.updateZoneUI()
-        elif action == renameAction:
-            newName, ok = qt.QInputDialog.getText(
-                self, "Rename Point", "New label:",
-                qt.QLineEdit.Normal, self.logic.zoneNode.GetNthControlPointLabel(index)
-            )
-            if ok and newName:
-                self.logic.renameZonePoint(index, newName)
-                self.updateZoneUI()
+
+    def _onJumpToZoneFromTable(self, item):
+        """Jump to a zone landmark on double-click in the progress table."""
+        if not self.logic or not self.logic.zoneNode:
+            return
+        from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
+
+        row = item.row()
+        if row < 0 or row >= len(SVS_STS_LANDMARKS):
+            return
+        lm = SVS_STS_LANDMARKS[row]
+        for i in range(self.logic.zoneNode.GetNumberOfControlPoints()):
+            if self.logic.zoneNode.GetNthControlPointLabel(i) == lm["label"]:
+                self.logic.jumpToZonePoint(i)
+                return
+
+    def _onZoneTableContextMenu(self, position):
+        """Right-click menu on zone table: jump / delete / re-place."""
+        from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
+
+        row = self.zoneTable.rowAt(position.y())
+        if row < 0 or row >= len(SVS_STS_LANDMARKS) or not self.logic:
+            return
+
+        lm = SVS_STS_LANDMARKS[row]
+
+        # Find existing control point for this landmark
+        cpIndex = -1
+        if self.logic.zoneNode:
+            for i in range(self.logic.zoneNode.GetNumberOfControlPoints()):
+                if self.logic.zoneNode.GetNthControlPointLabel(i) == lm["label"]:
+                    cpIndex = i
+                    break
+
+        menu = qt.QMenu()
+        jumpAction = None
+        deleteAction = None
+        if cpIndex >= 0:
+            jumpAction = menu.addAction(f"Jump to {lm['label']}")
+            deleteAction = menu.addAction(f"Delete {lm['label']}")
+            menu.addSeparator()
+        replaceAction = menu.addAction(f"Place {lm['label']} next")
+
+        action = menu.exec_(self.zoneTable.viewport().mapToGlobal(position))
+        if action is None:
+            return
+
+        if action == jumpAction and cpIndex >= 0:
+            self.logic.jumpToZonePoint(cpIndex)
+        elif action == deleteAction and cpIndex >= 0:
+            removedLabel = self.logic.zoneNode.GetNthControlPointLabel(cpIndex)
+            self.logic.deleteZonePoint(cpIndex)
+            if self.centerlinePicker:
+                self.centerlinePicker.onLandmarkRemoved(removedLabel)
+            self.updateZoneUI()
+        elif action == replaceAction:
+            self.zoneSelector.setCurrentIndex(row)
     
     def setOrthancMode(self, enabled: bool):
         """Enable/disable Orthanc mode - disables local export when using Orthanc."""
@@ -401,27 +595,3 @@ class WorkflowWidget(qt.QWidget):
             self.btnExport.setToolTip("")
             self.btnExport.setStyleSheet("text-align: center; padding: 10px; font-weight: bold; background-color: #007bff; color: white;")
             self.btnExport.setText("5. Export & Reset")
-    
-    def onOrthancStudyLoaded(self, study_id: str, study_info: dict):
-        """Handle study loaded from Orthanc."""
-        ct_path = study_info.get('_ct_path')
-        unified_path = study_info.get('_unified_path')
-        merged_path = study_info.get('_merged_path')
-        self.orthancTempDir = study_info.get('_temp_dir')
-        
-        # Load using logic
-        self.logic.currentId = study_info['patient_id']
-        self.logic.rootDir = self.orthancTempDir
-        self.logic.loadProcedureDataFromPaths(ct_path, unified_path, merged_path)
-        
-        # Update UI
-        self.workflowWidget.setCurrentId(study_info['patient_id'], "from Orthanc")
-        self.workflowWidget.markDone(1, "Data Loaded (Orthanc)")
-        self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-        
-        # Disable local export when using Orthanc workflow
-        self.workflowWidget.setOrthancMode(True)
-        
-        # Load existing annotations for reviewers
-        if self.orthancWidget.getRole() == "reviewer":
-            self._loadExistingAnnotations(study_id, self.orthancTempDir)

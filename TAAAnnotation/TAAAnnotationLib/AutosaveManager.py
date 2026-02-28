@@ -31,14 +31,28 @@ class AutosaveManager:
             return
         
         try:
+            # Safely get node IDs — nodes may have been deleted from the scene
+            volNodeId = None
+            segNodeId = None
+            try:
+                if self.logic.volNode and self.logic.volNode.GetID():
+                    volNodeId = self.logic.volNode.GetID()
+            except Exception:
+                pass
+            try:
+                if self.logic.segNode and self.logic.segNode.GetID():
+                    segNodeId = self.logic.segNode.GetID()
+            except Exception:
+                pass
+            
             state = {
                 "timestamp": datetime.now().isoformat(),
                 "currentId": self.logic.currentId,
                 "rootDir": self.logic.rootDir,
                 "phase": self.logic.workflowState["phase"],
                 "zoneCount": self.logic.workflowState.get("zoneCount", 0),
-                "volNodeId": self.logic.volNode.GetID() if self.logic.volNode else None,
-                "segNodeId": self.logic.segNode.GetID() if self.logic.segNode else None,
+                "volNodeId": volNodeId,
+                "segNodeId": segNodeId,
             }
             
             with open(self.stateFilePath, 'w') as f:
@@ -99,6 +113,11 @@ class AutosaveManager:
     def quickSave(self):
         """Manual quick save"""
         if not self.logic.currentId:
+            slicer.util.warningDisplay("No data loaded — nothing to save.")
+            return
+        
+        if not self.logic.rootDir or not os.path.isdir(self.logic.rootDir):
+            slicer.util.warningDisplay("Root directory is missing or invalid.")
             return
         
         try:
@@ -107,18 +126,32 @@ class AutosaveManager:
                 os.makedirs(saveDir)
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            savedItems = []
             
             if self.logic.segNode:
-                slicer.util.saveNode(
-                    self.logic.segNode,
-                    os.path.join(saveDir, f"{self.logic.currentId}_WIP_{timestamp}.seg.nrrd")
-                )
+                try:
+                    slicer.util.saveNode(
+                        self.logic.segNode,
+                        os.path.join(saveDir, f"{self.logic.currentId}_WIP_{timestamp}.seg.nrrd")
+                    )
+                    savedItems.append("segmentation")
+                except Exception as e:
+                    print(f"[QuickSave] Failed to save segmentation: {e}")
             
             if self.logic.zoneNode and self.logic.zoneNode.GetNumberOfControlPoints() > 0:
-                slicer.util.saveNode(
-                    self.logic.zoneNode,
-                    os.path.join(saveDir, f"{self.logic.currentId}_Zones_WIP_{timestamp}.fcsv")
-                )
+                try:
+                    slicer.util.saveNode(
+                        self.logic.zoneNode,
+                        os.path.join(saveDir, f"{self.logic.currentId}_Zones_WIP_{timestamp}.fcsv")
+                    )
+                    savedItems.append("zones")
+                except Exception as e:
+                    print(f"[QuickSave] Failed to save zones: {e}")
+            
+            if savedItems:
+                print(f"[QuickSave] Saved {', '.join(savedItems)} to {saveDir}")
+            else:
+                slicer.util.warningDisplay("Nothing to save — no segmentation or zone data yet.")
                 
         except Exception as e:
             slicer.util.errorDisplay(f"Quick save failed: {str(e)}")
