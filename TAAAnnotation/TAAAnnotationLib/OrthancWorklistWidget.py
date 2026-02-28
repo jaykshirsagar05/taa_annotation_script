@@ -123,6 +123,8 @@ class OrthancLoginWidget(qt.QWidget):
         self.directModeGroup.setVisible(self._directMode)
         self.roleNote.setVisible(not self._directMode)
         self.adminUrlEdit.setEnabled(not self._directMode)
+        self.statusLabel.setText("")  # Clear status when switching modes
+        self.loginButton.setEnabled(True)  # Ensure button is enabled
         if self._directMode:
             self.directModeToggle.setText("← Back to AdminDashboard login")
             self.loginButton.setText("Login to Orthanc (Direct)")

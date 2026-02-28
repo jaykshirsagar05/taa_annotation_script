@@ -11,6 +11,7 @@ taa_annotation_script/
 ├── TAAAnnotation/                        # Main Slicer module
 │   ├── TAAAnnotation.py                  # Module entry point (Widget + Logic)
 │   └── TAAAnnotationLib/                 # Library components
+│       ├── DatasetProfile.py             # Flexible dataset profile definitions & auto-detection
 │       ├── OrthancClient.py              # Orthanc REST API client
 │       ├── OrthancIntegrationWidget.py   # Orthanc login/worklist UI
 │       ├── OrthancWorklistWidget.py      # Worklist table & login panel
@@ -57,6 +58,19 @@ Three-tier MVC-style separation:
 - **Widget layer** — Qt-based UI (`TAAAnnotationWidget`, `WorkflowWidget`, `OrthancIntegrationWidget`)
 - **Logic layer** — MRML scene management, file I/O, workflow state (`TAAAnnotationLogic`)
 - **Service layer** — REST API, persistence, export (`OrthancClient`, `AutosaveManager`, `ExportManager`, `CenterlinePicker`)
+
+## Dataset Profiles
+
+The module uses a **profile-based** data loading system (`DatasetProfile.py`) that auto-detects the dataset type from available Orthanc attachments or local folder contents.
+
+| Profile | Input Data | Workflow | Skip |
+|---------|-----------|----------|------|
+| **Dual Mask** | CT + unified mask + merged mask | Load → Refine → VMTK → Zones → Export | — |
+| **Mask + Centerline** | CT + seg mask + pre-computed centerline (.vtk/.vtp) | Load → Refine → Zones → Export | VMTK |
+
+**Auto-detection priority:** Mask+Centerline (if centerline attachment exists) → Dual Mask (if both masks exist).
+
+**Adding a new profile:** Define in `PROFILES` dict in `DatasetProfile.py`, update `detect_profile_from_attachments()` and `detect_profile_from_folder()`.
 
 ## Code Conventions
 

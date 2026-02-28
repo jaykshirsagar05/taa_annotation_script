@@ -223,6 +223,16 @@ class OrthancClient:
         
     def logout(self):
         """Clear authentication state."""
+        # Close all connections in the session to avoid stale connections
+        try:
+            self.session.close()
+        except Exception:
+            pass  # Session may already be closed
+        
+        # Create a fresh session for next login
+        self.session = requests.Session()
+        
+        # Clear auth state
         self.auth_token = None
         self.current_user = None
         self.user_role = None
@@ -596,10 +606,18 @@ class OrthancClient:
     
     def download_nifti(self, study_id: str, attachment_type: int, 
                        output_path: Optional[str] = None) -> Optional[str]:
-        """Download a NIfTI attachment from a study."""
+        """Download a NIfTI attachment from a study.
+
+        Uses ``stream=True`` so the raw bytes are never touched by
+        ``requests``' automatic ``Content-Encoding`` decompression.
+        This prevents the library from silently stripping the gzip
+        layer of ``.nii.gz`` files when the server (or a proxy)
+        returns a ``Content-Encoding: gzip`` header.
+        """
         try:
             response = self.session.get(
-                f"{self.server_url}/studies/{study_id}/attachments/{attachment_type}/data"
+                f"{self.server_url}/studies/{study_id}/attachments/{attachment_type}/data",
+                stream=True,
             )
             
             if response.status_code == 200:
@@ -613,8 +631,16 @@ class OrthancClient:
                     fd, output_path = tempfile.mkstemp(suffix=suffix)
                     os.close(fd)
                 
+                # Read the raw, undecoded bytes to avoid Content-Encoding
+                # decompression that would corrupt .nii.gz files.
+                # decode_content=False prevents urllib3 from stripping gzip.
+                raw_data = response.raw.read(decode_content=False)
                 with open(output_path, 'wb') as f:
-                    f.write(response.content)
+                    f.write(raw_data)
+                
+                # Validate and fix NIfTI gzip files
+                output_path = self._validate_nifti_file(output_path)
+                
                 return output_path
             elif response.status_code == 404:
                 return None
@@ -624,6 +650,79 @@ class OrthancClient:
         except Exception as e:
             print(f"[OrthancClient] Error downloading attachment: {e}")
             return None
+
+    @staticmethod
+    def _validate_nifti_file(filepath: str) -> str:
+        """
+        Sniff the first bytes of a downloaded file and rename it so
+        the extension matches the actual format.
+
+        Handles three mismatch scenarios:
+        1. NRRD / seg.nrrd data saved as .nii.gz  (upload script
+           stored a .seg.nrrd mask under attachment 1026)
+        2. Raw (uncompressed) NIfTI saved as .nii.gz  (HTTP layer
+           stripped the gzip Content-Encoding)
+        3. Unknown non-gzip data saved as .nii.gz
+
+        Returns:
+            The (possibly updated) file path.
+        """
+        if not filepath.endswith('.nii.gz'):
+            return filepath
+
+        try:
+            with open(filepath, 'rb') as f:
+                header = f.read(512)
+
+            if len(header) < 4:
+                print(f"[OrthancClient] WARNING — downloaded file is too small: {filepath}")
+                return filepath
+
+            # 1. Properly gzip-compressed — nothing to do.
+            if header[0] == 0x1f and header[1] == 0x8b:
+                return filepath
+
+            # 2. NRRD format — starts with 'NRRD' magic bytes.
+            #    The upload script may have stored a .seg.nrrd mask
+            #    under the unified-mask attachment slot.
+            if header[:4] == b'NRRD':
+                # Determine if it is a segmentation NRRD (.seg.nrrd)
+                # by looking for "Segment" keys in the header.
+                is_seg_nrrd = b'Segment' in header
+                if is_seg_nrrd:
+                    new_path = filepath.replace('.nii.gz', '.seg.nrrd')
+                else:
+                    new_path = filepath.replace('.nii.gz', '.nrrd')
+                os.rename(filepath, new_path)
+                print(f"[OrthancClient] File is NRRD (not NIfTI) — renamed to "
+                      f"{os.path.basename(new_path)}")
+                return new_path
+
+            # 3. Raw (uncompressed) NIfTI — header size 348 (NIfTI-1)
+            #    or 540 (NIfTI-2) as little-endian int32 at offset 0.
+            import struct
+            hdr_size = struct.unpack('<i', header[:4])[0]
+            if hdr_size in (348, 540):
+                new_path = filepath[:-3]  # strip trailing .gz
+                os.rename(filepath, new_path)
+                print(f"[OrthancClient] File was raw NIfTI despite .nii.gz extension "
+                      f"— renamed to {os.path.basename(new_path)}")
+                return new_path
+
+            # 4. Unknown format — try re-gzipping in case it helps.
+            import gzip
+            with open(filepath, 'rb') as f_in:
+                raw = f_in.read()
+            with gzip.open(filepath, 'wb') as f_out:
+                f_out.write(raw)
+            print(f"[OrthancClient] Re-gzipped file (was not gzip): "
+                  f"{os.path.basename(filepath)}")
+            return filepath
+
+        except Exception as e:
+            print(f"[OrthancClient] WARNING — file validation failed for "
+                  f"{filepath}: {e}")
+            return filepath
     
     def _get_extension_for_type(self, attachment_type: int) -> str:
         """Get file extension for attachment type."""
@@ -660,6 +759,96 @@ class OrthancClient:
             "notes": self.has_attachment(study_id, self.ATTACHMENT_NOTES),
             "metadata": self.has_attachment(study_id, self.ATTACHMENT_METADATA)
         }
+
+    def detect_dataset_profile(self, study_id: str):
+        """
+        Auto-detect the dataset profile for a study based on which
+        attachments are present on Orthanc.
+
+        Returns:
+            DatasetProfile instance, or None if no profile matches.
+        """
+        from .DatasetProfile import detect_profile_from_attachments
+        attachments = self.get_study_attachments(study_id)
+        return detect_profile_from_attachments(attachments)
+
+    def download_study_files(self, study_id: str, patient_id: str, profile, temp_dir: str) -> Dict[str, Optional[str]]:
+        """
+        Download all files required by a dataset profile.
+
+        Args:
+            study_id:   Orthanc study identifier.
+            patient_id: Patient ID (used for local filenames).
+            profile:    DatasetProfile instance describing what to download.
+            temp_dir:   Local directory for downloaded files.
+
+        Returns:
+            dict of {logical_name: local_path_or_None}
+        """
+        from .DatasetProfile import download_filename
+
+        paths: Dict[str, Optional[str]] = {}
+
+        # Download required attachments
+        for logical_name, att_id in profile.required_attachments.items():
+            fname = download_filename(logical_name, patient_id)
+            local_path = self.download_nifti(
+                study_id, att_id,
+                os.path.join(temp_dir, fname)
+            )
+            # For centerline files: detect actual format and rename if needed
+            if logical_name == "centerline" and local_path:
+                local_path = self._detect_and_fix_centerline_ext(local_path)
+            paths[logical_name] = local_path
+
+        # Download optional attachments (no error on missing)
+        for logical_name, att_id in profile.optional_attachments.items():
+            fname = download_filename(logical_name, patient_id)
+            local_path = self.download_nifti(
+                study_id, att_id,
+                os.path.join(temp_dir, fname)
+            )
+            paths[logical_name] = local_path
+
+        return paths
+
+    @staticmethod
+    def _detect_and_fix_centerline_ext(filepath: str) -> str:
+        """
+        Sniff the first bytes of a downloaded centerline file and rename
+        it to '.vtp' if its content is VTK XML (VTP) rather than VTK legacy.
+
+        Slicer picks the reader based on extension: .vtk → legacy reader,
+        .vtp → XML PolyData reader.  Getting this wrong causes a silent load
+        failure, so we fix it here at download time.
+
+        Returns:
+            The (possibly updated) file path.
+        """
+        try:
+            with open(filepath, 'rb') as f:
+                header = f.read(256)
+
+            is_xml = (header.lstrip()[:5] == b'<?xml'
+                      or b'<VTKFile' in header
+                      or b'type="PolyData"' in header)
+
+            if is_xml and not filepath.endswith('.vtp'):
+                new_path = filepath.rsplit('.', 1)[0] + '.vtp'
+                os.rename(filepath, new_path)
+                print(f"[OrthancClient] Centerline is VTP format — renamed to {os.path.basename(new_path)}")
+                return new_path
+
+            is_legacy = header[:1] == b'#' or header.lstrip()[:13] == b'# vtk DataFil'
+            if is_legacy and not filepath.endswith('.vtk'):
+                new_path = filepath.rsplit('.', 1)[0] + '.vtk'
+                os.rename(filepath, new_path)
+                print(f"[OrthancClient] Centerline is VTK legacy format — renamed to {os.path.basename(new_path)}")
+                return new_path
+        except Exception as e:
+            print(f"[OrthancClient] Warning: could not detect centerline format: {e}")
+
+        return filepath
     
     # -------------------------------------------------------------------------
     # Annotation Workflow Methods

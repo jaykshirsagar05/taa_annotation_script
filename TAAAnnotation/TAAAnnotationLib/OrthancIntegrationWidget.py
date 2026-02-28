@@ -137,20 +137,30 @@ class OrthancIntegrationWidget(qt.QWidget):
         """Handle successful login."""
         self.userRole = role
         
-        # Create worklist widget
+        # Clean up any existing worklist widget first
         if self.worklistWidget:
+            try:
+                self.worklistWidget.studySelected.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.worklistWidget.logoutButton.clicked.disconnect()
+            except (TypeError, RuntimeError):
+                pass
             self.worklistWidget.setParent(None)
             self.worklistWidget.deleteLater()
-            
-        self.worklistWidget = OrthancWorklistWidget(self.orthancClient, role)
-        self.worklistWidget.studySelected.connect(self._onStudySelected)
-        self.worklistWidget.logoutButton.clicked.connect(self._onLogout)
+            self.worklistWidget = None
         
-        # Clear and add to container
+        # Clear worklist layout
         while self.worklistLayout.count():
             item = self.worklistLayout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        
+        # Create new worklist widget
+        self.worklistWidget = OrthancWorklistWidget(self.orthancClient, role)
+        self.worklistWidget.studySelected.connect(self._onStudySelected)
+        self.worklistWidget.logoutButton.clicked.connect(self._onLogout)
         
         # Show offline-mode banner when AdminDashboard is unavailable
         if not self.orthancClient.dashboard_available:
@@ -210,63 +220,105 @@ class OrthancIntegrationWidget(qt.QWidget):
             self.reviewCommentsEdit.setVisible(True)
             
     def _onLogout(self):
-        """Handle logout."""
+        """Handle logout - defer to next event loop tick.
+        
+        Must NOT destroy worklistWidget synchronously here because this slot is
+        called from logoutButton.clicked, which is owned by worklistWidget itself.
+        Destroying the widget while its signal is still on the call stack crashes Qt.
+        """
+        qt.QTimer.singleShot(0, self._doLogout)
+
+    def _doLogout(self):
+        """Perform the actual logout and widget cleanup (deferred, safe to destroy widgets)."""
         self.orthancClient.logout()
         self.currentStudyId = None
         self.currentStudyInfo = None
         self.userRole = None
-        
-        # Reset login widget (including direct-mode state)
+
+        # Safe to clean up now - logoutButton's signal has fully unwound
+        if self.worklistWidget:
+            try:
+                self.worklistWidget.studySelected.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.worklistWidget.logoutButton.clicked.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self.worklistWidget.setParent(None)
+            self.worklistWidget.deleteLater()
+            self.worklistWidget = None
+
+        # Clear remaining items in worklist layout (e.g. offline banner)
+        while self.worklistLayout.count():
+            item = self.worklistLayout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Reset login widget
         self.loginWidget.loginButton.setEnabled(True)
         self.loginWidget.statusLabel.setText("")
+        self.loginWidget.usernameEdit.setText("")
+        self.loginWidget.passwordEdit.setText("")
         if self.loginWidget._directMode:
             self.loginWidget._toggleDirectMode()  # switch back to dashboard mode
-        
-        # Hide actions
+
+        # Hide actions group and return to login page
         self.actionsGroup.setVisible(False)
-        
-        # Switch to login page
         self.stackedWidget.setCurrentIndex(0)
-        
+
         self.loggedOut.emit()
         
     def _onStudySelected(self, study_id: str, study_info: dict):
-        """Handle study selection from worklist."""
+        """Handle study selection from worklist — profile-aware loading."""
         self.currentStudyId = study_id
         self.currentStudyInfo = study_info
         
         try:
-            slicer.util.showStatusMessage("Downloading data from Orthanc...")
+            slicer.util.showStatusMessage("Detecting dataset profile...")
+            slicer.app.processEvents()
+            
+            # Auto-detect profile from available attachments
+            profile = self.orthancClient.detect_dataset_profile(study_id)
+            if profile is None:
+                slicer.util.errorDisplay(
+                    "Cannot determine dataset type.\n\n"
+                    "The study must have at minimum a CT scan and a "
+                    "segmentation mask attached."
+                )
+                return
+
+            patient_id = study_info['patient_id']
+            print(f"[Orthanc] Detected profile: {profile.name} for {patient_id}")
+            
+            slicer.util.showStatusMessage(
+                f"Downloading data from Orthanc ({profile.name})..."
+            )
             slicer.app.processEvents()
             
             # Create temp directory
-            self.tempDir = tempfile.mkdtemp(prefix=f"orthanc_{study_info['patient_id']}_")
+            self.tempDir = tempfile.mkdtemp(prefix=f"orthanc_{patient_id}_")
             
-            # Download files
-            ct_path = self.orthancClient.download_nifti(
-                study_id,
-                OrthancClient.ATTACHMENT_CT_NIFTI,
-                os.path.join(self.tempDir, f"ct_scan_{study_info['patient_id']}.nii.gz")
+            # Download files based on profile
+            paths = self.orthancClient.download_study_files(
+                study_id, patient_id, profile, self.tempDir
             )
             
-            unified_path = self.orthancClient.download_nifti(
-                study_id,
-                OrthancClient.ATTACHMENT_UNIFIED_MASK,
-                os.path.join(self.tempDir, f"{study_info['patient_id']}_unified_mask_smoothed.nii.gz")
-            )
-            
-            merged_path = self.orthancClient.download_nifti(
-                study_id,
-                OrthancClient.ATTACHMENT_MERGED_MASK,
-                os.path.join(self.tempDir, f"{study_info['patient_id']}_merged.nii.gz")
-            )
-            
-            if not all([ct_path, unified_path, merged_path]):
-                missing = []
-                if not ct_path: missing.append("CT scan")
-                if not unified_path: missing.append("unified mask")
-                if not merged_path: missing.append("merged mask")
-                slicer.util.errorDisplay(f"Missing required files: {', '.join(missing)}")
+            # Validate required files
+            missing = [name for name in profile.required_attachments
+                       if not paths.get(name)]
+            if missing:
+                labels = {
+                    "ct": "CT scan",
+                    "seg_mask": "segmentation mask",
+                    "ref_mask": "reference (merged) mask",
+                    "centerline": "pre-computed centerline",
+                }
+                missing_labels = [labels.get(m, m) for m in missing]
+                slicer.util.errorDisplay(
+                    f"Missing required files for '{profile.name}' profile:\n"
+                    f"  {', '.join(missing_labels)}"
+                )
                 return
             
             # Enable action buttons
@@ -276,15 +328,21 @@ class OrthancIntegrationWidget(qt.QWidget):
                 self.btnApprove.setEnabled(True)
                 self.btnReject.setEnabled(True)
             
-            # Emit signal with paths
-            study_info['_ct_path'] = ct_path
-            study_info['_unified_path'] = unified_path
-            study_info['_merged_path'] = merged_path
+            # Build study_info with paths and profile
+            study_info['_file_paths'] = paths
+            study_info['_profile'] = profile
             study_info['_temp_dir'] = self.tempDir
+            
+            # Legacy keys for backward compatibility
+            study_info['_ct_path'] = paths.get("ct")
+            study_info['_unified_path'] = paths.get("seg_mask")
+            study_info['_merged_path'] = paths.get("ref_mask")
             
             self.studyLoaded.emit(study_id, study_info)
             
-            slicer.util.showStatusMessage(f"Loaded {study_info['patient_id']} from Orthanc", 3000)
+            slicer.util.showStatusMessage(
+                f"Loaded {patient_id} from Orthanc [{profile.name}]", 3000
+            )
             
         except Exception as e:
             slicer.util.errorDisplay(f"Failed to load study: {str(e)}")

@@ -8,6 +8,10 @@ from TAAAnnotationLib import (
     WorkflowWidget, OrthancIntegrationWidget,
     AutosaveManager, CenterlinePicker, ExportManager
 )
+from TAAAnnotationLib.DatasetProfile import (
+    DatasetProfile, PROFILES,
+    detect_profile_from_folder, detect_profile_from_attachments,
+)
 import tempfile
 
 
@@ -116,7 +120,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     # --- Manual Load Handler ---
     def onLoadData(self):
-        """Handle manual data loading from folder."""
+        """Handle manual data loading from folder (profile auto-detected)."""
         # Warn if there's unsaved work
         if self.logic.hasUnsavedWork:
             if not slicer.util.confirmYesNoDisplay(
@@ -132,34 +136,77 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             try:
                 success = self.logic.loadData(folderPath)
                 if success:
+                    profile = self.logic.activeProfile
+                    self.workflowWidget.setProfile(profile)
                     self.workflowWidget.markDone(1, "Data Loaded")
+                    
+                    if profile and profile.has_precalculated_centerline and self.logic.centerlineNode:
+                        self.workflowWidget.markDone(3, "Centerline Pre-loaded")
+                    
                     self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-                    self.workflowWidget.setStatus(f"✓ Loaded: {self.logic.currentId}")
+                    profile_label = f" [{profile.name}]" if profile else ""
+                    self.workflowWidget.setStatus(f"✓ Loaded: {self.logic.currentId}{profile_label}")
                     self.workflowWidget.setCurrentId(self.logic.currentId)
             finally:
                 self.workflowWidget.setButtonsEnabled(True)
 
     # --- Orthanc Handlers ---
     def onOrthancStudyLoaded(self, study_id: str, study_info: dict):
-        """Handle study loaded from Orthanc."""
-        ct_path = study_info.get('_ct_path')
-        unified_path = study_info.get('_unified_path')
-        merged_path = study_info.get('_merged_path')
-        self.orthancTempDir = study_info.get('_temp_dir')
+        """Handle study loaded from Orthanc (profile-aware)."""
+        try:
+            profile = study_info.get('_profile')
+            file_paths = study_info.get('_file_paths', {})
+            self.orthancTempDir = study_info.get('_temp_dir')
+            
+            # Backward-compat: if no profile, build a legacy dual-mask paths dict
+            if profile is None:
+                profile = PROFILES[DatasetProfile.DUAL_MASK]
+                file_paths = {
+                    "ct": study_info.get('_ct_path'),
+                    "seg_mask": study_info.get('_unified_path'),
+                    "ref_mask": study_info.get('_merged_path'),
+                }
+            
+            print(f"[Orthanc] Loading profile: {profile.name}, paths: {list(file_paths.keys())}")
+            for k, v in file_paths.items():
+                exists = os.path.exists(v) if v else 'N/A'
+                print(f"  {k}: {v} (exists={exists})")
+            
+            # Load using logic
+            self.logic.currentId = study_info['patient_id']
+            self.logic.rootDir = self.orthancTempDir
+            self.logic.activeProfile = profile
+            errors = self.logic.loadDataWithProfile(profile, file_paths)
+            
+            # Update UI with profile info
+            self.workflowWidget.setProfile(profile)
+            self.workflowWidget.setCurrentId(
+                study_info['patient_id'],
+                f"from Orthanc — {profile.name}"
+            )
+            self.workflowWidget.markDone(1, "Data Loaded (Orthanc)")
+            
+            # If centerline was pre-loaded, mark VMTK phase as done
+            if profile.has_precalculated_centerline and self.logic.centerlineNode:
+                self.workflowWidget.markDone(3, "Centerline Pre-loaded")
+            
+            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+            
+            # Show loading errors if any
+            if errors:
+                slicer.util.warningDisplay(
+                    "Some files could not be loaded:\n\n" + "\n".join(errors),
+                    "Partial Load"
+                )
+            
+            # Load existing annotations for reviewers
+            if self.orthancWidget.getRole() == "reviewer":
+                self._loadExistingAnnotations(study_id, self.orthancTempDir)
         
-        # Load using logic
-        self.logic.currentId = study_info['patient_id']
-        self.logic.rootDir = self.orthancTempDir
-        self.logic.loadProcedureDataFromPaths(ct_path, unified_path, merged_path)
-        
-        # Update UI
-        self.workflowWidget.setCurrentId(study_info['patient_id'], "from Orthanc")
-        self.workflowWidget.markDone(1, "Data Loaded (Orthanc)")
-        self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-        
-        # Load existing annotations for reviewers
-        if self.orthancWidget.getRole() == "reviewer":
-            self._loadExistingAnnotations(study_id, self.orthancTempDir)
+        except Exception as e:
+            slicer.util.errorDisplay(f"Failed to load study data:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
 
     def _loadExistingAnnotations(self, study_id: str, temp_dir: str):
         """Load existing annotations for review."""
@@ -340,9 +387,10 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 "Unsaved Work"
             ):
                 return
-        slicer.mrmlScene.Clear(0)
-        self.logic.reset()
-        self.workflowWidget.resetUI()
+        # Disable picker first (removes VTK observers from scene nodes before
+        # the scene is cleared; skipping this step crashes VTK/Slicer).
+        # Then delegate to resetApplication which does the correct teardown order.
+        self.resetApplication()
 
     def resetForNextStudy(self):
         """Reset for next study."""
@@ -364,6 +412,15 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.workflowWidget.setButtonsEnabled(True)
 
     def onVmtkSetup(self):
+        # If centerline is already pre-loaded, skip VMTK
+        if (self.logic.activeProfile
+                and self.logic.activeProfile.has_precalculated_centerline
+                and self.logic.centerlineNode):
+            slicer.util.infoDisplay(
+                "Centerline is pre-loaded for this dataset.\n"
+                "VMTK extraction is not needed — proceed to zone placement."
+            )
+            return
         self.workflowWidget.setButtonsEnabled(False)
         try:
             if self.logic.setupVMTK():
@@ -436,6 +493,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         self.networkNode = None
         self.endpointNode = None
         self.centerlineNode = None
+        self.activeProfile = None  # DatasetProfile for the loaded study
         self.hasUnsavedWork = False
         self.workflowState = {
             "phase": 0,
@@ -460,7 +518,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         return filename.replace("ct_scan_", "").replace(".nii.gz", "")
 
     def loadData(self, folderPath):
-        """Load all data for a subject"""
+        """Load all data for a subject with automatic profile detection."""
         import numpy as np
         
         try:
@@ -470,61 +528,46 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                 slicer.util.errorDisplay("Could not find 'ct_scan_*.nii.gz' in folder")
                 return False
             
-            # Reset state (which also clears scene), then set new ID/dir
+            # Auto-detect dataset profile from folder contents
+            profile, found_files = detect_profile_from_folder(folderPath, detectedId)
+            
+            if profile is None:
+                slicer.util.errorDisplay(
+                    "Could not determine dataset type.\n\n"
+                    "Expected at minimum:\n"
+                    "  - ct_scan_{id}.nii.gz\n"
+                    "  - {id}_unified_mask_smoothed.nii.gz\n"
+                    "and either:\n"
+                    "  - {id}_merged_mask.nii.gz  (Dual Mask profile)\n"
+                    "  - a .vtp/.vtk centerline file  (Mask+Centerline profile)"
+                )
+                return False
+            
+            print(f"[LoadData] Detected profile: {profile.name} for {detectedId}")
+            
+            # Validate required files exist
+            missing = [name for name in profile.required_attachments
+                       if name not in found_files]
+            if missing:
+                slicer.util.errorDisplay(
+                    f"Missing required files for '{profile.name}' profile:\n"
+                    f"  {', '.join(missing)}"
+                )
+                return False
+            
+            # Reset state, then set new ID/dir/profile
             self.reset()
             self.rootDir = folderPath
             self.currentId = detectedId
+            self.activeProfile = profile
             
-            # Define paths
-            volPath = os.path.join(folderPath, f"ct_scan_{self.currentId}.nii.gz")
-            segPath = os.path.join(folderPath, f"{self.currentId}_unified_mask_smoothed.nii.gz")
-            refPath = os.path.join(folderPath, f"{self.currentId}_merged_mask.nii.gz")
-            
-            # Validate files
-            for path, name in [(volPath, "CT scan"), (segPath, "unified segmentation"), (refPath, "merged segmentation")]:
-                if not os.path.exists(path):
-                    slicer.util.errorDisplay(f"Missing {name}: {path}")
-                    return False
-            
-            # Load CT volume
-            self.volNode = slicer.util.loadVolume(volPath)
-            
-            # Load unified segmentation
-            tempUnified = slicer.util.loadLabelVolume(segPath)
-            self.segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.currentId}_unified")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tempUnified, self.segNode)
-            slicer.mrmlScene.RemoveNode(tempUnified)
-            self.segNode.CreateClosedSurfaceRepresentation()
-            
-            # Load merged segmentation
-            tempMerged = slicer.util.loadLabelVolume(refPath)
-            self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.currentId}_merged")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tempMerged, self.refNode)
-            slicer.mrmlScene.RemoveNode(tempMerged)
-            self.refNode.CreateClosedSurfaceRepresentation()
-            
-            # Create binarized merged
-            tempMergedBinary = slicer.util.loadLabelVolume(refPath)
-            array = slicer.util.arrayFromVolume(tempMergedBinary)
-            array[array > 0] = 1
-            slicer.util.updateVolumeFromArray(tempMergedBinary, array)
-            
-            self.binarizedMergedNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", f"{self.currentId}_merged_binary")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tempMergedBinary, self.binarizedMergedNode)
-            slicer.mrmlScene.RemoveNode(tempMergedBinary)
-            self.binarizedMergedNode.CreateClosedSurfaceRepresentation()
-            
-            # Set visibility
-            self.segNode.GetDisplayNode().SetVisibility(True)
-            self.refNode.GetDisplayNode().SetVisibility(False)
-            self.binarizedMergedNode.GetDisplayNode().SetVisibility(False)
-            
-            # Setup view
-            slicer.app.layoutManager().sliceWidget('Red').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(self.volNode.GetID())
-            slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
-            
-            self.workflowState["phase"] = 1
-            self.hasUnsavedWork = True
+            # Load using profile-aware method
+            errors = self.loadDataWithProfile(profile, found_files)
+            if errors:
+                slicer.util.warningDisplay(
+                    "Data loaded with warnings:\n\n" + "\n".join(errors),
+                    "Partial Load"
+                )
             return True
             
         except Exception as e:
@@ -739,64 +782,202 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
     
     def loadProcedureDataFromPaths(self, ct_path: str, unified_path: str, merged_path: str):
         """
-        Load procedure data from explicit file paths (for Orthanc integration).
-        
-        Args:
-            ct_path: Path to CT NIfTI file
-            unified_path: Path to unified mask NIfTI file  
-            merged_path: Path to merged mask NIfTI file
+        Legacy: Load procedure data from explicit file paths.
+        Delegates to loadDataWithProfile with a Dual Mask profile.
         """
+        profile = PROFILES[DatasetProfile.DUAL_MASK]
+        self.activeProfile = profile
+        file_paths = {
+            "ct": ct_path,
+            "seg_mask": unified_path,
+            "ref_mask": merged_path,
+        }
+        self.loadDataWithProfile(profile, file_paths)
+
+    def loadDataWithProfile(self, profile, file_paths: dict):
+        """
+        Load data into the scene based on a DatasetProfile.
+
+        This is the single, profile-aware entry point used by both Orthanc
+        and manual-folder loading paths.  Each section is wrapped in its
+        own try/except so a failure in one file does not prevent the rest
+        from loading.
+
+        Args:
+            profile:    DatasetProfile instance.
+            file_paths: dict of {logical_name: local_file_path}
+
+        Returns:
+            list of error strings (empty if everything loaded successfully).
+        """
+        import numpy as np
+
+        errors = []
         slicer.mrmlScene.Clear(0)
-        
-        # Load CT volume
-        print(f"[Loading] CT from: {ct_path}")
-        self.volNode = slicer.util.loadVolume(ct_path)
-        if not self.volNode:
-            raise RuntimeError(f"Failed to load CT volume from {ct_path}")
-        
-        # Load unified segmentation (for editing)
-        print(f"[Loading] Unified mask from: {unified_path}")
-        unifiedLabelNode = slicer.util.loadLabelVolume(unified_path)
-        if not unifiedLabelNode:
-            raise RuntimeError(f"Failed to load unified mask from {unified_path}")
-        
-        self.segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", 
-                                                        f"{self.currentId}_Segmentation")
-        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-            unifiedLabelNode, self.segNode)
-        slicer.mrmlScene.RemoveNode(unifiedLabelNode)
-        self.segNode.CreateClosedSurfaceRepresentation()
-        
-        # Load merged segmentation (reference)
-        print(f"[Loading] Merged mask from: {merged_path}")
-        mergedLabelNode = slicer.util.loadLabelVolume(merged_path)
-        if mergedLabelNode:
-            # FIXED: Use self.refNode to be compatible with setupRefinement()
-            self.refNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode",
-                                                                    f"{self.currentId}_Merged")
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-                mergedLabelNode, self.refNode)
-            slicer.mrmlScene.RemoveNode(mergedLabelNode)
-            self.refNode.CreateClosedSurfaceRepresentation()
-            self.refNode.GetDisplayNode().SetVisibility(False)
-        
-        # Create binarized version for centerline
-        self._createBinarizedMask(merged_path)
-        
-        # Setup views
+
+        # --- CT volume (always required) ---
+        ct_path = file_paths.get("ct")
+        if not ct_path or not os.path.exists(ct_path):
+            raise RuntimeError(f"CT scan path missing or not found: {ct_path}")
+        try:
+            print(f"[Loading] CT from: {ct_path}")
+            self.volNode = slicer.util.loadVolume(ct_path)
+            if not self.volNode:
+                raise RuntimeError("loadVolume returned None")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load CT volume from {ct_path}: {e}")
+
+        # --- Segmentation mask ---
+        seg_path = file_paths.get("seg_mask")
+        if seg_path and os.path.exists(seg_path):
+            try:
+                seg_path = self._fixFileExtension(seg_path)
+                file_size = os.path.getsize(seg_path)
+                print(f"[Loading] Segmentation mask from: {seg_path} "
+                      f"(size={file_size} bytes)")
+                if file_size == 0:
+                    raise RuntimeError("Downloaded mask file is empty (0 bytes)")
+
+                # If the file is a .seg.nrrd or .nrrd, load as segmentation
+                # directly — it cannot be read by a NIfTI reader.
+                if seg_path.endswith('.seg.nrrd') or seg_path.endswith('.nrrd'):
+                    self.segNode = self._loadSegmentationFromNrrd(seg_path)
+                    if not self.segNode:
+                        raise RuntimeError(
+                            "Failed to load NRRD segmentation mask")
+                else:
+                    # NIfTI path: label-map → segmentation
+                    unifiedLabelNode = self._loadNiftiAsLabelMap(seg_path)
+                    if not unifiedLabelNode:
+                        raise RuntimeError(
+                            "All loading strategies failed for segmentation mask")
+
+                    self.segNode = slicer.mrmlScene.AddNewNodeByClass(
+                        "vtkMRMLSegmentationNode",
+                        f"{self.currentId}_Segmentation"
+                    )
+                    slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                        unifiedLabelNode, self.segNode
+                    )
+                    slicer.mrmlScene.RemoveNode(unifiedLabelNode)
+
+                self.segNode.CreateClosedSurfaceRepresentation()
+                print("[Loading] Segmentation mask loaded successfully")
+            except Exception as e:
+                msg = f"Segmentation mask: {e}"
+                print(f"[Loading] ERROR — {msg}")
+                errors.append(msg)
+        elif seg_path:
+            msg = f"Segmentation mask file not found: {seg_path}"
+            print(f"[Loading] ERROR — {msg}")
+            errors.append(msg)
+
+        # --- Reference mask (optional — present in Dual Mask profile) ---
+        ref_path = file_paths.get("ref_mask")
+        if ref_path and os.path.exists(ref_path):
+            try:
+                ref_path = self._fixFileExtension(ref_path)
+                print(f"[Loading] Reference mask from: {ref_path}")
+                mergedLabelNode = self._loadNiftiAsLabelMap(ref_path)
+                if mergedLabelNode:
+                    self.refNode = slicer.mrmlScene.AddNewNodeByClass(
+                        "vtkMRMLSegmentationNode",
+                        f"{self.currentId}_Merged"
+                    )
+                    slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                        mergedLabelNode, self.refNode
+                    )
+                    slicer.mrmlScene.RemoveNode(mergedLabelNode)
+                    self.refNode.CreateClosedSurfaceRepresentation()
+                    self.refNode.GetDisplayNode().SetVisibility(False)
+                    print("[Loading] Reference mask loaded successfully")
+
+                # Create binarized version for centerline extraction
+                self._createBinarizedMask(ref_path)
+            except Exception as e:
+                msg = f"Reference mask: {e}"
+                print(f"[Loading] ERROR — {msg}")
+                errors.append(msg)
+
+        # --- Pre-computed centerline (Mask+Centerline profile) ---
+        centerline_path = file_paths.get("centerline")
+        if centerline_path and os.path.exists(centerline_path):
+            try:
+                self.centerlineNode = self._loadCenterlineModel(centerline_path)
+            except Exception as e:
+                msg = f"Centerline: {e}"
+                print(f"[Loading] ERROR — {msg}")
+                errors.append(msg)
+
+        # --- Set visibility ---
+        if self.segNode and self.segNode.GetDisplayNode():
+            self.segNode.GetDisplayNode().SetVisibility(True)
+
+        # --- Setup views ---
         self._setupViews()
-        
+
         self.workflowState["phase"] = 1
         self.hasUnsavedWork = False
-        
-        print(f"[Loading] Complete - ready for annotation")
+
+        print(f"[Loading] Complete — profile: {profile.name}")
+        if errors:
+            print(f"[Loading] Errors: {errors}")
+        return errors
+
+    def _loadCenterlineModel(self, centerline_path):
+        """
+        Load a centerline model from disk, handling both .vtk and .vtp formats.
+
+        Slicer uses the file extension to choose a reader:
+        .vtk -> legacy VTK, .vtp -> VTK XML PolyData.
+        If the file was downloaded with the wrong extension the first attempt
+        fails, so this helper retries with the alternate extension.
+
+        Returns:
+            Loaded model node, or None.
+        """
+        print(f"[Loading] Pre-computed centerline from: {centerline_path}")
+        node = slicer.util.loadModel(centerline_path)
+
+        # If initial load failed, try with the alternate extension
+        if node is None:
+            alt_ext = ".vtp" if centerline_path.endswith(".vtk") else ".vtk"
+            alt_path = centerline_path.rsplit(".", 1)[0] + alt_ext
+            print(f"[Loading] loadModel failed for {os.path.basename(centerline_path)}, "
+                  f"retrying as {alt_ext}...")
+            try:
+                import shutil
+                shutil.copy2(centerline_path, alt_path)
+                node = slicer.util.loadModel(alt_path)
+            except Exception as e2:
+                print(f"[Loading] Retry with {alt_ext} also failed: {e2}")
+
+        if node is None:
+            print(f"[Loading] WARNING: Could not load centerline from {centerline_path}")
+            return None
+
+        node.SetName(f"{self.currentId}_Centerline")
+        displayNode = node.GetDisplayNode()
+        if displayNode:
+            displayNode.SetVisibility(True)
+            displayNode.SetColor(1.0, 1.0, 0.0)  # yellow
+            displayNode.SetLineWidth(3)
+
+        polyData = node.GetPolyData()
+        npts = polyData.GetNumberOfPoints() if polyData else 0
+        print(f"[Loading] Centerline loaded ({npts} pts)")
+        return node
 
     def _createBinarizedMask(self, merged_path):
         """Create binarized mask for centerline extraction from merged mask path."""
         if not os.path.exists(merged_path):
             return
 
-        tempMergedBinary = slicer.util.loadLabelVolume(merged_path)
+        merged_path = self._fixFileExtension(merged_path)
+        tempMergedBinary = self._loadNiftiAsLabelMap(merged_path)
+        if not tempMergedBinary:
+            print("[Loading] WARNING — could not load merged mask for binarization")
+            return
         array = slicer.util.arrayFromVolume(tempMergedBinary)
         array[array > 0] = 1
         slicer.util.updateVolumeFromArray(tempMergedBinary, array)
@@ -812,6 +993,170 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         if self.volNode:
             slicer.app.layoutManager().sliceWidget('Red').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(self.volNode.GetID())
         slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+
+    # -----------------------------------------------------------------
+    # File-format loading helpers
+    # -----------------------------------------------------------------
+
+    def _loadSegmentationFromNrrd(self, filepath):
+        """
+        Load a .seg.nrrd or .nrrd file directly as a segmentation node.
+
+        .seg.nrrd files are native Slicer segmentations — they contain
+        segment metadata (names, colors, label values) that
+        ``loadSegmentation`` reads directly into a
+        ``vtkMRMLSegmentationNode``.
+
+        Returns:
+            vtkMRMLSegmentationNode on success, or None.
+        """
+        try:
+            print(f"[Loading]   Loading NRRD segmentation: {os.path.basename(filepath)}")
+            segNode = slicer.util.loadSegmentation(filepath)
+            if segNode:
+                segNode.SetName(f"{self.currentId}_Segmentation")
+                print(f"[Loading]   loadSegmentation succeeded "
+                      f"({segNode.GetSegmentation().GetNumberOfSegments()} segments)")
+                return segNode
+        except Exception as e1:
+            print(f"[Loading]   loadSegmentation failed: {e1}")
+
+        # Fallback: try loading as label map and importing
+        try:
+            print("[Loading]   Fallback: loading NRRD as label volume...")
+            labelNode = slicer.util.loadLabelVolume(filepath)
+            if labelNode:
+                segNode = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLSegmentationNode",
+                    f"{self.currentId}_Segmentation"
+                )
+                slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                    labelNode, segNode
+                )
+                slicer.mrmlScene.RemoveNode(labelNode)
+                print("[Loading]   NRRD label-volume fallback succeeded")
+                return segNode
+        except Exception as e2:
+            print(f"[Loading]   NRRD label-volume fallback failed: {e2}")
+
+        return None
+
+    @staticmethod
+    def _fixFileExtension(filepath):
+        """
+        Ensure the file extension matches the actual content.
+
+        Handles:
+        - .nii.gz file that is actually NRRD  → rename to .nrrd/.seg.nrrd
+        - .nii.gz file that is uncompressed NIfTI → rename to .nii
+        - Already-correct files → returned unchanged
+        """
+        if not filepath.endswith('.nii.gz'):
+            return filepath
+        try:
+            with open(filepath, 'rb') as f:
+                header = f.read(512)
+            if len(header) < 4:
+                return filepath
+
+            # Valid gzip — nothing to fix
+            if header[0] == 0x1f and header[1] == 0x8b:
+                return filepath
+
+            # NRRD format
+            if header[:4] == b'NRRD':
+                is_seg = b'Segment' in header
+                new_path = filepath.replace('.nii.gz',
+                                            '.seg.nrrd' if is_seg else '.nrrd')
+                os.rename(filepath, new_path)
+                print(f"[Loading] Renamed {os.path.basename(filepath)} → "
+                      f"{os.path.basename(new_path)} (NRRD detected)")
+                return new_path
+
+            # Uncompressed NIfTI
+            import struct
+            hdr_size = struct.unpack('<i', header[:4])[0]
+            if hdr_size in (348, 540):
+                new_path = filepath[:-3]  # strip .gz
+                os.rename(filepath, new_path)
+                print(f"[Loading] Renamed {os.path.basename(filepath)} → "
+                      f"{os.path.basename(new_path)} (raw NIfTI)")
+                return new_path
+
+            return filepath
+        except Exception as e:
+            print(f"[Loading] _fixFileExtension warning: {e}")
+            return filepath
+
+    @staticmethod
+    def _loadNiftiAsLabelMap(filepath):
+        """
+        Robustly load a NIfTI mask file as a vtkMRMLLabelMapVolumeNode.
+
+        Tries, in order:
+          1. slicer.util.loadLabelVolume
+          2. slicer.util.loadVolume  → convert to label map
+          3. SimpleITK direct read   → push into label map node
+
+        Returns:
+            vtkMRMLLabelMapVolumeNode on success, or None.
+        """
+        import numpy as np
+
+        # --- Strategy 1: native label-volume reader ---
+        try:
+            node = slicer.util.loadLabelVolume(filepath)
+            if node:
+                print("[Loading]   Strategy 1 (loadLabelVolume) succeeded")
+                return node
+        except Exception as e1:
+            print(f"[Loading]   Strategy 1 (loadLabelVolume) failed: {e1}")
+
+        # --- Strategy 2: generic volume reader + conversion ---
+        try:
+            tmpVol = slicer.util.loadVolume(filepath)
+            if tmpVol:
+                labelNode = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLLabelMapVolumeNode", "tmp_label_conv"
+                )
+                volLogic = slicer.modules.volumes.logic()
+                volLogic.CreateLabelVolumeFromVolume(
+                    slicer.mrmlScene, labelNode, tmpVol
+                )
+                slicer.mrmlScene.RemoveNode(tmpVol)
+                print("[Loading]   Strategy 2 (loadVolume + convert) succeeded")
+                return labelNode
+        except Exception as e2:
+            print(f"[Loading]   Strategy 2 (loadVolume + convert) failed: {e2}")
+
+        # --- Strategy 3: SimpleITK direct read → push to MRML ---
+        try:
+            import SimpleITK as sitk
+            import sitkUtils
+
+            print(f"[Loading]   Strategy 3: reading with SimpleITK...")
+            sitkImage = sitk.ReadImage(filepath)
+
+            # Cast to integer type if needed (label maps require int)
+            pixel_type = sitkImage.GetPixelID()
+            print(f"[Loading]   SimpleITK pixel type: {pixel_type} "
+                  f"({sitkImage.GetPixelIDTypeAsString()})")
+            if pixel_type in (sitk.sitkFloat32, sitk.sitkFloat64):
+                sitkImage = sitk.Cast(sitkImage, sitk.sitkInt16)
+
+            # Push into a Slicer volume node
+            tempName = "tmp_sitk_label"
+            sitkUtils.PushVolumeToSlicer(sitkImage, name=tempName,
+                                         className='vtkMRMLLabelMapVolumeNode')
+            labelNode = slicer.util.getNode(tempName)
+            if labelNode:
+                print("[Loading]   Strategy 3 (SimpleITK) succeeded")
+                return labelNode
+        except Exception as e3:
+            print(f"[Loading]   Strategy 3 (SimpleITK) failed: {e3}")
+
+        print("[Loading]   All loading strategies exhausted — returning None")
+        return None
 
 
 #

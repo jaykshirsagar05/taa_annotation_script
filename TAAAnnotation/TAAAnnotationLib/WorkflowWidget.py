@@ -29,6 +29,7 @@ class WorkflowWidget(qt.QWidget):
         self.centerlinePicker = None
         self.logic = None
         self.orthancTempDir = ""  # Temporary directory for Orthanc studies
+        self._activeProfile = None  # DatasetProfile for the loaded study
         self._setupUI()
         
     def setLogic(self, logic):
@@ -290,17 +291,30 @@ class WorkflowWidget(qt.QWidget):
         slicer.app.processEvents()
     
     def updateUIState(self, phase: int, orthancMode: bool = False):
-        """Update UI based on workflow phase."""
+        """Update UI based on workflow phase and active profile."""
+        centerlinePreloaded = (
+            self._activeProfile is not None
+            and self._activeProfile.has_precalculated_centerline
+        )
+        # Centerline is considered ready if VMTK phase was passed OR it was pre-loaded
+        centerlineReady = (phase >= 3) or centerlinePreloaded
+
         self.btnSeg.setEnabled(phase >= 1)
-        self.btnVmtk.setEnabled(phase >= 2)
-        self.btnClickMode.setEnabled(phase >= 3)
+
+        if centerlinePreloaded:
+            # VMTK not needed — keep button disabled (already marked done)
+            self.btnVmtk.setEnabled(False)
+        else:
+            self.btnVmtk.setEnabled(phase >= 2)
+
+        self.btnClickMode.setEnabled(centerlineReady)
         self.btnQuickSave.setEnabled(phase >= 1)
         
         # Export only enabled for local workflow, not Orthanc
         if orthancMode:
             self.btnExport.setEnabled(False)
         else:
-            self.btnExport.setEnabled(phase >= 3)
+            self.btnExport.setEnabled(centerlineReady)
         
     def setCurrentId(self, current_id: str, source: str = ""):
         """Set the current study ID display."""
@@ -308,6 +322,28 @@ class WorkflowWidget(qt.QWidget):
             self.currentIdLabel.setText(f"Current: {current_id} ({source})")
         else:
             self.currentIdLabel.setText(f"Current: {current_id}" if current_id else "")
+
+    def setProfile(self, profile):
+        """Set the active dataset profile and adjust UI accordingly."""
+        self._activeProfile = profile
+        if profile is None:
+            return
+
+        if profile.has_precalculated_centerline:
+            self.btnVmtk.setText("3. Centerline (Pre-loaded ✔)")
+            self.btnVmtk.setStyleSheet(
+                "background-color: #28a745; color: white; text-align: left; "
+                "padding: 8px; font-weight: bold;"
+            )
+            self.btnVmtk.setEnabled(False)
+            self.btnVmtk.setToolTip(
+                "Centerline was provided with the dataset — "
+                "VMTK extraction is not needed."
+            )
+        else:
+            self.btnVmtk.setText("3. Extract VMTK Centerline")
+            self.btnVmtk.setStyleSheet(self.defaultStyle)
+            self.btnVmtk.setToolTip("")
             
     def setStatus(self, message: str):
         """Set status message."""
@@ -342,12 +378,16 @@ class WorkflowWidget(qt.QWidget):
         """Reset UI to initial state."""
         from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
 
+        self._activeProfile = None
+
         self.btnLoad.setStyleSheet(self.defaultStyle)
         self.btnLoad.setText("1. Load Data & Initialize")
         self.btnSeg.setStyleSheet(self.defaultStyle)
         self.btnSeg.setText("2. Refine Mask")
         self.btnVmtk.setStyleSheet(self.defaultStyle)
         self.btnVmtk.setText("3. Extract VMTK Centerline")
+        self.btnVmtk.setToolTip("")
+        self.btnVmtk.setEnabled(False)
         self._setPickerButtonOff()
         self.btnConfirmPoint.setEnabled(False)
         self.centerlineCombo.setCurrentNode(None)
