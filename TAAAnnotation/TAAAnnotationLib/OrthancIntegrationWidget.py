@@ -151,6 +151,28 @@ class OrthancIntegrationWidget(qt.QWidget):
             item = self.worklistLayout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        
+        # Show offline-mode banner when AdminDashboard is unavailable
+        if not self.orthancClient.dashboard_available:
+            offlineBanner = qt.QFrame()
+            offlineBanner.setStyleSheet(
+                "background-color: #fff3cd; border: 1px solid #ffc107; "
+                "border-radius: 4px; padding: 6px;"
+            )
+            bannerLayout = qt.QHBoxLayout(offlineBanner)
+            bannerLayout.setContentsMargins(8, 4, 8, 4)
+            bannerIcon = qt.QLabel("⚠️")
+            bannerIcon.setStyleSheet("font-size: 16px;")
+            bannerLayout.addWidget(bannerIcon)
+            bannerText = qt.QLabel(
+                "Operating in <b>Direct Orthanc</b> mode — AdminDashboard is offline. "
+                "Worklist and status are read from Orthanc metadata directly."
+            )
+            bannerText.setWordWrap(True)
+            bannerText.setStyleSheet("color: #856404; font-size: 11px;")
+            bannerLayout.addWidget(bannerText, 1)
+            self.worklistLayout.addWidget(offlineBanner)
+        
         self.worklistLayout.addWidget(self.worklistWidget)
         
         # Configure action buttons based on role
@@ -165,7 +187,8 @@ class OrthancIntegrationWidget(qt.QWidget):
         # Initial refresh
         self.worklistWidget.refreshWorklist()
         
-        print(f"[Orthanc] Logged in as {self.orthancClient.current_user} with role: {role}")
+        mode_label = "direct" if not self.orthancClient.dashboard_available else "dashboard"
+        print(f"[Orthanc] Logged in as {self.orthancClient.current_user} with role: {role} ({mode_label} mode)")
         
     def _configureActionsForRole(self, role: str):
         """Configure action buttons based on role."""
@@ -193,9 +216,11 @@ class OrthancIntegrationWidget(qt.QWidget):
         self.currentStudyInfo = None
         self.userRole = None
         
-        # Reset login widget
+        # Reset login widget (including direct-mode state)
         self.loginWidget.loginButton.setEnabled(True)
         self.loginWidget.statusLabel.setText("")
+        if self.loginWidget._directMode:
+            self.loginWidget._toggleDirectMode()  # switch back to dashboard mode
         
         # Hide actions
         self.actionsGroup.setVisible(False)

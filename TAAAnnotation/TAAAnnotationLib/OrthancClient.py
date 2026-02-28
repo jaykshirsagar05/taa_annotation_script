@@ -85,6 +85,11 @@ class OrthancClient:
         self.user_id: Optional[int] = None
         self.assigned_series: List[str] = []
         
+        # Dashboard availability flag
+        # When False, all AdminDashboard API calls are skipped and
+        # Orthanc-direct fallback paths are used instead.
+        self.dashboard_available: bool = True
+        
         # Orthanc basic auth (obtained from AdminDashboard or config)
         self.orthanc_auth: Optional[Tuple[str, str]] = None
         
@@ -140,6 +145,50 @@ class OrthancClient:
             return False, "Connection timed out"
         except Exception as e:
             return False, f"Login error: {str(e)}"
+
+    def login_direct(self, username: str, password: str,
+                     role: str = "annotator") -> Tuple[bool, str]:
+        """
+        Authenticate directly with Orthanc using static credentials.
+
+        Use this when AdminDashboard is unreachable. The user picks their
+        role manually. All subsequent AdminDashboard API calls are skipped
+        and Orthanc-direct fallback paths are used instead.
+
+        Args:
+            username: Orthanc basic-auth username
+            password: Orthanc basic-auth password
+            role: User-selected role (annotator / reviewer / admin)
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if role not in ("annotator", "reviewer", "admin"):
+            return False, f"Invalid role: {role}"
+
+        # Set Orthanc basic-auth so all subsequent requests use it
+        self.set_orthanc_credentials(username, password)
+
+        # Verify Orthanc is reachable with these credentials
+        orthanc_ok, orthanc_msg = self._verify_orthanc_connection()
+        if not orthanc_ok:
+            # Clear creds on failure
+            self.orthanc_auth = None
+            self.session.auth = None
+            return False, f"Orthanc authentication failed: {orthanc_msg}"
+
+        # Populate authentication state without AdminDashboard
+        self.current_user = username
+        self.user_role = role
+        self.user_id = None
+        self.auth_token = None  # No JWT in direct mode
+        self.assigned_series = []
+        self.dashboard_available = False
+
+        print(f"[OrthancClient] Direct login as '{username}' with role '{role}' "
+              f"(AdminDashboard offline)")
+        return True, (f"Logged in directly to Orthanc as {username} ({role}) "
+                      f"— AdminDashboard offline")
     
     def _verify_orthanc_connection(self) -> Tuple[bool, str]:
         """
@@ -181,6 +230,7 @@ class OrthancClient:
         self.assigned_series = []
         self.orthanc_auth = None
         self.session.auth = None
+        self.dashboard_available = True  # Reset for next login attempt
         
     def is_authenticated(self) -> bool:
         """Check if client is authenticated with AdminDashboard."""
@@ -192,6 +242,12 @@ class OrthancClient:
     
     def validate_token(self) -> Tuple[bool, str]:
         """Validate the current token with AdminDashboard."""
+        if not self.dashboard_available:
+            # In direct mode there is no token; treat session as valid
+            # as long as Orthanc is reachable.
+            ok, msg = self._verify_orthanc_connection()
+            return ok, msg if ok else f"Orthanc unreachable: {msg}"
+
         if not self.auth_token:
             return False, "No token"
         
@@ -297,6 +353,7 @@ class OrthancClient:
     def query_studies_by_status(self, status: AnnotationStatus) -> List[Dict[str, Any]]:
         """
         Query studies filtered by annotation status via AdminDashboard.
+        Falls back to direct Orthanc query when dashboard is unavailable.
         
         Args:
             status: AnnotationStatus enum value
@@ -304,6 +361,11 @@ class OrthancClient:
         Returns:
             List of studies matching the status
         """
+        if not self.dashboard_available:
+            # Skip AdminDashboard entirely — query Orthanc directly
+            all_studies = self.get_all_studies()
+            return [s for s in all_studies if s.get("annotation_status") == status.value]
+
         try:
             response = requests.get(
                 f"{self.admin_url}/studies/api/by-status/{status.value}",
@@ -336,6 +398,10 @@ class OrthancClient:
         """
         effective_role = role or self.user_role
         
+        if not self.dashboard_available:
+            # Skip AdminDashboard — use Orthanc-direct fallback
+            return self._get_worklist_fallback(effective_role)
+
         try:
             params = {"role": effective_role} if effective_role else {}
             response = requests.get(
@@ -392,6 +458,9 @@ class OrthancClient:
         if not effective_role:
             return False, "No role assigned - please contact admin"
         
+        if not self.dashboard_available:
+            return self._claim_study_fallback(study_id, effective_role)
+
         try:
             response = requests.post(
                 f"{self.admin_url}/studies/api/{study_id}/claim",
@@ -452,6 +521,9 @@ class OrthancClient:
     
     def release_study(self, study_id: str) -> Tuple[bool, str]:
         """Release a claimed study back to previous state via AdminDashboard."""
+        if not self.dashboard_available:
+            return self._release_study_fallback(study_id)
+
         try:
             response = requests.post(
                 f"{self.admin_url}/studies/api/{study_id}/release",

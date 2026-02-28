@@ -14,7 +14,12 @@ from .OrthancClient import OrthancClient, AnnotationStatus
 
 
 class OrthancLoginWidget(qt.QWidget):
-    """Login panel for Orthanc authentication via AdminDashboard."""
+    """Login panel for Orthanc authentication via AdminDashboard.
+
+    When AdminDashboard is unreachable the widget automatically offers a
+    *direct-login* mode that uses Orthanc basic-auth credentials and a
+    locally-chosen role so the annotation workflow is never blocked.
+    """
     
     def __init__(self, orthanc_client: OrthancClient, 
                  on_login_success: Optional[Callable] = None,
@@ -22,6 +27,7 @@ class OrthancLoginWidget(qt.QWidget):
         super().__init__(parent)
         self.orthancClient = orthanc_client
         self.onLoginSuccess = on_login_success
+        self._directMode = False  # True when user toggles "Direct Orthanc Login"
         self.setupUI()
         
     def setupUI(self):
@@ -54,10 +60,45 @@ class OrthancLoginWidget(qt.QWidget):
         
         layout.addWidget(credGroup)
         
-        # Note: Role is now determined by AdminDashboard, not selected locally
-        roleNote = qt.QLabel("Note: Your role is assigned by the administrator")
-        roleNote.setStyleSheet("color: gray; font-style: italic; font-size: 11px;")
-        layout.addWidget(roleNote)
+        # Role note (shown in normal mode)
+        self.roleNote = qt.QLabel("Note: Your role is assigned by the administrator")
+        self.roleNote.setStyleSheet("color: gray; font-style: italic; font-size: 11px;")
+        layout.addWidget(self.roleNote)
+        
+        # --- Direct mode controls (hidden by default) ---
+        self.directModeGroup = qt.QGroupBox("Role Selection  (Dashboard Offline)")
+        self.directModeGroup.setStyleSheet(
+            "QGroupBox { color: #856404; border: 1px solid #ffc107; "
+            "border-radius: 4px; margin-top: 6px; padding-top: 14px; }"
+            "QGroupBox::title { background-color: #fff3cd; padding: 2px 6px; }"
+        )
+        directLayout = qt.QFormLayout(self.directModeGroup)
+        
+        self.roleCombo = qt.QComboBox()
+        self.roleCombo.addItems(["annotator", "reviewer", "admin"])
+        directLayout.addRow("Role:", self.roleCombo)
+        
+        directHint = qt.QLabel(
+            "AdminDashboard is unreachable. You can log in directly to\n"
+            "Orthanc with static credentials. Select your role manually."
+        )
+        directHint.setStyleSheet("color: #856404; font-size: 11px;")
+        directHint.setWordWrap(True)
+        directLayout.addRow(directHint)
+        
+        self.directModeGroup.setVisible(False)
+        layout.addWidget(self.directModeGroup)
+        
+        # Toggle link to switch to direct mode manually
+        self.directModeToggle = qt.QPushButton("Dashboard down? Login directly to Orthanc →")
+        self.directModeToggle.setFlat(True)
+        self.directModeToggle.setStyleSheet(
+            "color: #0366d6; text-decoration: underline; font-size: 11px; "
+            "border: none; padding: 2px; text-align: left;"
+        )
+        self.directModeToggle.setCursor(qt.Qt.PointingHandCursor)
+        self.directModeToggle.clicked.connect(self._toggleDirectMode)
+        layout.addWidget(self.directModeToggle)
         
         # Login button
         self.loginButton = qt.QPushButton("Login")
@@ -73,10 +114,36 @@ class OrthancLoginWidget(qt.QWidget):
         
         # Enable enter key to login
         self.passwordEdit.returnPressed.connect(self.onLogin)
-        
+
+    # ----- direct-mode helpers ------------------------------------------------
+
+    def _toggleDirectMode(self):
+        """Toggle between AdminDashboard and direct Orthanc login."""
+        self._directMode = not self._directMode
+        self.directModeGroup.setVisible(self._directMode)
+        self.roleNote.setVisible(not self._directMode)
+        self.adminUrlEdit.setEnabled(not self._directMode)
+        if self._directMode:
+            self.directModeToggle.setText("← Back to AdminDashboard login")
+            self.loginButton.setText("Login to Orthanc (Direct)")
+        else:
+            self.directModeToggle.setText("Dashboard down? Login directly to Orthanc →")
+            self.loginButton.setText("Login")
+
+    def _activateDirectMode(self):
+        """Activate direct-login mode (called automatically on dashboard failure)."""
+        if not self._directMode:
+            self._directMode = True
+            self.directModeGroup.setVisible(True)
+            self.roleNote.setVisible(False)
+            self.adminUrlEdit.setEnabled(False)
+            self.directModeToggle.setText("← Back to AdminDashboard login")
+            self.loginButton.setText("Login to Orthanc (Direct)")
+
+    # --------------------------------------------------------------------------
+
     def onLogin(self):
         """Handle login button click."""
-        admin_url = self.adminUrlEdit.text.strip()
         orthanc_url = self.orthancUrlEdit.text.strip()
         username = self.usernameEdit.text.strip()
         password = self.passwordEdit.text
@@ -87,30 +154,59 @@ class OrthancLoginWidget(qt.QWidget):
             return
         
         self.loginButton.setEnabled(False)
-        self.statusLabel.setText("Connecting to AdminDashboard...")
-        self.statusLabel.setStyleSheet("color: gray;")
         
-        # Update URLs
-        self.orthancClient.admin_url = admin_url
+        # Update Orthanc URL regardless of mode
         self.orthancClient.server_url = orthanc_url
-        
-        # Attempt login via AdminDashboard
-        success, message = self.orthancClient.login(username, password)
-        
-        if success:
-            role = self.orthancClient.get_role()
-            self.statusLabel.setText(f"✓ {message}")
-            self.statusLabel.setStyleSheet("color: green;")
+
+        if self._directMode:
+            # --- Direct Orthanc login (AdminDashboard bypassed) ---
+            self.statusLabel.setText("Connecting to Orthanc directly...")
+            self.statusLabel.setStyleSheet("color: gray;")
             
-            if self.onLoginSuccess:
-                self.onLoginSuccess(role)
+            role = self.roleCombo.currentText
+            success, message = self.orthancClient.login_direct(username, password, role)
+            
+            if success:
+                self.statusLabel.setText(f"✓ {message}")
+                self.statusLabel.setStyleSheet("color: #28a745;")
+                if self.onLoginSuccess:
+                    self.onLoginSuccess(role)
+            else:
+                self.statusLabel.setText(f"✗ {message}")
+                self.statusLabel.setStyleSheet("color: red;")
+                self.loginButton.setEnabled(True)
         else:
-            self.statusLabel.setText(f"✗ {message}")
-            self.statusLabel.setStyleSheet("color: red;")
-            self.loginButton.setEnabled(True)
+            # --- Normal AdminDashboard login ---
+            admin_url = self.adminUrlEdit.text.strip()
+            self.orthancClient.admin_url = admin_url
+            self.statusLabel.setText("Connecting to AdminDashboard...")
+            self.statusLabel.setStyleSheet("color: gray;")
+            
+            success, message = self.orthancClient.login(username, password)
+            
+            if success:
+                role = self.orthancClient.get_role()
+                self.statusLabel.setText(f"✓ {message}")
+                self.statusLabel.setStyleSheet("color: green;")
+                if self.onLoginSuccess:
+                    self.onLoginSuccess(role)
+            else:
+                self.statusLabel.setText(f"✗ {message}")
+                self.statusLabel.setStyleSheet("color: red;")
+                self.loginButton.setEnabled(True)
+                
+                # If dashboard is unreachable, auto-switch to direct mode
+                if "Cannot connect to AdminDashboard" in message or "timed out" in message.lower():
+                    self._activateDirectMode()
+                    self.statusLabel.setText(
+                        f"✗ {message}\n\n"
+                        "Switched to Direct Orthanc Login mode. "
+                        "Select your role and try again."
+                    )
+                    self.statusLabel.setStyleSheet("color: #856404;")
     
     def getSelectedRole(self) -> str:
-        """Get the authenticated user's role (from AdminDashboard)."""
+        """Get the authenticated user's role (from AdminDashboard or manual)."""
         return self.orthancClient.get_role() or "annotator"
 
 
