@@ -463,6 +463,15 @@ class WorkflowWidget(qt.QWidget):
             and self.centerlinePicker.currentPreviewPos is not None
         ):
             self.btnConfirmPoint.setEnabled(True)
+            self.lblClickStatus.setText(
+                "Preview placed \u2014 adjust in Axial / Coronal / Sagittal "
+                "views, then press Confirm"
+            )
+            self.lblClickStatus.setStyleSheet(
+                "color: #856404; background-color: #fff3cd; "
+                "border: 1px solid #ffc107; border-radius: 3px; "
+                "padding: 4px; font-weight: bold;"
+            )
         else:
             self.btnConfirmPoint.setEnabled(False)
     

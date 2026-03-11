@@ -186,6 +186,16 @@ class CenterlinePicker:
         self._hoverTimer.timeout.connect(self._performHoverPick)
         self._lastMousePos = None
 
+        # Slice-view adjustment support
+        self._previewObserverTag = None
+        self._isSnapping = False
+        self._snapTimer = qt.QTimer()
+        self._snapTimer.setInterval(150)
+        self._snapTimer.setSingleShot(True)
+        self._snapTimer.timeout.connect(self._performSnapToLine)
+        self._originalSliceIntersectionVisibility = None
+        self._originalSliceIntersectionThickness = None
+
     # ------------------------------------------------------------------
     #  Public helpers
     # ------------------------------------------------------------------
@@ -265,6 +275,16 @@ class CenterlinePicker:
             displayNode.SetLineWidth(3)
             displayNode.SetOpacity(0.6)
 
+            # Show centerline in all 2D slice views (Axial/Coronal/Sagittal)
+            self._originalSliceIntersectionVisibility = (
+                displayNode.GetSliceIntersectionVisibility()
+            )
+            self._originalSliceIntersectionThickness = (
+                displayNode.GetSliceIntersectionThickness()
+            )
+            displayNode.SetSliceIntersectionVisibility(True)
+            displayNode.SetSliceIntersectionThickness(3)
+
         # Install VTK observers
         if not self._setupPointPicking():
             return False
@@ -275,6 +295,8 @@ class CenterlinePicker:
     def disable(self):
         """Disable click mode and clean up transient nodes."""
         self._hoverTimer.stop()
+        self._snapTimer.stop()
+        self._stopPreviewObservation()
 
         # Restore centerline appearance
         if self.centerlineNode:
@@ -285,6 +307,18 @@ class CenterlinePicker:
                 if self.originalCenterlineOpacity is not None:
                     displayNode.SetOpacity(self.originalCenterlineOpacity)
                 displayNode.SetLineWidth(1)
+
+                # Restore 2D slice intersection visibility
+                if self._originalSliceIntersectionVisibility is not None:
+                    displayNode.SetSliceIntersectionVisibility(
+                        self._originalSliceIntersectionVisibility
+                    )
+                if self._originalSliceIntersectionThickness is not None:
+                    displayNode.SetSliceIntersectionThickness(
+                        self._originalSliceIntersectionThickness
+                    )
+                self._originalSliceIntersectionVisibility = None
+                self._originalSliceIntersectionThickness = None
 
         self._removePointPicking()
 
@@ -542,7 +576,12 @@ class CenterlinePicker:
     # ------------------------------------------------------------------
 
     def _updatePreviewState(self, pos, pointId):
-        """Lock the preview location and show cross-section disk + yellow slice."""
+        """Lock the preview location and show cross-section disk + slice views.
+
+        After this call the preview fiducial is *unlocked* so the user can
+        drag it in axial / coronal / sagittal slice views.  A snap-to-
+        centerline timer re-projects the point on release.
+        """
         self.currentPreviewPos = pos
         self.currentPreviewId = pointId
 
@@ -555,6 +594,10 @@ class CenterlinePicker:
             else None
         )
 
+        # Stop observing before modifying the preview node
+        self._stopPreviewObservation()
+        self._isSnapping = True
+
         # Update preview fiducial
         if self.previewNode:
             self.previewNode.RemoveAllControlPoints()
@@ -563,6 +606,17 @@ class CenterlinePicker:
             self.previewNode.SetNthControlPointLabel(0, f"\u25b6 {label}")
             if lm:
                 self.previewNode.GetDisplayNode().SetSelectedColor(*lm["color"])
+
+            # Unlock so the user can drag in slice views to adjust
+            self.previewNode.SetLocked(False)
+
+            # Ensure preview fiducial is visible in 2D slice views
+            pDisp = self.previewNode.GetDisplayNode()
+            if pDisp:
+                pDisp.SetSliceProjection(True)
+                pDisp.SetSliceProjectionUseFiducialColor(True)
+
+        self._isSnapping = False
 
         # Tangent and slice orientation
         tangent = self._getTangentAtPoint(self.centerlineNode.GetPolyData(), pointId)
@@ -583,8 +637,14 @@ class CenterlinePicker:
         )
         yellowSlice.sliceLogic().GetSliceNode().SetSliceVisible(False)
 
+        # Center Red (Axial) and Green (Coronal) slices on the point
+        self._centerSliceViewsOnPoint(pos)
+
         # 3D disk
         self._createOrUpdatePreviewPlane(pos, n, t1, lm)
+
+        # Start observing the preview node for user adjustments in slices
+        self._startPreviewObservation()
 
     def _createOrUpdatePreviewPlane(self, center, normal, xAxis, lm=None):
         if self.previewPlaneNode:
@@ -635,6 +695,109 @@ class CenterlinePicker:
             threeDWidget.threeDView().forceRender()
 
     # ------------------------------------------------------------------
+    #  Slice-view adjustment helpers
+    # ------------------------------------------------------------------
+
+    def _centerSliceViewsOnPoint(self, pos):
+        """Center Red (Axial) and Green (Coronal) slices on *pos*."""
+        for name in ["Red", "Green"]:
+            sw = slicer.app.layoutManager().sliceWidget(name)
+            if sw:
+                sliceNode = sw.sliceLogic().GetSliceNode()
+                sliceNode.JumpSlice(pos[0], pos[1], pos[2])
+
+    def _startPreviewObservation(self):
+        """Observe the preview fiducial for user drags in slice views."""
+        self._stopPreviewObservation()
+        if self.previewNode:
+            self._previewObserverTag = self.previewNode.AddObserver(
+                slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
+                self._onPreviewPointMoved,
+            )
+
+    def _stopPreviewObservation(self):
+        """Remove the preview-point-moved observer."""
+        if self._previewObserverTag is not None and self.previewNode:
+            self.previewNode.RemoveObserver(self._previewObserverTag)
+        self._previewObserverTag = None
+
+    def _onPreviewPointMoved(self, caller, event):
+        """Debounced handler for preview drag in slice views."""
+        if self._isSnapping:
+            return
+        if not self._snapTimer.isActive():
+            self._snapTimer.start()
+
+    def _performSnapToLine(self):
+        """Snap the preview fiducial to the nearest centerline point.
+
+        Called after the user finishes dragging in a slice view.  Updates
+        the cross-section disk and slice orientations accordingly.
+        """
+        if (
+            not self.previewNode
+            or self.previewNode.GetNumberOfControlPoints() == 0
+        ):
+            return
+
+        pos = [0.0, 0.0, 0.0]
+        self.previewNode.GetNthControlPointPosition(0, pos)
+
+        nearestPointId = self._findNearestCenterlinePoint(pos)
+        if nearestPointId < 0:
+            return
+
+        exactPos = (
+            self.centerlineNode.GetPolyData().GetPoints().GetPoint(nearestPointId)
+        )
+
+        self._isSnapping = True
+        try:
+            self.previewNode.SetNthControlPointPosition(
+                0, exactPos[0], exactPos[1], exactPos[2]
+            )
+            self.currentPreviewPos = exactPos
+            self.currentPreviewId = nearestPointId
+
+            # Recompute tangent / cross-section
+            tangent = self._getTangentAtPoint(
+                self.centerlineNode.GetPolyData(), nearestPointId
+            )
+            n = np.array(tangent, dtype=float)
+            n /= np.linalg.norm(n)
+            a = (
+                np.array([0.0, 0.0, 1.0])
+                if abs(n[2]) < 0.9
+                else np.array([0.0, 1.0, 0.0])
+            )
+            t1 = np.cross(n, a)
+            t1 /= np.linalg.norm(t1)
+
+            lm = (
+                SVS_STS_LANDMARKS[self.selectedZoneIndex]
+                if self.selectedZoneIndex < len(SVS_STS_LANDMARKS)
+                else None
+            )
+
+            # Update Yellow cross-section
+            yellowSlice = slicer.app.layoutManager().sliceWidget("Yellow")
+            if yellowSlice:
+                yellowLogic = yellowSlice.sliceLogic()
+                yellowLogic.GetSliceNode().SetSliceToRASByNTP(
+                    n[0], n[1], n[2],
+                    t1[0], t1[1], t1[2],
+                    exactPos[0], exactPos[1], exactPos[2], 0,
+                )
+
+            # Re-center Axial / Coronal views
+            self._centerSliceViewsOnPoint(exactPos)
+
+            # Re-draw cross-section disk
+            self._createOrUpdatePreviewPlane(exactPos, n, t1, lm)
+        finally:
+            self._isSnapping = False
+
+    # ------------------------------------------------------------------
     #  Confirm / commit zone point
     # ------------------------------------------------------------------
 
@@ -683,9 +846,14 @@ class CenterlinePicker:
         # Track centreline point-ID for zone colouring
         self.landmarkPointIds[zoneIndex] = self.currentPreviewId
 
+        # Stop slice-view adjustment observation
+        self._stopPreviewObservation()
+        self._snapTimer.stop()
+
         # Clean up preview artefacts
         if self.previewNode:
             self.previewNode.RemoveAllControlPoints()
+            self.previewNode.SetLocked(True)
         if self.previewPlaneNode:
             slicer.mrmlScene.RemoveNode(self.previewPlaneNode)
             self.previewPlaneNode = None
