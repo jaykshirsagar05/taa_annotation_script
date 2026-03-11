@@ -140,7 +140,7 @@ class OrthancIntegrationWidget(qt.QWidget):
         # Clean up any existing worklist widget first
         if self.worklistWidget:
             try:
-                self.worklistWidget.studySelected.disconnect()
+                self.worklistWidget.seriesSelected.disconnect()
             except (TypeError, RuntimeError):
                 pass
             try:
@@ -159,7 +159,7 @@ class OrthancIntegrationWidget(qt.QWidget):
         
         # Create new worklist widget
         self.worklistWidget = OrthancWorklistWidget(self.orthancClient, role)
-        self.worklistWidget.studySelected.connect(self._onStudySelected)
+        self.worklistWidget.seriesSelected.connect(self._onSeriesSelected)
         self.worklistWidget.logoutButton.clicked.connect(self._onLogout)
         
         # Show offline-mode banner when AdminDashboard is unavailable
@@ -238,7 +238,7 @@ class OrthancIntegrationWidget(qt.QWidget):
         # Safe to clean up now - logoutButton's signal has fully unwound
         if self.worklistWidget:
             try:
-                self.worklistWidget.studySelected.disconnect()
+                self.worklistWidget.seriesSelected.disconnect()
             except (TypeError, RuntimeError):
                 pass
             try:
@@ -269,41 +269,41 @@ class OrthancIntegrationWidget(qt.QWidget):
 
         self.loggedOut.emit()
         
-    def _onStudySelected(self, study_id: str, study_info: dict):
-        """Handle study selection from worklist — profile-aware loading."""
-        self.currentStudyId = study_id
-        self.currentStudyInfo = study_info
-        
+    def _onSeriesSelected(self, series_id: str, series_info: dict):
+        """Handle CT series selection from worklist — profile-aware download and load."""
+        self.currentStudyId = series_id          # kept as currentStudyId for compat
+        self.currentStudyInfo = series_info
+
         try:
-            slicer.util.showStatusMessage("Detecting dataset profile...")
+            slicer.util.showStatusMessage("Detecting dataset profile for series...")
             slicer.app.processEvents()
-            
-            # Auto-detect profile from available attachments
-            profile = self.orthancClient.detect_dataset_profile(study_id)
+
+            # Auto-detect profile from series-level (+ parent study fallback) attachments
+            profile = self.orthancClient.detect_dataset_profile_for_series(series_id)
             if profile is None:
                 slicer.util.errorDisplay(
-                    "Cannot determine dataset type.\n\n"
-                    "The study must have at minimum a CT scan and a "
-                    "segmentation mask attached."
+                    "Cannot determine dataset type for this series.\n\n"
+                    "The series (or its parent study) must have at minimum a CT "
+                    "scan and a segmentation mask attached."
                 )
                 return
 
-            patient_id = study_info['patient_id']
-            print(f"[Orthanc] Detected profile: {profile.name} for {patient_id}")
-            
+            patient_id = series_info.get("patient_id", series_id)
+            print(f"[Orthanc] Series {series_id} — profile: {profile.name}, "
+                  f"patient: {patient_id}")
+
             slicer.util.showStatusMessage(
-                f"Downloading data from Orthanc ({profile.name})..."
+                f"Downloading series data from Orthanc ({profile.name})..."
             )
             slicer.app.processEvents()
-            
-            # Create temp directory
+
             self.tempDir = tempfile.mkdtemp(prefix=f"orthanc_{patient_id}_")
-            
-            # Download files based on profile
-            paths = self.orthancClient.download_study_files(
-                study_id, patient_id, profile, self.tempDir
+
+            # Download using series-level method (transparent study-level fallback)
+            paths = self.orthancClient.download_files_for_series(
+                series_id, patient_id, profile, self.tempDir
             )
-            
+
             # Validate required files
             missing = [name for name in profile.required_attachments
                        if not paths.get(name)]
@@ -320,32 +320,31 @@ class OrthancIntegrationWidget(qt.QWidget):
                     f"  {', '.join(missing_labels)}"
                 )
                 return
-            
+
             # Enable action buttons
             if self.userRole == "annotator":
                 self.btnSubmit.setEnabled(True)
             else:
                 self.btnApprove.setEnabled(True)
                 self.btnReject.setEnabled(True)
-            
-            # Build study_info with paths and profile
-            study_info['_file_paths'] = paths
-            study_info['_profile'] = profile
-            study_info['_temp_dir'] = self.tempDir
-            
-            # Legacy keys for backward compatibility
-            study_info['_ct_path'] = paths.get("ct")
-            study_info['_unified_path'] = paths.get("seg_mask")
-            study_info['_merged_path'] = paths.get("ref_mask")
-            
-            self.studyLoaded.emit(study_id, study_info)
-            
+
+            # Enrich series_info with local file paths and profile
+            series_info['_file_paths'] = paths
+            series_info['_profile']    = profile
+            series_info['_temp_dir']   = self.tempDir
+            # Legacy keys expected by TAAAnnotationWidget.onOrthancStudyLoaded
+            series_info['_ct_path']       = paths.get("ct")
+            series_info['_unified_path']  = paths.get("seg_mask")
+            series_info['_merged_path']   = paths.get("ref_mask")
+
+            self.studyLoaded.emit(series_id, series_info)
+
             slicer.util.showStatusMessage(
-                f"Loaded {patient_id} from Orthanc [{profile.name}]", 3000
+                f"Loaded {patient_id} series from Orthanc [{profile.name}]", 3000
             )
-            
+
         except Exception as e:
-            slicer.util.errorDisplay(f"Failed to load study: {str(e)}")
+            slicer.util.errorDisplay(f"Failed to load series: {str(e)}")
             import traceback
             traceback.print_exc()
             

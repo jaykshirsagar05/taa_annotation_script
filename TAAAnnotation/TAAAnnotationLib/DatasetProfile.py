@@ -155,7 +155,8 @@ def detect_profile_from_attachments(available_attachments):
     Returns:
         DatasetProfile instance, or None if no profile matches.
     """
-    has_ct        = available_attachments.get("ct_nifti", False)
+    has_ct        = (available_attachments.get("ct_nifti", False)
+                     or available_attachments.get("ct_dicom", False))
     has_unified   = available_attachments.get("unified_mask", False)
     has_merged    = available_attachments.get("merged_mask", False)
     has_centerline = available_attachments.get("centerline", False)

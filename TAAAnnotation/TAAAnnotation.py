@@ -208,31 +208,33 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             import traceback
             traceback.print_exc()
 
-    def _loadExistingAnnotations(self, study_id: str, temp_dir: str):
-        """Load existing annotations for review."""
-        # Download refined mask
-        refined_path = self.orthancClient.download_nifti(
-            study_id,
+    def _loadExistingAnnotations(self, series_id: str, temp_dir: str):
+        """Load existing annotations for review (series-level attachments)."""
+        pid = self.logic.currentId
+
+        # Refined mask
+        refined_path = self.orthancClient.download_nifti_from_series(
+            series_id,
             OrthancClient.ATTACHMENT_REFINED_MASK,
-            os.path.join(temp_dir, f"{self.logic.currentId}_refined_mask.seg.nrrd")
+            os.path.join(temp_dir, f"{pid}_refined_mask.seg.nrrd"),
         )
         if refined_path:
             slicer.util.loadSegmentation(refined_path)
-        
-        # Download zones
-        zones_path = self.orthancClient.download_nifti(
-            study_id,
+
+        # Zones
+        zones_path = self.orthancClient.download_nifti_from_series(
+            series_id,
             OrthancClient.ATTACHMENT_ZONES,
-            os.path.join(temp_dir, f"{self.logic.currentId}_Zones.fcsv")
+            os.path.join(temp_dir, f"{pid}_Zones.fcsv"),
         )
         if zones_path:
             slicer.util.loadMarkups(zones_path)
-        
-        # Download centerline
-        centerline_path = self.orthancClient.download_nifti(
-            study_id,
+
+        # Centerline
+        centerline_path = self.orthancClient.download_nifti_from_series(
+            series_id,
             OrthancClient.ATTACHMENT_CENTERLINE,
-            os.path.join(temp_dir, f"{self.logic.currentId}_Centerline.vtk")
+            os.path.join(temp_dir, f"{pid}_Centerline.vtk"),
         )
         if centerline_path:
             slicer.util.loadModel(centerline_path)
@@ -316,7 +318,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             progressDialog.setLabelText("Uploading...")
             slicer.app.processEvents()
             
-            success, message = self.orthancClient.submit_annotation(study_id, files, notes)
+            success, message = self.orthancClient.submit_annotation_on_series(study_id, files, notes)
             
             progressDialog.close()
             
@@ -346,7 +348,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         
         try:
             comments = self.orthancWidget.getReviewComments()
-            success, message = self.orthancClient.approve_annotation(study_id, comments)
+            success, message = self.orthancClient.approve_annotation_on_series(study_id, comments)
             
             if success:
                 slicer.util.infoDisplay(f"✓ {message}")
@@ -367,7 +369,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
         
         try:
-            success, message = self.orthancClient.reject_annotation(study_id, reason)
+            success, message = self.orthancClient.reject_annotation_on_series(study_id, reason)
             
             if success:
                 slicer.util.infoDisplay(f"✓ {message}")
@@ -815,15 +817,15 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         errors = []
         slicer.mrmlScene.Clear(0)
 
-        # --- CT volume (always required) ---
+        # --- CT volume (always required; supports NIfTI file or DICOM folder) ---
         ct_path = file_paths.get("ct")
         if not ct_path or not os.path.exists(ct_path):
             raise RuntimeError(f"CT scan path missing or not found: {ct_path}")
         try:
             print(f"[Loading] CT from: {ct_path}")
-            self.volNode = slicer.util.loadVolume(ct_path)
+            self.volNode = self._loadCtVolume(ct_path)
             if not self.volNode:
-                raise RuntimeError("loadVolume returned None")
+                raise RuntimeError("Failed to load CT volume")
         except Exception as e:
             raise RuntimeError(f"Failed to load CT volume from {ct_path}: {e}")
 
@@ -993,6 +995,49 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         if self.volNode:
             slicer.app.layoutManager().sliceWidget('Red').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(self.volNode.GetID())
         slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+
+    def _loadCtVolume(self, ct_path):
+        """
+        Load CT from either a file path (NIfTI/NRRD) or a DICOM folder.
+
+        Returns:
+            vtkMRMLScalarVolumeNode on success, or None.
+        """
+        if os.path.isdir(ct_path):
+            return self._loadDicomFromFolder(ct_path)
+        return slicer.util.loadVolume(ct_path)
+
+    def _loadDicomFromFolder(self, dicom_folder):
+        """Import and load a DICOM study from a folder into the MRML scene."""
+        try:
+            from DICOMLib import DICOMUtils
+
+            loaded_node_ids = []
+            with DICOMUtils.TemporaryDICOMDatabase() as db:
+                DICOMUtils.importDicom(dicom_folder, db)
+                patient_uids = db.patients()
+                for patient_uid in patient_uids:
+                    loaded_node_ids.extend(DICOMUtils.loadPatientByUID(patient_uid))
+
+            for node_id in loaded_node_ids:
+                node = slicer.mrmlScene.GetNodeByID(node_id)
+                if node and node.IsA("vtkMRMLScalarVolumeNode"):
+                    print(f"[Loading] DICOM CT loaded from folder: {dicom_folder}")
+                    return node
+
+            # Fallback: first .dcm file as generic volume load
+            for root, _, files in os.walk(dicom_folder):
+                for name in files:
+                    if name.lower().endswith(".dcm"):
+                        dicom_file = os.path.join(root, name)
+                        node = slicer.util.loadVolume(dicom_file)
+                        if node:
+                            print(f"[Loading] DICOM CT loaded via file fallback: {dicom_file}")
+                            return node
+            return None
+        except Exception as e:
+            print(f"[Loading] Failed to load DICOM CT from folder '{dicom_folder}': {e}")
+            return None
 
     # -----------------------------------------------------------------
     # File-format loading helpers

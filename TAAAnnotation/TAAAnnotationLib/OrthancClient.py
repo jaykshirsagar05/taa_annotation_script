@@ -17,6 +17,7 @@ import requests
 import json
 import tempfile
 import os
+import zipfile
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from enum import Enum
@@ -750,6 +751,7 @@ class OrthancClient:
         """Check which standard attachments exist for a study."""
         return {
             "ct_nifti": self.has_attachment(study_id, self.ATTACHMENT_CT_NIFTI),
+            "ct_dicom": self._study_has_ct_dicom(study_id),
             "unified_mask": self.has_attachment(study_id, self.ATTACHMENT_UNIFIED_MASK),
             "merged_mask": self.has_attachment(study_id, self.ATTACHMENT_MERGED_MASK),
             "refined_mask": self.has_attachment(study_id, self.ATTACHMENT_REFINED_MASK),
@@ -791,11 +793,15 @@ class OrthancClient:
 
         # Download required attachments
         for logical_name, att_id in profile.required_attachments.items():
-            fname = download_filename(logical_name, patient_id)
-            local_path = self.download_nifti(
-                study_id, att_id,
-                os.path.join(temp_dir, fname)
-            )
+            if logical_name == "ct":
+                # CT priority: NIfTI attachment first, then DICOM from Orthanc series
+                local_path = self._download_ct_with_fallback(study_id, patient_id, temp_dir)
+            else:
+                fname = download_filename(logical_name, patient_id)
+                local_path = self.download_nifti(
+                    study_id, att_id,
+                    os.path.join(temp_dir, fname)
+                )
             # For centerline files: detect actual format and rename if needed
             if logical_name == "centerline" and local_path:
                 local_path = self._detect_and_fix_centerline_ext(local_path)
@@ -811,6 +817,110 @@ class OrthancClient:
             paths[logical_name] = local_path
 
         return paths
+
+    def _download_ct_with_fallback(self, study_id: str, patient_id: str, temp_dir: str) -> Optional[str]:
+        """
+        Download CT data for a study.
+
+        Priority order:
+            1) CT NIfTI attachment (type 1025)
+            2) DICOM CT series downloaded from the Orthanc study
+
+        Returns:
+            Local file path (NIfTI) or folder path (DICOM directory), or None.
+        """
+        from .DatasetProfile import download_filename
+
+        ct_fname = download_filename("ct", patient_id)
+        nifti_path = self.download_nifti(
+            study_id,
+            self.ATTACHMENT_CT_NIFTI,
+            os.path.join(temp_dir, ct_fname),
+        )
+        if nifti_path:
+            print(f"[OrthancClient] CT downloaded as NIfTI attachment: {os.path.basename(nifti_path)}")
+            return nifti_path
+
+        dicom_dir = os.path.join(temp_dir, f"{patient_id}_ct_dicom")
+        if self._download_ct_dicom_series(study_id, dicom_dir):
+            print(f"[OrthancClient] CT downloaded as DICOM series: {dicom_dir}")
+            return dicom_dir
+
+        print("[OrthancClient] CT download failed (neither NIfTI attachment nor DICOM CT series available)")
+        return None
+
+    def _study_has_ct_dicom(self, study_id: str) -> bool:
+        """Return True when the study contains at least one CT series with instances."""
+        try:
+            response = self.session.get(f"{self.server_url}/studies/{study_id}")
+            if response.status_code != 200:
+                return False
+            series_ids = response.json().get("Series", [])
+            for series_id in series_ids:
+                series_resp = self.session.get(f"{self.server_url}/series/{series_id}")
+                if series_resp.status_code != 200:
+                    continue
+                series = series_resp.json()
+                modality = series.get("MainDicomTags", {}).get("Modality", "")
+                instances = series.get("Instances", [])
+                if modality == "CT" and len(instances) > 0:
+                    return True
+        except Exception as e:
+            print(f"[OrthancClient] Error checking CT DICOM availability: {e}")
+        return False
+
+    def _download_ct_dicom_series(self, study_id: str, output_dir: str) -> bool:
+        """
+        Download a CT DICOM series from the study into output_dir.
+
+        Chooses the CT series with the most instances and extracts its
+        archive ZIP from Orthanc.
+        """
+        try:
+            response = self.session.get(f"{self.server_url}/studies/{study_id}")
+            if response.status_code != 200:
+                return False
+
+            series_ids = response.json().get("Series", [])
+            best_series_id = None
+            best_count = -1
+            for series_id in series_ids:
+                series_resp = self.session.get(f"{self.server_url}/series/{series_id}")
+                if series_resp.status_code != 200:
+                    continue
+                series = series_resp.json()
+                modality = series.get("MainDicomTags", {}).get("Modality", "")
+                instances = series.get("Instances", [])
+                if modality != "CT":
+                    continue
+                count = len(instances)
+                if count > best_count:
+                    best_series_id = series_id
+                    best_count = count
+
+            if not best_series_id:
+                return False
+
+            os.makedirs(output_dir, exist_ok=True)
+            archive_resp = self.session.get(f"{self.server_url}/series/{best_series_id}/archive")
+            if archive_resp.status_code != 200:
+                return False
+
+            zip_path = os.path.join(output_dir, "series.zip")
+            with open(zip_path, "wb") as f:
+                f.write(archive_resp.content)
+
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(output_dir)
+            os.remove(zip_path)
+
+            for root, _, files in os.walk(output_dir):
+                if any(name.lower().endswith(".dcm") for name in files):
+                    return True
+            return False
+        except Exception as e:
+            print(f"[OrthancClient] Error downloading CT DICOM series: {e}")
+            return False
 
     @staticmethod
     def _detect_and_fix_centerline_ext(filepath: str) -> str:
@@ -876,6 +986,10 @@ class OrthancClient:
         
         uploaded = []
         for name, path in files.items():
+            # Explicitly ignore non-annotation payloads (e.g., CT volume);
+            # CT is source data and should not be re-uploaded at submission time.
+            if name not in file_mapping:
+                continue
             if path and os.path.exists(path):
                 attachment_type = file_mapping.get(name)
                 if attachment_type and self.upload_nifti(study_id, path, attachment_type):
@@ -1033,6 +1147,596 @@ class OrthancClient:
     # -------------------------------------------------------------------------
     # Annotation Metadata Methods
     # -------------------------------------------------------------------------
+
+    # =========================================================================
+    # Series-Level Annotation Workflow
+    # =========================================================================
+    # Each CT series in Orthanc is treated as one annotatable unit.
+    # Annotations (masks, centerline, zones) are stored as attachments on the
+    # series using the same type IDs as the study-level workflow.
+    # For initial segmentation masks that were uploaded at the study level
+    # (the existing workflow), downloads fall back transparently to the
+    # parent study.
+    # =========================================================================
+
+    def get_all_ct_series(self) -> List[Dict[str, Any]]:
+        """
+        Return info dicts for every CT-modality series in Orthanc.
+
+        Each item is a complete annotation work-item that can be shown as a
+        row in the worklist table.
+        """
+        try:
+            response = self.session.get(f"{self.server_url}/series")
+            response.raise_for_status()
+            all_ids = response.json()
+        except Exception as e:
+            print(f"[OrthancClient] Error listing series: {e}")
+            return []
+
+        ct_series = []
+        for series_id in all_ids:
+            info = self.get_series_info(series_id)
+            if info and info.get("modality") == "CT":
+                ct_series.append(info)
+        return ct_series
+
+    def get_series_info(self, series_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get full display info for a series, including patient data from the
+        parent study and current annotation status from series-level metadata.
+
+        Returns:
+            Dict suitable for a worklist row, or None on error.
+        """
+        try:
+            response = self.session.get(f"{self.server_url}/series/{series_id}")
+            response.raise_for_status()
+            series_data = response.json()
+        except Exception as e:
+            print(f"[OrthancClient] Error fetching series {series_id}: {e}")
+            return None
+
+        parent_study_id = series_data.get("ParentStudy", "")
+        tags = series_data.get("MainDicomTags", {})
+
+        # Patient info lives on the parent study
+        patient_id = patient_name = study_date = ""
+        try:
+            study_resp = self.session.get(f"{self.server_url}/studies/{parent_study_id}")
+            if study_resp.status_code == 200:
+                sd = study_resp.json()
+                patient_id  = sd.get("PatientMainDicomTags", {}).get("PatientID", "")
+                patient_name = sd.get("PatientMainDicomTags", {}).get("PatientName", "")
+                study_date   = sd.get("MainDicomTags", {}).get("StudyDate", "")
+        except Exception:
+            pass
+
+        metadata = self.get_series_annotation_metadata(series_id)
+        return {
+            "orthanc_series_id": series_id,
+            "orthanc_study_id":  parent_study_id,
+            "patient_id":        patient_id,
+            "patient_name":      patient_name,
+            "study_date":        study_date,
+            "series_description": tags.get("SeriesDescription", ""),
+            "series_number":     tags.get("SeriesNumber", ""),
+            "modality":          tags.get("Modality", "Unknown"),
+            "instance_count":    len(series_data.get("Instances", [])),
+            "annotation_status": (metadata.get("status", AnnotationStatus.PENDING.value)
+                                  if metadata else AnnotationStatus.PENDING.value),
+            "annotator":  metadata.get("annotator")  if metadata else None,
+            "reviewer":   metadata.get("reviewer")   if metadata else None,
+            "annotation_metadata": metadata,
+        }
+
+    def get_series_annotation_metadata(self, series_id: str) -> Optional[Dict[str, Any]]:
+        """Read annotation metadata stored at the series level."""
+        try:
+            response = self.session.get(
+                f"{self.server_url}/series/{series_id}"
+                f"/attachments/{self.ATTACHMENT_METADATA}/data"
+            )
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code == 404:
+                return {
+                    "status": AnnotationStatus.PENDING.value,
+                    "created": None, "annotator": None,
+                    "reviewer": None, "history": [],
+                }
+            return None
+        except Exception as e:
+            print(f"[OrthancClient] Error getting series metadata {series_id}: {e}")
+            return None
+
+    def set_series_annotation_metadata(self, series_id: str,
+                                        metadata: Dict[str, Any]) -> bool:
+        """Write annotation metadata to the series level."""
+        try:
+            import json as _json
+            metadata["last_modified"] = datetime.now().isoformat()
+            response = self.session.put(
+                f"{self.server_url}/series/{series_id}"
+                f"/attachments/{self.ATTACHMENT_METADATA}",
+                data=_json.dumps(metadata),
+                headers={"Content-Type": "application/json"},
+            )
+            return response.status_code in (200, 201)
+        except Exception as e:
+            print(f"[OrthancClient] Error setting series metadata {series_id}: {e}")
+            return False
+
+    def has_attachment_on_series(self, series_id: str, attachment_type: int) -> bool:
+        """Return True when the attachment exists on a series."""
+        try:
+            return self.session.get(
+                f"{self.server_url}/series/{series_id}/attachments/{attachment_type}"
+            ).status_code == 200
+        except Exception:
+            return False
+
+    def get_series_attachments_info(self, series_id: str,
+                                     parent_study_id: str = "") -> Dict[str, bool]:
+        """
+        Check which annotation attachments exist for a CT series.
+
+        Looks at series-level attachments first.  For the initial masks
+        (unified and merged) it also falls back to the parent study so that
+        masks uploaded at study level (the existing workflow) are still found.
+
+        Args:
+            series_id:       Orthanc series ID.
+            parent_study_id: Parent study ID; resolved automatically when empty.
+
+        Returns:
+            Dict of {logical_name: bool}.
+        """
+        if not parent_study_id:
+            try:
+                r = self.session.get(f"{self.server_url}/series/{series_id}")
+                if r.status_code == 200:
+                    parent_study_id = r.json().get("ParentStudy", "")
+            except Exception:
+                pass
+
+        def _has(url: str) -> bool:
+            try:
+                return self.session.get(url).status_code == 200
+            except Exception:
+                return False
+
+        def _series_or_study(att_id: int) -> bool:
+            if _has(f"{self.server_url}/series/{series_id}/attachments/{att_id}"):
+                return True
+            if parent_study_id:
+                return _has(
+                    f"{self.server_url}/studies/{parent_study_id}/attachments/{att_id}"
+                )
+            return False
+
+        # Determine instance count from cached data if possible
+        ct_dicom = False
+        try:
+            r = self.session.get(f"{self.server_url}/series/{series_id}")
+            if r.status_code == 200:
+                ct_dicom = len(r.json().get("Instances", [])) > 0
+        except Exception:
+            pass
+
+        return {
+            "ct_dicom":    ct_dicom,
+            "ct_nifti":    _series_or_study(self.ATTACHMENT_CT_NIFTI),
+            "unified_mask": _series_or_study(self.ATTACHMENT_UNIFIED_MASK),
+            "merged_mask": _series_or_study(self.ATTACHMENT_MERGED_MASK),
+            "refined_mask": _has(
+                f"{self.server_url}/series/{series_id}/attachments/{self.ATTACHMENT_REFINED_MASK}"
+            ),
+            "centerline": _has(
+                f"{self.server_url}/series/{series_id}/attachments/{self.ATTACHMENT_CENTERLINE}"
+            ),
+            "zones": _has(
+                f"{self.server_url}/series/{series_id}/attachments/{self.ATTACHMENT_ZONES}"
+            ),
+            "endpoints": _has(
+                f"{self.server_url}/series/{series_id}/attachments/{self.ATTACHMENT_ENDPOINTS}"
+            ),
+            "notes": _has(
+                f"{self.server_url}/series/{series_id}/attachments/{self.ATTACHMENT_NOTES}"
+            ),
+            "metadata": _has(
+                f"{self.server_url}/series/{series_id}/attachments/{self.ATTACHMENT_METADATA}"
+            ),
+        }
+
+    def detect_dataset_profile_for_series(self, series_id: str):
+        """
+        Auto-detect the dataset profile for a CT series based on the
+        attachments available on the series (and its parent study).
+
+        Returns:
+            DatasetProfile instance, or None if no profile matches.
+        """
+        from .DatasetProfile import detect_profile_from_attachments
+        info = self.get_series_info(series_id)
+        parent_study_id = info.get("orthanc_study_id", "") if info else ""
+        attachments = self.get_series_attachments_info(series_id, parent_study_id)
+        return detect_profile_from_attachments(attachments)
+
+    def download_nifti_from_series(self, series_id: str, attachment_type: int,
+                                    output_path: Optional[str] = None) -> Optional[str]:
+        """
+        Download an attachment from a series, with transparent fallback to the
+        parent study for attachments that were uploaded at study level.
+        """
+        url = (f"{self.server_url}/series/{series_id}"
+               f"/attachments/{attachment_type}/data")
+        try:
+            resp = self.session.get(url, stream=True)
+            if resp.status_code == 200:
+                if output_path is None:
+                    suffix = self._get_extension_for_type(attachment_type)
+                    fd, output_path = tempfile.mkstemp(suffix=suffix)
+                    os.close(fd)
+                raw = resp.raw.read(decode_content=False)
+                with open(output_path, "wb") as f:
+                    f.write(raw)
+                return self._validate_nifti_file(output_path)
+            if resp.status_code != 404:
+                print(f"[OrthancClient] Series download HTTP {resp.status_code} "
+                      f"(att {attachment_type})")
+        except Exception as e:
+            print(f"[OrthancClient] Series download error: {e}")
+
+        # Fallback: parent study level
+        try:
+            r = self.session.get(f"{self.server_url}/series/{series_id}")
+            if r.status_code == 200:
+                parent_study_id = r.json().get("ParentStudy", "")
+                if parent_study_id:
+                    return self.download_nifti(parent_study_id, attachment_type,
+                                               output_path)
+        except Exception as e:
+            print(f"[OrthancClient] Study-level download fallback error: {e}")
+        return None
+
+    def upload_nifti_to_series(self, series_id: str, file_path: str,
+                                attachment_type: int) -> bool:
+        """Upload a file as an attachment on a series."""
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            response = self.session.put(
+                f"{self.server_url}/series/{series_id}/attachments/{attachment_type}",
+                data=data,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            return response.status_code in (200, 201)
+        except Exception as e:
+            print(f"[OrthancClient] Error uploading to series: {e}")
+            return False
+
+    def _download_dicom_series(self, series_id: str, output_dir: str) -> bool:
+        """Download a specific DICOM series by its Orthanc series ID into output_dir."""
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            archive_resp = self.session.get(
+                f"{self.server_url}/series/{series_id}/archive"
+            )
+            if archive_resp.status_code != 200:
+                return False
+            zip_path = os.path.join(output_dir, "series.zip")
+            with open(zip_path, "wb") as f:
+                f.write(archive_resp.content)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(output_dir)
+            os.remove(zip_path)
+            for root, _, files in os.walk(output_dir):
+                if any(fn.lower().endswith(".dcm") for fn in files):
+                    return True
+            return False
+        except Exception as e:
+            print(f"[OrthancClient] Error downloading DICOM series {series_id}: {e}")
+            return False
+
+    def download_files_for_series(self, series_id: str, patient_id: str,
+                                   profile, temp_dir: str) -> Dict[str, Optional[str]]:
+        """
+        Download all files required by a DatasetProfile for a CT series.
+
+        CT data is fetched directly from the DICOM series.  All other
+        attachments are pulled from the series level with a fallback to
+        the parent study (for masks uploaded under the old study-level
+        workflow).
+
+        Returns:
+            dict of {logical_name: local_path_or_None}
+        """
+        from .DatasetProfile import download_filename
+        paths: Dict[str, Optional[str]] = {}
+
+        # --- CT: NIfTI attachment first, then DICOM series archive ---
+        ct_fname = download_filename("ct", patient_id)
+        ct_path = self.download_nifti_from_series(
+            series_id, self.ATTACHMENT_CT_NIFTI,
+            os.path.join(temp_dir, ct_fname),
+        )
+        if ct_path:
+            print(f"[OrthancClient] CT from NIfTI attachment (series): "
+                  f"{os.path.basename(ct_path)}")
+        else:
+            dicom_dir = os.path.join(temp_dir, f"{patient_id}_ct_dicom")
+            if self._download_dicom_series(series_id, dicom_dir):
+                ct_path = dicom_dir
+                print(f"[OrthancClient] CT from DICOM series: {dicom_dir}")
+            else:
+                print("[OrthancClient] CT download failed for series")
+        paths["ct"] = ct_path
+
+        # --- Required attachments ---
+        for logical_name, att_id in profile.required_attachments.items():
+            if logical_name == "ct":
+                continue
+            fname = download_filename(logical_name, patient_id)
+            local_path = self.download_nifti_from_series(
+                series_id, att_id, os.path.join(temp_dir, fname)
+            )
+            if logical_name == "centerline" and local_path:
+                local_path = self._detect_and_fix_centerline_ext(local_path)
+            paths[logical_name] = local_path
+
+        # --- Optional attachments ---
+        for logical_name, att_id in profile.optional_attachments.items():
+            fname = download_filename(logical_name, patient_id)
+            local_path = self.download_nifti_from_series(
+                series_id, att_id, os.path.join(temp_dir, fname)
+            )
+            paths[logical_name] = local_path
+
+        return paths
+
+    def query_series_by_status(self, status: AnnotationStatus) -> List[Dict[str, Any]]:
+        """Filter the CT series list by annotation status."""
+        return [s for s in self.get_all_ct_series()
+                if s.get("annotation_status") == status.value]
+
+    def get_series_worklist(self, role: str = None) -> List[Dict[str, Any]]:
+        """
+        Return the annotatable CT series relevant for the given role.
+
+        annotator → pending, rejected, own in-progress
+        reviewer  → annotated, own in-review
+        admin/None → all CT series
+        """
+        effective_role = role or self.user_role
+        all_series = self.get_all_ct_series()
+        if not effective_role:
+            return all_series
+        if effective_role == "annotator":
+            return [s for s in all_series if (
+                s.get("annotation_status") in (
+                    AnnotationStatus.PENDING.value,
+                    AnnotationStatus.REJECTED.value,
+                )
+                or (s.get("annotation_status") == AnnotationStatus.IN_PROGRESS.value
+                    and s.get("annotator") == self.current_user)
+            )]
+        if effective_role == "reviewer":
+            return [s for s in all_series if (
+                s.get("annotation_status") == AnnotationStatus.ANNOTATED.value
+                or (s.get("annotation_status") == AnnotationStatus.IN_REVIEW.value
+                    and s.get("reviewer") == self.current_user)
+            )]
+        return all_series
+
+    def claim_series(self, series_id: str, role: str = None) -> Tuple[bool, str]:
+        """Claim a CT series for annotation or review."""
+        effective_role = role or self.user_role
+        if not effective_role:
+            return False, "No role assigned — please contact admin"
+        if not self.dashboard_available:
+            return self._claim_series_fallback(series_id, effective_role)
+        try:
+            response = requests.post(
+                f"{self.admin_url}/series/api/{series_id}/claim",
+                headers=self._get_auth_headers(),
+                json={"role": effective_role},
+                timeout=30,
+            )
+            data = response.json()
+            if response.status_code == 200 and data.get("success"):
+                return True, data.get("message", "Series claimed successfully")
+            # AdminDashboard /series endpoint may not be implemented yet — fall back
+            return self._claim_series_fallback(series_id, effective_role)
+        except Exception as e:
+            print(f"[OrthancClient] Error claiming series via AdminDashboard: {e}")
+            return self._claim_series_fallback(series_id, effective_role)
+
+    def _claim_series_fallback(self, series_id: str, role: str) -> Tuple[bool, str]:
+        """Claim a series directly via Orthanc series-level metadata."""
+        metadata = self.get_series_annotation_metadata(series_id) or {}
+        current_status = metadata.get("status", AnnotationStatus.PENDING.value)
+
+        if role in ("annotator", "admin") and current_status in (
+            AnnotationStatus.PENDING.value, AnnotationStatus.REJECTED.value
+        ):
+            metadata["status"] = AnnotationStatus.IN_PROGRESS.value
+            metadata["annotator"] = self.current_user
+            metadata["annotation_started"] = datetime.now().isoformat()
+        elif role in ("reviewer", "admin") and current_status == AnnotationStatus.ANNOTATED.value:
+            metadata["status"] = AnnotationStatus.IN_REVIEW.value
+            metadata["reviewer"] = self.current_user
+            metadata["review_started"] = datetime.now().isoformat()
+        else:
+            return False, f"Cannot claim: series status is '{current_status}'"
+
+        metadata.setdefault("history", []).append({
+            "action": f"claimed_by_{role}",
+            "user": self.current_user,
+            "user_id": self.user_id,
+            "timestamp": datetime.now().isoformat(),
+            "previous_status": current_status,
+        })
+        if self.set_series_annotation_metadata(series_id, metadata):
+            return True, f"Series claimed successfully as {role}"
+        return False, "Failed to update metadata"
+
+    def release_series(self, series_id: str) -> Tuple[bool, str]:
+        """Release a claimed series back to its previous status."""
+        if not self.dashboard_available:
+            return self._release_series_fallback(series_id)
+        try:
+            response = requests.post(
+                f"{self.admin_url}/series/api/{series_id}/release",
+                headers=self._get_auth_headers(),
+                timeout=30,
+            )
+            data = response.json()
+            if response.status_code == 200 and data.get("success"):
+                return True, data.get("message", "Series released")
+            return self._release_series_fallback(series_id)
+        except Exception as e:
+            print(f"[OrthancClient] Error releasing series via AdminDashboard: {e}")
+            return self._release_series_fallback(series_id)
+
+    def _release_series_fallback(self, series_id: str) -> Tuple[bool, str]:
+        metadata = self.get_series_annotation_metadata(series_id) or {}
+        current_status = metadata.get("status")
+        if current_status == AnnotationStatus.IN_PROGRESS.value:
+            if metadata.get("annotator") != self.current_user and self.user_role != "admin":
+                return False, "Cannot release: claimed by a different user"
+            metadata["status"] = AnnotationStatus.PENDING.value
+            metadata["annotator"] = None
+        elif current_status == AnnotationStatus.IN_REVIEW.value:
+            if metadata.get("reviewer") != self.current_user and self.user_role != "admin":
+                return False, "Cannot release: claimed by a different reviewer"
+            metadata["status"] = AnnotationStatus.ANNOTATED.value
+            metadata["reviewer"] = None
+        else:
+            return False, f"Cannot release: status is '{current_status}'"
+        metadata.setdefault("history", []).append({
+            "action": "released",
+            "user": self.current_user,
+            "user_id": self.user_id,
+            "timestamp": datetime.now().isoformat(),
+            "previous_status": current_status,
+        })
+        if self.set_series_annotation_metadata(series_id, metadata):
+            return True, "Series released successfully"
+        return False, "Failed to update metadata"
+
+    def submit_annotation_on_series(self, series_id: str, files: Dict[str, str],
+                                     notes: str = "") -> Tuple[bool, str]:
+        """Upload annotation files to series-level attachments and advance status."""
+        if self.user_role not in ("annotator", "admin"):
+            return False, f"Role '{self.user_role}' cannot submit annotations"
+        metadata = self.get_series_annotation_metadata(series_id) or {}
+        if (metadata.get("annotator") != self.current_user
+                and self.user_role != "admin"):
+            return False, "Cannot submit: series not claimed by you"
+
+        file_mapping = {
+            "refined_mask": self.ATTACHMENT_REFINED_MASK,
+            "centerline":   self.ATTACHMENT_CENTERLINE,
+            "zones":        self.ATTACHMENT_ZONES,
+            "endpoints":    self.ATTACHMENT_ENDPOINTS,
+        }
+        uploaded = []
+        for name, path in files.items():
+            att_id = file_mapping.get(name)
+            if att_id is None:
+                continue
+            if path and os.path.exists(path):
+                if self.upload_nifti_to_series(series_id, path, att_id):
+                    uploaded.append(name)
+                else:
+                    return False, f"Failed to upload {name}"
+
+        if notes:
+            try:
+                self.session.put(
+                    f"{self.server_url}/series/{series_id}"
+                    f"/attachments/{self.ATTACHMENT_NOTES}",
+                    data=notes.encode("utf-8"),
+                    headers={"Content-Type": "text/plain"},
+                )
+            except Exception as e:
+                print(f"[OrthancClient] Warning: failed to upload notes: {e}")
+
+        metadata["status"] = AnnotationStatus.ANNOTATED.value
+        metadata["annotation_completed"] = datetime.now().isoformat()
+        metadata["uploaded_files"] = uploaded
+        metadata.setdefault("history", []).append({
+            "action": "annotation_submitted",
+            "user": self.current_user,
+            "user_id": self.user_id,
+            "timestamp": datetime.now().isoformat(),
+            "files_uploaded": uploaded,
+        })
+        if self.set_series_annotation_metadata(series_id, metadata):
+            return True, f"Annotation submitted ({len(uploaded)} files uploaded)"
+        return False, "Failed to update metadata"
+
+    def approve_annotation_on_series(self, series_id: str,
+                                      comments: str = "") -> Tuple[bool, str]:
+        """Approve a series annotation as ground truth."""
+        if self.user_role not in ("reviewer", "admin"):
+            return False, f"Role '{self.user_role}' cannot approve annotations"
+        metadata = self.get_series_annotation_metadata(series_id) or {}
+        if (metadata.get("reviewer") != self.current_user
+                and self.user_role != "admin"):
+            return False, "Cannot approve: series not claimed by you for review"
+        metadata["status"] = AnnotationStatus.GROUND_TRUTH.value
+        metadata["review_completed"] = datetime.now().isoformat()
+        metadata["reviewer_comments"] = comments
+        metadata["approved_by"] = self.current_user
+        metadata.setdefault("history", []).append({
+            "action": "approved_as_ground_truth",
+            "user": self.current_user,
+            "user_id": self.user_id,
+            "timestamp": datetime.now().isoformat(),
+        })
+        if self.set_series_annotation_metadata(series_id, metadata):
+            return True, "Annotation approved as ground truth"
+        return False, "Failed to update metadata"
+
+    def reject_annotation_on_series(self, series_id: str,
+                                     reason: str) -> Tuple[bool, str]:
+        """Reject a series annotation and return it to the annotator."""
+        if self.user_role not in ("reviewer", "admin"):
+            return False, f"Role '{self.user_role}' cannot reject annotations"
+        if not reason:
+            return False, "Rejection reason is required"
+        metadata = self.get_series_annotation_metadata(series_id) or {}
+        if (metadata.get("reviewer") != self.current_user
+                and self.user_role != "admin"):
+            return False, "Cannot reject: series not claimed by you for review"
+        metadata["status"] = AnnotationStatus.REJECTED.value
+        metadata["review_completed"] = datetime.now().isoformat()
+        metadata["rejection_reason"] = reason
+        metadata["rejected_by"] = self.current_user
+        metadata["reviewer"] = None
+        metadata.setdefault("history", []).append({
+            "action": "rejected",
+            "user": self.current_user,
+            "user_id": self.user_id,
+            "timestamp": datetime.now().isoformat(),
+            "reason": reason,
+        })
+        if self.set_series_annotation_metadata(series_id, metadata):
+            return True, "Annotation rejected and returned to annotator"
+        return False, "Failed to update metadata"
+
+    def get_statistics_for_series(self) -> Dict[str, int]:
+        """Get annotation statistics across all CT series."""
+        all_series = self.get_all_ct_series()
+        stats = {status.value: 0 for status in AnnotationStatus}
+        for s in all_series:
+            st = s.get("annotation_status", AnnotationStatus.PENDING.value)
+            if st in stats:
+                stats[st] += 1
+        stats["total"] = len(all_series)
+        return stats
     
     def get_annotation_metadata(self, study_id: str) -> Optional[Dict[str, Any]]:
         """

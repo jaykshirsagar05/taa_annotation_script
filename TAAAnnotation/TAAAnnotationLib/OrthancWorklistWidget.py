@@ -215,14 +215,14 @@ class OrthancLoginWidget(qt.QWidget):
 class OrthancWorklistWidget(qt.QWidget):
     """Worklist widget showing available studies."""
     
-    # Signal emitted when a study is selected for annotation
-    studySelected = qt.Signal(str, dict)  # (study_id, study_info)
+    # Signal emitted when a CT series is selected for annotation
+    seriesSelected = qt.Signal(str, dict)  # (series_id, series_info)
     
     def __init__(self, orthanc_client: OrthancClient, role: str = "annotator", parent=None):
         super().__init__(parent)
         self.orthancClient = orthanc_client
         self.role = role
-        self.currentStudies = []
+        self.currentSeries = []
         self.setupUI()
         
     def setupUI(self):
@@ -252,7 +252,7 @@ class OrthancWorklistWidget(qt.QWidget):
         if self.role == "annotator":
             self.filterCombo.addItems(["My Worklist", "All Pending", "My In Progress", "Rejected"])
         elif self.role == "admin":
-            self.filterCombo.addItems(["All Studies", "Pending", "In Progress", "Annotated", "In Review", "Ground Truth"])
+            self.filterCombo.addItems(["All Series", "Pending", "In Progress", "Annotated", "In Review", "Ground Truth"])
         else:  # reviewer
             self.filterCombo.addItems(["My Worklist", "Awaiting Review", "My In Review", "Ground Truth"])
         self.filterCombo.currentIndexChanged.connect(self.refreshWorklist)
@@ -273,15 +273,16 @@ class OrthancWorklistWidget(qt.QWidget):
         
         # Worklist table
         self.worklistTable = qt.QTableWidget()
-        self.worklistTable.setColumnCount(6)
+        self.worklistTable.setColumnCount(8)
         self.worklistTable.setHorizontalHeaderLabels([
-            "Patient ID", "Patient Name", "Study Date", "Status", "Annotator", "Reviewer"
+            "Series Description", "Patient ID", "Date",
+            "Series #", "Slices", "Status", "Annotator", "Reviewer"
         ])
         self.worklistTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
         self.worklistTable.setSelectionMode(qt.QAbstractItemView.SingleSelection)
         self.worklistTable.horizontalHeader().setStretchLastSection(True)
         self.worklistTable.setAlternatingRowColors(True)
-        self.worklistTable.doubleClicked.connect(self.onStudyDoubleClicked)
+        self.worklistTable.doubleClicked.connect(self.onSeriesDoubleClicked)
         
         layout.addWidget(self.worklistTable)
         
@@ -313,7 +314,7 @@ class OrthancWorklistWidget(qt.QWidget):
     def refreshWorklist(self):
         """Refresh the worklist from Orthanc."""
         self.worklistTable.setRowCount(0)
-        self.currentStudies = []
+        self.currentSeries = []
         
         filter_idx = self.filterCombo.currentIndex
         if callable(filter_idx):
@@ -321,91 +322,95 @@ class OrthancWorklistWidget(qt.QWidget):
         
         try:
             if self.role == "annotator":
-                if filter_idx == 0:  # My Worklist
-                    studies = self.orthancClient.get_worklist("annotator")
-                elif filter_idx == 1:  # All Pending
-                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.PENDING)
-                elif filter_idx == 2:  # My In Progress
-                    studies = [s for s in self.orthancClient.get_all_studies()
-                              if s.get("annotation_status") == AnnotationStatus.IN_PROGRESS.value
-                              and s.get("annotator") == self.orthancClient.current_user]
-                else:  # Rejected
-                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.REJECTED)
+                if filter_idx == 0:   # My Worklist
+                    series_list = self.orthancClient.get_series_worklist("annotator")
+                elif filter_idx == 1: # All Pending
+                    series_list = self.orthancClient.query_series_by_status(AnnotationStatus.PENDING)
+                elif filter_idx == 2: # My In Progress
+                    series_list = [s for s in self.orthancClient.get_all_ct_series()
+                                   if s.get("annotation_status") == AnnotationStatus.IN_PROGRESS.value
+                                   and s.get("annotator") == self.orthancClient.current_user]
+                else:                 # Rejected
+                    series_list = self.orthancClient.query_series_by_status(AnnotationStatus.REJECTED)
             elif self.role == "admin":
-                # Admin can see all studies with different filters
-                if filter_idx == 0:  # All Studies
-                    studies = self.orthancClient.get_all_studies()
-                elif filter_idx == 1:  # Pending
-                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.PENDING)
-                elif filter_idx == 2:  # In Progress
-                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.IN_PROGRESS)
-                elif filter_idx == 3:  # Annotated
-                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.ANNOTATED)
-                elif filter_idx == 4:  # In Review
-                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.IN_REVIEW)
-                else:  # Ground Truth
-                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.GROUND_TRUTH)
+                if filter_idx == 0:   # All Series
+                    series_list = self.orthancClient.get_all_ct_series()
+                elif filter_idx == 1: # Pending
+                    series_list = self.orthancClient.query_series_by_status(AnnotationStatus.PENDING)
+                elif filter_idx == 2: # In Progress
+                    series_list = self.orthancClient.query_series_by_status(AnnotationStatus.IN_PROGRESS)
+                elif filter_idx == 3: # Annotated
+                    series_list = self.orthancClient.query_series_by_status(AnnotationStatus.ANNOTATED)
+                elif filter_idx == 4: # In Review
+                    series_list = self.orthancClient.query_series_by_status(AnnotationStatus.IN_REVIEW)
+                else:                 # Ground Truth
+                    series_list = self.orthancClient.query_series_by_status(AnnotationStatus.GROUND_TRUTH)
             else:  # reviewer
-                if filter_idx == 0:  # My Worklist
-                    studies = self.orthancClient.get_worklist("reviewer")
-                elif filter_idx == 1:  # Awaiting Review
-                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.ANNOTATED)
-                elif filter_idx == 2:  # My In Review
-                    studies = [s for s in self.orthancClient.get_all_studies()
-                              if s.get("annotation_status") == AnnotationStatus.IN_REVIEW.value
-                              and s.get("reviewer") == self.orthancClient.current_user]
-                else:  # Ground Truth
-                    studies = self.orthancClient.query_studies_by_status(AnnotationStatus.GROUND_TRUTH)
-            
-            self.currentStudies = studies
-            self.populateTable(studies)
-            
-            # Update statistics
-            stats = self.orthancClient.get_statistics()
+                if filter_idx == 0:   # My Worklist
+                    series_list = self.orthancClient.get_series_worklist("reviewer")
+                elif filter_idx == 1: # Awaiting Review
+                    series_list = self.orthancClient.query_series_by_status(AnnotationStatus.ANNOTATED)
+                elif filter_idx == 2: # My In Review
+                    series_list = [s for s in self.orthancClient.get_all_ct_series()
+                                   if s.get("annotation_status") == AnnotationStatus.IN_REVIEW.value
+                                   and s.get("reviewer") == self.orthancClient.current_user]
+                else:                 # Ground Truth
+                    series_list = self.orthancClient.query_series_by_status(AnnotationStatus.GROUND_TRUTH)
+
+            self.currentSeries = series_list
+            self.populateTable(series_list)
+
+            stats = self.orthancClient.get_statistics_for_series()
             self.statsLabel.setText(
-                f"Total: {stats['total']} | Pending: {stats.get('pending', 0)} | "
-                f"Annotated: {stats.get('annotated', 0)} | Ground Truth: {stats.get('ground_truth', 0)}"
+                f"CT Series — Total: {stats['total']} | "
+                f"Pending: {stats.get('pending', 0)} | "
+                f"Annotated: {stats.get('annotated', 0)} | "
+                f"Ground Truth: {stats.get('ground_truth', 0)}"
             )
             
         except Exception as e:
             slicer.util.errorDisplay(f"Failed to refresh worklist: {str(e)}")
     
-    def populateTable(self, studies):
-        """Populate the table with study data."""
-        self.worklistTable.setRowCount(len(studies))
-        
+    def populateTable(self, series_list):
+        """Populate the table with CT series data (one row per annotatable series)."""
+        self.worklistTable.setRowCount(len(series_list))
+
         status_colors = {
-            "pending": "#FFF3CD",
-            "in_progress": "#CCE5FF",
-            "annotated": "#D4EDDA",
-            "in_review": "#E2D5F1",
-            "reviewed": "#C3E6CB",
-            "rejected": "#F8D7DA",
-            "ground_truth": "#28A745"
+            "pending":      "#FFF3CD",
+            "in_progress":  "#CCE5FF",
+            "annotated":    "#D4EDDA",
+            "in_review":    "#E2D5F1",
+            "reviewed":     "#C3E6CB",
+            "rejected":     "#F8D7DA",
+            "ground_truth": "#28A745",
         }
-        
-        for row, study in enumerate(studies):
-            items = [
-                study.get("patient_id", ""),
-                study.get("patient_name", ""),
-                study.get("study_date", ""),
-                study.get("annotation_status", ""),
-                study.get("annotator", "") or "-",
-                study.get("reviewer", "") or "-"
-            ]
-            
-            status = study.get("annotation_status", "")
+        STATUS_COL = 5  # matches header: Series Desc | PID | Date | Series# | Slices | Status | Ann | Rev
+
+        for row, series in enumerate(series_list):
+            status = series.get("annotation_status", "")
             bg_color = status_colors.get(status, "#FFFFFF")
-            
+            series_id = series.get("orthanc_series_id", "")
+
+            desc = (series.get("series_description", "")
+                    or f"Series {series.get('series_number', row + 1)}")
+            items = [
+                desc,
+                series.get("patient_id", ""),
+                series.get("study_date", ""),
+                str(series.get("series_number", "")),
+                str(series.get("instance_count", "")),
+                status,
+                series.get("annotator", "") or "-",
+                series.get("reviewer", "") or "-",
+            ]
+
             for col, text in enumerate(items):
                 item = qt.QTableWidgetItem(str(text))
-                item.setData(qt.Qt.UserRole, study.get("orthanc_id"))
-                
-                if col == 3:  # Status column
+                item.setData(qt.Qt.UserRole, series_id)
+                if col == STATUS_COL:
                     item.setBackground(qt.QColor(bg_color))
                     if status == "ground_truth":
                         item.setForeground(qt.QColor("#FFFFFF"))
-                
                 self.worklistTable.setItem(row, col, item)
         
         self.worklistTable.resizeColumnsToContents()
@@ -420,13 +425,13 @@ class OrthancWorklistWidget(qt.QWidget):
             return
         
         row = selected[0].row()
-        if row >= len(self.currentStudies):
+        if row >= len(self.currentSeries):
             return
             
-        study = self.currentStudies[row]
-        status = study.get("annotation_status", "")
-        annotator = study.get("annotator")
-        reviewer = study.get("reviewer")
+        series = self.currentSeries[row]
+        status   = series.get("annotation_status", "")
+        annotator = series.get("annotator")
+        reviewer  = series.get("reviewer")
         current_user = self.orthancClient.current_user
         
         if self.role == "annotator":
@@ -449,81 +454,76 @@ class OrthancWorklistWidget(qt.QWidget):
             # Can release if in_review and claimed by self
             self.releaseButton.setEnabled(status == "in_review" and reviewer == current_user)
     
-    def getSelectedStudy(self):
-        """Get the currently selected study info."""
+    def getSelectedSeries(self):
+        """Get the currently selected series info."""
         selected = self.worklistTable.selectedItems()
         if not selected:
             return None, None
-        
         row = selected[0].row()
-        if row >= len(self.currentStudies):
+        if row >= len(self.currentSeries):
             return None, None
-        
-        study = self.currentStudies[row]
-        return study.get("orthanc_id"), study
-    
+        series = self.currentSeries[row]
+        return series.get("orthanc_series_id"), series
+
     def onClaimStudy(self):
-        """Claim the selected study."""
-        study_id, study_info = self.getSelectedStudy()
-        if not study_id:
+        """Claim the selected series."""
+        series_id, _ = self.getSelectedSeries()
+        if not series_id:
             return
-        
-        success, message = self.orthancClient.claim_study(study_id, self.role)
+        success, message = self.orthancClient.claim_series(series_id, self.role)
         if success:
             slicer.util.infoDisplay(message)
             self.refreshWorklist()
         else:
             slicer.util.errorDisplay(message)
-    
+
     def onReleaseStudy(self):
-        """Release the selected study."""
-        study_id, study_info = self.getSelectedStudy()
-        if not study_id:
+        """Release the selected series."""
+        series_id, _ = self.getSelectedSeries()
+        if not series_id:
             return
-        
         confirm = slicer.util.confirmYesNoDisplay(
-            "Are you sure you want to release this study? Any unsaved work will be lost.",
+            "Are you sure you want to release this series? Any unsaved work will be lost.",
             "Confirm Release"
         )
         if confirm:
-            success, message = self.orthancClient.release_study(study_id)
+            success, message = self.orthancClient.release_series(series_id)
             if success:
                 slicer.util.infoDisplay(message)
                 self.refreshWorklist()
             else:
                 slicer.util.errorDisplay(message)
-    
+
     def onLoadStudy(self):
-        """Load the selected study for annotation/review."""
-        study_id, study_info = self.getSelectedStudy()
-        if study_id and study_info:
-            self.studySelected.emit(study_id, study_info)
-    
-    def onStudyDoubleClicked(self, index):
-        """Handle double-click on a study row."""
-        study_id, study_info = self.getSelectedStudy()
-        if not study_id:
+        """Load the selected series for annotation/review."""
+        series_id, series_info = self.getSelectedSeries()
+        if series_id and series_info:
+            self.seriesSelected.emit(series_id, series_info)
+
+    def onSeriesDoubleClicked(self, index):
+        """Handle double-click: auto-claim if needed then load the series."""
+        series_id, series_info = self.getSelectedSeries()
+        if not series_id:
             return
-        
-        status = study_info.get("annotation_status", "")
-        annotator = study_info.get("annotator")
-        reviewer = study_info.get("reviewer")
+        status    = series_info.get("annotation_status", "")
+        annotator = series_info.get("annotator")
+        reviewer  = series_info.get("reviewer")
         current_user = self.orthancClient.current_user
-        
-        # If already claimed by user, load directly
-        if self.role == "annotator" and status == "in_progress" and annotator == current_user:
-            self.studySelected.emit(study_id, study_info)
-        elif self.role == "reviewer" and status == "in_review" and reviewer == current_user:
-            self.studySelected.emit(study_id, study_info)
-        # Otherwise, try to claim first
-        elif (self.role == "annotator" and status in ["pending", "rejected"]) or \
-             (self.role == "reviewer" and status == "annotated"):
-            success, message = self.orthancClient.claim_study(study_id, self.role)
+
+        # Already claimed by this user — load directly
+        if (self.role == "annotator" and status == "in_progress"
+                and annotator == current_user):
+            self.seriesSelected.emit(series_id, series_info)
+        elif (self.role == "reviewer" and status == "in_review"
+              and reviewer == current_user):
+            self.seriesSelected.emit(series_id, series_info)
+        elif ((self.role == "annotator" and status in ("pending", "rejected"))
+              or (self.role == "reviewer" and status == "annotated")):
+            success, message = self.orthancClient.claim_series(series_id, self.role)
             if success:
                 self.refreshWorklist()
-                # Re-fetch study info and load
-                updated_info = self.orthancClient.get_study_info(study_id)
+                updated_info = self.orthancClient.get_series_info(series_id)
                 if updated_info:
-                    self.studySelected.emit(study_id, updated_info)
+                    self.seriesSelected.emit(series_id, updated_info)
             else:
                 slicer.util.errorDisplay(message)
