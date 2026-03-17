@@ -17,10 +17,13 @@ import tempfile
 
 class TAAAnnotation(ScriptedLoadableModule):
     """Main module class - defines metadata and help text"""
-    
+
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = "TAA Annotation"
+        # Schedule update check 3 s after startup so it doesn't block module loading
+        qt.QTimer.singleShot(3000, self._checkForUpdates)
+
         self.parent.categories = ["Segmentation"]
         self.parent.dependencies = ["SegmentEditor", "ExtractCenterline"]
         self.parent.contributors = ["University of Ottawa Heart Institute (Canada)"]
@@ -39,6 +42,13 @@ class TAAAnnotation(ScriptedLoadableModule):
         self.parent.acknowledgementText = """
         Developed for TAA research annotation workflow.
         """
+
+    def _checkForUpdates(self):
+        try:
+            from TAAAnnotationLib.AutoUpdater import checkAndUpdate
+            checkAndUpdate()
+        except Exception as e:
+            print(f"[TAAAnnotation] Update check error: {e}")
 
 
 class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
@@ -685,6 +695,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             if inputSurfaceModel:
                 parameterNode.SetNodeReferenceID("InputSurface", inputSurfaceModel.GetID())
             parameterNode.SetNodeReferenceID("OutputCenterlineModel", self.centerlineNode.GetID())
+            parameterNode.SetNodeReferenceID("CenterlineModel", self.centerlineNode.GetID())
             parameterNode.SetNodeReferenceID("NetworkModel", self.networkNode.GetID())
             parameterNode.SetNodeReferenceID("EndPoints", self.endpointNode.GetID())
             
