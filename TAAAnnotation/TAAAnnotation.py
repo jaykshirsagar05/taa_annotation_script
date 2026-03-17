@@ -548,10 +548,10 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                     "Could not determine dataset type.\n\n"
                     "Expected at minimum:\n"
                     "  - ct_scan_{id}.nii.gz\n"
-                    "  - {id}_unified_mask_smoothed.nii.gz\n"
-                    "and either:\n"
-                    "  - {id}_merged_mask.nii.gz  (Dual Mask profile)\n"
-                    "  - a .vtp/.vtk centerline file  (Mask+Centerline profile)"
+                    "  - {id}_unified_mask_smoothed.nii.gz\n\n"
+                    "Optional (selects a richer profile):\n"
+                    "  - {id}_merged_mask.nii.gz  → Dual Mask profile\n"
+                    "  - a .vtp/.vtk centerline file  → Mask+Centerline profile"
                 )
                 return False
             
@@ -594,7 +594,11 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             if not self.segNode:
                 slicer.util.errorDisplay("No segmentation loaded")
                 return False
-            
+
+            # Binarize mask before opening the editor (CT_AND_SEG_MASK profile)
+            if getattr(self.activeProfile, 'binarize_mask_before_refine', False):
+                self._binarizeSegmentationNode(self.segNode)
+
             slicer.util.selectModule("SegmentEditor")
             
             segmentEditorNode = slicer.mrmlScene.GetSingletonNode("SegmentEditor", "vtkMRMLSegmentEditorNode")
@@ -612,6 +616,28 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         except Exception as e:
             slicer.util.errorDisplay(f"Failed to setup refinement: {str(e)}")
             return False
+
+    def _binarizeSegmentationNode(self, segNode):
+        """Merge all segments into a single binary segment (label 0/1)."""
+        try:
+            tempLabel = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLLabelMapVolumeNode", "_temp_binarize"
+            )
+            slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
+                segNode, tempLabel, slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
+            )
+            array = slicer.util.arrayFromVolume(tempLabel)
+            array[array > 0] = 1
+            slicer.util.updateVolumeFromArray(tempLabel, array)
+            segNode.GetSegmentation().RemoveAllSegments()
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                tempLabel, segNode
+            )
+            slicer.mrmlScene.RemoveNode(tempLabel)
+            segNode.CreateClosedSurfaceRepresentation()
+            print("[Binarize] Segmentation mask binarized to single binary segment")
+        except Exception as e:
+            print(f"[Binarize] WARNING — failed to binarize mask: {e}")
 
     def setupVMTK(self):
         """Setup VMTK centerline extraction"""

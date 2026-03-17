@@ -6,6 +6,7 @@ or local folder contents, enabling the module to work with different data
 configurations without hardcoded file requirements.
 
 Profiles:
+    CT_AND_SEG_MASK:     CT + segmentation mask only  (default; mask binarized before refine)
     DUAL_MASK:           CT + unified mask + merged mask  (full VMTK workflow)
     MASK_AND_CENTERLINE: CT + seg mask + pre-computed centerline  (skip VMTK)
 
@@ -52,12 +53,14 @@ class DatasetProfile:
     """
 
     # Profile type constants
+    CT_AND_SEG_MASK = "ct_and_seg_mask"
     DUAL_MASK = "dual_mask"
     MASK_AND_CENTERLINE = "mask_and_centerline"
 
     def __init__(self, profile_type, name, description,
                  required_attachments, optional_attachments=None,
-                 skip_phases=None, has_precalculated_centerline=False):
+                 skip_phases=None, has_precalculated_centerline=False,
+                 binarize_mask_before_refine=False):
         self.profile_type = profile_type
         self.name = name
         self.description = description
@@ -65,6 +68,7 @@ class DatasetProfile:
         self.optional_attachments = optional_attachments or {}
         self.skip_phases = skip_phases or set()
         self.has_precalculated_centerline = has_precalculated_centerline
+        self.binarize_mask_before_refine = binarize_mask_before_refine
 
     def should_skip_phase(self, phase_number):
         """Check if a workflow phase should be skipped for this profile."""
@@ -79,6 +83,23 @@ class DatasetProfile:
 # -------------------------------------------------------------------------
 
 PROFILES = {
+    DatasetProfile.CT_AND_SEG_MASK: DatasetProfile(
+        profile_type=DatasetProfile.CT_AND_SEG_MASK,
+        name="CT + Seg Mask",
+        description=(
+            "CT scan with a segmentation mask only. "
+            "Default profile: mask is binarized automatically before refinement, "
+            "then the refined mask is used for centerline extraction and upload."
+        ),
+        required_attachments={
+            "ct":       ATT_CT_NIFTI,
+            "seg_mask": ATT_UNIFIED_MASK,
+        },
+        skip_phases=set(),
+        has_precalculated_centerline=False,
+        binarize_mask_before_refine=True,
+    ),
+
     DatasetProfile.DUAL_MASK: DatasetProfile(
         profile_type=DatasetProfile.DUAL_MASK,
         name="Dual Mask",
@@ -165,13 +186,13 @@ def detect_profile_from_attachments(available_attachments):
     if has_ct and has_unified and has_centerline:
         return PROFILES[DatasetProfile.MASK_AND_CENTERLINE]
 
-    # Dual Mask (original workflow)
+    # Dual Mask when both masks are present
     if has_ct and has_unified and has_merged:
         return PROFILES[DatasetProfile.DUAL_MASK]
 
-    # Partial match — fall back to Dual Mask (download will report what's missing)
+    # CT + seg mask only — default profile (mask will be binarized before refine)
     if has_ct and has_unified:
-        return PROFILES[DatasetProfile.DUAL_MASK]
+        return PROFILES[DatasetProfile.CT_AND_SEG_MASK]
 
     return None
 
@@ -245,7 +266,7 @@ def detect_profile_from_folder(folder_path, patient_id):
     if has_ct and has_seg and has_ref:
         return PROFILES[DatasetProfile.DUAL_MASK], found
     if has_ct and has_seg:
-        # Only one mask, no centerline — fall back to dual-mask (will warn)
-        return PROFILES[DatasetProfile.DUAL_MASK], found
+        # CT + seg mask only — default profile (mask will be binarized before refine)
+        return PROFILES[DatasetProfile.CT_AND_SEG_MASK], found
 
     return None, found
