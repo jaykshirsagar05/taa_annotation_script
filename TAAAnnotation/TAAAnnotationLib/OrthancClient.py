@@ -22,6 +22,8 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from enum import Enum
 
+from . import config as _cfg
+
 
 class AnnotationStatus(Enum):
     """Annotation lifecycle states stored as Orthanc metadata."""
@@ -67,17 +69,14 @@ class OrthancClient:
     ATTACHMENT_ENDPOINTS = 1031
     ATTACHMENT_NOTES = 1032
     
-    def __init__(self, orthanc_url: str = "http://localhost:8042",
-                 admin_dashboard_url: str = "http://localhost:7777"):
+    def __init__(self, orthanc_url: str = None, admin_dashboard_url: str = None):
         """
         Initialize Orthanc client with AdminDashboard integration.
-        
-        Args:
-            orthanc_url: Base URL of Orthanc server
-            admin_dashboard_url: Base URL of AdminDashboard API
+        URLs and Orthanc credentials are read from config.py; the parameters
+        here exist only for programmatic overrides.
         """
-        self.server_url = orthanc_url.rstrip('/')
-        self.admin_url = admin_dashboard_url.rstrip('/')
+        self.server_url = (orthanc_url or _cfg.ORTHANC_URL).rstrip('/')
+        self.admin_url = (admin_dashboard_url or _cfg.ADMIN_DASHBOARD_URL).rstrip('/')
         
         # Authentication state
         self.auth_token: Optional[str] = None
@@ -126,7 +125,11 @@ class OrthancClient:
                     self.user_role = data["user"]["role"]
                     self.user_id = data["user"]["id"]
                     self.assigned_series = data["user"].get("assigned_series_uids", [])
-                    
+
+                    # Set Orthanc basic-auth using the service account from config.
+                    # Dashboard user credentials are separate from Orthanc credentials.
+                    self.set_orthanc_credentials(_cfg.ORTHANC_USERNAME, _cfg.ORTHANC_PASSWORD)
+
                     # Now verify Orthanc connectivity
                     orthanc_ok, orthanc_msg = self._verify_orthanc_connection()
                     if orthanc_ok:

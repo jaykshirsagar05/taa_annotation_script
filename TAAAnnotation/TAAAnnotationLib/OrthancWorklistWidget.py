@@ -11,6 +11,7 @@ import qt
 import slicer
 from typing import Optional, Callable
 from .OrthancClient import OrthancClient, AnnotationStatus
+from . import config as _cfg
 
 
 class OrthancLoginWidget(qt.QWidget):
@@ -32,39 +33,28 @@ class OrthancLoginWidget(qt.QWidget):
         
     def setupUI(self):
         layout = qt.QVBoxLayout(self)
-        
-        # Server settings group
-        serverGroup = qt.QGroupBox("Server Connection")
-        serverLayout = qt.QFormLayout(serverGroup)
-        
-        self.adminUrlEdit = qt.QLineEdit("http://localhost:8000")
-        serverLayout.addRow("Admin Dashboard:", self.adminUrlEdit)
-        
-        self.orthancUrlEdit = qt.QLineEdit("http://localhost:8042")
-        serverLayout.addRow("Orthanc Server:", self.orthancUrlEdit)
-        
-        layout.addWidget(serverGroup)
-        
+
         # Credentials group
         credGroup = qt.QGroupBox("Credentials")
         credLayout = qt.QFormLayout(credGroup)
-        
+
         self.usernameEdit = qt.QLineEdit()
         self.usernameEdit.setPlaceholderText("Username")
         credLayout.addRow("Username:", self.usernameEdit)
-        
+
+        self.passwordLabel = qt.QLabel("Password:")
         self.passwordEdit = qt.QLineEdit()
         self.passwordEdit.setPlaceholderText("Password")
         self.passwordEdit.setEchoMode(qt.QLineEdit.Password)
-        credLayout.addRow("Password:", self.passwordEdit)
-        
+        credLayout.addRow(self.passwordLabel, self.passwordEdit)
+
         layout.addWidget(credGroup)
-        
+
         # Role note (shown in normal mode)
         self.roleNote = qt.QLabel("Note: Your role is assigned by the administrator")
         self.roleNote.setStyleSheet("color: gray; font-style: italic; font-size: 11px;")
         layout.addWidget(self.roleNote)
-        
+
         # --- Direct mode controls (hidden by default) ---
         self.directModeGroup = qt.QGroupBox("Role Selection  (Dashboard Offline)")
         self.directModeGroup.setStyleSheet(
@@ -73,22 +63,22 @@ class OrthancLoginWidget(qt.QWidget):
             "QGroupBox::title { background-color: #fff3cd; padding: 2px 6px; }"
         )
         directLayout = qt.QFormLayout(self.directModeGroup)
-        
+
         self.roleCombo = qt.QComboBox()
         self.roleCombo.addItems(["annotator", "reviewer", "admin"])
         directLayout.addRow("Role:", self.roleCombo)
-        
+
         directHint = qt.QLabel(
-            "AdminDashboard is unreachable. You can log in directly to\n"
-            "Orthanc with static credentials. Select your role manually."
+            "AdminDashboard is unreachable. Enter your username, select your\n"
+            "role, and log in. Orthanc credentials are loaded from config."
         )
         directHint.setStyleSheet("color: #856404; font-size: 11px;")
         directHint.setWordWrap(True)
         directLayout.addRow(directHint)
-        
+
         self.directModeGroup.setVisible(False)
         layout.addWidget(self.directModeGroup)
-        
+
         # Toggle link to switch to direct mode manually
         self.directModeToggle = qt.QPushButton("Dashboard down? Login directly to Orthanc →")
         self.directModeToggle.setFlat(True)
@@ -99,20 +89,20 @@ class OrthancLoginWidget(qt.QWidget):
         self.directModeToggle.setCursor(qt.Qt.PointingHandCursor)
         self.directModeToggle.clicked.connect(self._toggleDirectMode)
         layout.addWidget(self.directModeToggle)
-        
+
         # Login button
         self.loginButton = qt.QPushButton("Login")
         self.loginButton.clicked.connect(self.onLogin)
         layout.addWidget(self.loginButton)
-        
+
         # Status label
         self.statusLabel = qt.QLabel("")
         self.statusLabel.setWordWrap(True)
         layout.addWidget(self.statusLabel)
-        
+
         layout.addStretch()
-        
-        # Enable enter key to login
+
+        # Enable enter key to submit in dashboard mode
         self.passwordEdit.returnPressed.connect(self.onLogin)
 
     # ----- direct-mode helpers ------------------------------------------------
@@ -122,9 +112,11 @@ class OrthancLoginWidget(qt.QWidget):
         self._directMode = not self._directMode
         self.directModeGroup.setVisible(self._directMode)
         self.roleNote.setVisible(not self._directMode)
-        self.adminUrlEdit.setEnabled(not self._directMode)
-        self.statusLabel.setText("")  # Clear status when switching modes
-        self.loginButton.setEnabled(True)  # Ensure button is enabled
+        # Password field is only needed for dashboard authentication
+        self.passwordLabel.setVisible(not self._directMode)
+        self.passwordEdit.setVisible(not self._directMode)
+        self.statusLabel.setText("")
+        self.loginButton.setEnabled(True)
         if self._directMode:
             self.directModeToggle.setText("← Back to AdminDashboard login")
             self.loginButton.setText("Login to Orthanc (Direct)")
@@ -138,7 +130,8 @@ class OrthancLoginWidget(qt.QWidget):
             self._directMode = True
             self.directModeGroup.setVisible(True)
             self.roleNote.setVisible(False)
-            self.adminUrlEdit.setEnabled(False)
+            self.passwordLabel.setVisible(False)
+            self.passwordEdit.setVisible(False)
             self.directModeToggle.setText("← Back to AdminDashboard login")
             self.loginButton.setText("Login to Orthanc (Direct)")
 
@@ -146,28 +139,24 @@ class OrthancLoginWidget(qt.QWidget):
 
     def onLogin(self):
         """Handle login button click."""
-        orthanc_url = self.orthancUrlEdit.text.strip()
         username = self.usernameEdit.text.strip()
-        password = self.passwordEdit.text
-        
-        if not username or not password:
-            self.statusLabel.setText("Please enter username and password")
-            self.statusLabel.setStyleSheet("color: orange;")
-            return
-        
-        self.loginButton.setEnabled(False)
-        
-        # Update Orthanc URL regardless of mode
-        self.orthancClient.server_url = orthanc_url
 
         if self._directMode:
-            # --- Direct Orthanc login (AdminDashboard bypassed) ---
+            # Direct mode: only username is required; Orthanc password from config
+            if not username:
+                self.statusLabel.setText("Please enter your username")
+                self.statusLabel.setStyleSheet("color: orange;")
+                return
+
+            self.loginButton.setEnabled(False)
             self.statusLabel.setText("Connecting to Orthanc directly...")
             self.statusLabel.setStyleSheet("color: gray;")
-            
+
             role = self.roleCombo.currentText
-            success, message = self.orthancClient.login_direct(username, password, role)
-            
+            success, message = self.orthancClient.login_direct(
+                username, _cfg.ORTHANC_PASSWORD, role
+            )
+
             if success:
                 self.statusLabel.setText(f"✓ {message}")
                 self.statusLabel.setStyleSheet("color: #28a745;")
@@ -178,12 +167,17 @@ class OrthancLoginWidget(qt.QWidget):
                 self.statusLabel.setStyleSheet("color: red;")
                 self.loginButton.setEnabled(True)
         else:
-            # --- Normal AdminDashboard login ---
-            admin_url = self.adminUrlEdit.text.strip()
-            self.orthancClient.admin_url = admin_url
+            # Dashboard mode: both username and password are required
+            password = self.passwordEdit.text
+            if not username or not password:
+                self.statusLabel.setText("Please enter username and password")
+                self.statusLabel.setStyleSheet("color: orange;")
+                return
+
+            self.loginButton.setEnabled(False)
             self.statusLabel.setText("Connecting to AdminDashboard...")
             self.statusLabel.setStyleSheet("color: gray;")
-            
+
             success, message = self.orthancClient.login(username, password)
             
             if success:

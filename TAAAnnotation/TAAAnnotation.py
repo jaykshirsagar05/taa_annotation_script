@@ -406,6 +406,10 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def resetForNextStudy(self):
         """Reset for next study."""
+        # Disable picker before scene clear: removes VTK observers and MRML node
+        # refs while nodes are still alive.  Skipping this leaves dangling state
+        # that crashes Slicer when disable() is called later (e.g. on logout).
+        self.centerlinePicker.cleanup()
         slicer.mrmlScene.Clear(0)
         self.logic.reset()
         self.workflowWidget.resetUI()
@@ -819,6 +823,28 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             if threeDWidget:
                 threeDWidget.threeDView().setFocalPoint(pos[0], pos[1], pos[2])
     
+    def getAortaSurfacePolyData(self):
+        """Extract and return a vtkPolyData closed surface from the refined segmentation.
+
+        Tries self.segNode first (refined mask), falls back to self.refNode.
+        Returns vtkPolyData, or None if no segmentation is available.
+        """
+        import vtk
+        for candidate in (self.segNode, self.refNode):
+            if candidate is None:
+                continue
+            seg = candidate.GetSegmentation()
+            if seg is None or seg.GetNumberOfSegments() == 0:
+                continue
+            candidate.CreateClosedSurfaceRepresentation()
+            segmentId = seg.GetNthSegmentID(0)
+            polyData = vtk.vtkPolyData()
+            candidate.GetClosedSurfaceRepresentation(segmentId, polyData)
+            if polyData.GetNumberOfPoints() > 0:
+                return polyData
+        print("[getAortaSurfacePolyData] No valid surface found in segNode or refNode")
+        return None
+
     def loadProcedureDataFromPaths(self, ct_path: str, unified_path: str, merged_path: str):
         """
         Legacy: Load procedure data from explicit file paths.
