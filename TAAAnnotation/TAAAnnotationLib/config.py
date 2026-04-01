@@ -15,3 +15,8 @@ ADMIN_DASHBOARD_URL = "http://10.16.65.17:7778"
 # regardless of whether the user logged in via the dashboard or direct mode.
 ORTHANC_USERNAME = "orthanc"
 ORTHANC_PASSWORD = "orthanc"
+
+# Default CT display window settings applied after Orthanc load.
+# Window width controls contrast span; level controls center HU.
+DEFAULT_CT_WINDOW_WIDTH = 1200
+DEFAULT_CT_WINDOW_LEVEL = 350

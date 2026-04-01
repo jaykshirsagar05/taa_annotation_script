@@ -18,6 +18,7 @@ import json
 import tempfile
 import os
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from enum import Enum
@@ -635,12 +636,12 @@ class OrthancClient:
                     fd, output_path = tempfile.mkstemp(suffix=suffix)
                     os.close(fd)
                 
-                # Read the raw, undecoded bytes to avoid Content-Encoding
-                # decompression that would corrupt .nii.gz files.
-                # decode_content=False prevents urllib3 from stripping gzip.
-                raw_data = response.raw.read(decode_content=False)
+                # Stream in chunks to avoid loading large files (e.g. CT NIfTI)
+                # entirely into memory. decode_content=False prevents urllib3
+                # from stripping the gzip layer of .nii.gz files.
                 with open(output_path, 'wb') as f:
-                    f.write(raw_data)
+                    for chunk in response.raw.stream(1 << 20, decode_content=False):
+                        f.write(chunk)
                 
                 # Validate and fix NIfTI gzip files
                 output_path = self._validate_nifti_file(output_path)
@@ -792,12 +793,8 @@ class OrthancClient:
         """
         from .DatasetProfile import download_filename
 
-        paths: Dict[str, Optional[str]] = {}
-
-        # Download required attachments
-        for logical_name, att_id in profile.required_attachments.items():
+        def _fetch_one(logical_name: str, att_id: int, required: bool) -> tuple:
             if logical_name == "ct":
-                # CT priority: NIfTI attachment first, then DICOM from Orthanc series
                 local_path = self._download_ct_with_fallback(study_id, patient_id, temp_dir)
             else:
                 fname = download_filename(logical_name, patient_id)
@@ -805,19 +802,24 @@ class OrthancClient:
                     study_id, att_id,
                     os.path.join(temp_dir, fname)
                 )
-            # For centerline files: detect actual format and rename if needed
             if logical_name == "centerline" and local_path:
                 local_path = self._detect_and_fix_centerline_ext(local_path)
-            paths[logical_name] = local_path
+            return logical_name, local_path
 
-        # Download optional attachments (no error on missing)
-        for logical_name, att_id in profile.optional_attachments.items():
-            fname = download_filename(logical_name, patient_id)
-            local_path = self.download_nifti(
-                study_id, att_id,
-                os.path.join(temp_dir, fname)
-            )
-            paths[logical_name] = local_path
+        tasks = {
+            **{name: (att_id, True)  for name, att_id in profile.required_attachments.items()},
+            **{name: (att_id, False) for name, att_id in profile.optional_attachments.items()},
+        }
+
+        paths: Dict[str, Optional[str]] = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(_fetch_one, name, att_id, req): name
+                for name, (att_id, req) in tasks.items()
+            }
+            for future in as_completed(futures):
+                logical_name, local_path = future.result()
+                paths[logical_name] = local_path
 
         return paths
 

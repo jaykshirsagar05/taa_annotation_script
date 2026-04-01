@@ -12,6 +12,7 @@ from TAAAnnotationLib.DatasetProfile import (
     DatasetProfile, PROFILES,
     detect_profile_from_folder, detect_profile_from_attachments,
 )
+from TAAAnnotationLib import config as _cfg
 import tempfile
 
 
@@ -187,6 +188,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.rootDir = self.orthancTempDir
             self.logic.activeProfile = profile
             errors = self.logic.loadDataWithProfile(profile, file_paths)
+            self.logic.applyConfiguredCtWindowLevel()
             
             # Update UI with profile info
             self.workflowWidget.setProfile(profile)
@@ -522,6 +524,25 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
     def getTimestamp(self):
         from datetime import datetime
         return datetime.now().strftime("%H:%M:%S")
+
+    def applyConfiguredCtWindowLevel(self):
+        """Apply default CT window/level values from config.py to the loaded CT volume."""
+        if not self.volNode:
+            return False
+
+        displayNode = self.volNode.GetDisplayNode()
+        if not displayNode:
+            self.volNode.CreateDefaultDisplayNodes()
+            displayNode = self.volNode.GetDisplayNode()
+        if not displayNode:
+            return False
+
+        width = float(getattr(_cfg, "DEFAULT_CT_WINDOW_WIDTH", 1200))
+        level = float(getattr(_cfg, "DEFAULT_CT_WINDOW_LEVEL", 350))
+        displayNode.SetAutoWindowLevel(False)
+        displayNode.SetWindowLevel(width, level)
+        print(f"[Display] Applied CT window/level from config: W={width}, L={level}")
+        return True
 
     def getIdFromFiles(self, folderPath):
         """Extract patient ID from CT scan filename"""
