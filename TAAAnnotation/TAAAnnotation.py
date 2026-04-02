@@ -734,6 +734,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                 binarizedRefinedNode.GetClosedSurfaceRepresentation(segmentId, polyData)
                 
                 if polyData.GetNumberOfPoints() > 0:
+                    polyData = self._applyFlowExtensions(polyData)
                     inputSurfaceModel.SetAndObservePolyData(polyData)
                     inputSurfaceModel.CreateDefaultDisplayNodes()
                     displayNode = inputSurfaceModel.GetDisplayNode()
@@ -770,6 +771,68 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             import traceback
             traceback.print_exc()
             return False
+
+    def _applyFlowExtensions(self, surfacePolyData):
+        """Apply VMTK flow extensions to extend the surface at open boundaries.
+
+        This ensures that when auto-detect endpoints runs during centerline
+        extraction, the detected endpoints reach all the way to the ends of
+        the aortic surface.  Falls back to the original surface if VMTK
+        computational-geometry classes are unavailable or if the filter fails.
+        """
+        try:
+            import vtkvmtkComputationalGeometryPython as vtkvmtkCG
+        except ImportError:
+            print("[FlowExtensions] VMTK computational geometry not available, skipping")
+            return surfacePolyData
+
+        try:
+            # Compute boundary reference systems for open boundary edges
+            boundaryRefSys = vtkvmtkCG.vtkvmtkBoundaryReferenceSystems()
+            boundaryRefSys.SetInputData(surfacePolyData)
+            boundaryRefSys.SetBoundaryRadiusArrayName('BoundaryRadius')
+            boundaryRefSys.SetBoundaryNormalsArrayName('BoundaryNormals')
+            boundaryRefSys.SetPoint1ArrayName('Point1')
+            boundaryRefSys.SetPoint2ArrayName('Point2')
+            boundaryRefSys.Update()
+
+            refSysOutput = boundaryRefSys.GetOutput()
+            nBoundaries = refSysOutput.GetNumberOfPoints()
+            if nBoundaries == 0:
+                print("[FlowExtensions] No open boundaries detected, skipping")
+                return surfacePolyData
+
+            print(f"[FlowExtensions] {nBoundaries} open boundary(ies) found, applying extensions")
+
+            # Extend surface at each open boundary using boundary normals
+            flowExt = vtkvmtkCG.vtkvmtkFlowExtensionsFilter()
+            flowExt.SetInputData(surfacePolyData)
+            flowExt.SetCenterlines(refSysOutput)
+            flowExt.SetExtensionModeToUseNormalToBoundary()
+            flowExt.SetInterpolationModeToLinear()
+            flowExt.SetExtensionRatio(2.0)          # extension length = 2x boundary radius
+            flowExt.SetTransitionRatio(0.25)         # smooth blend over 25% of extension
+            flowExt.SetAdaptiveExtensionLength(1)    # scale length to each boundary size
+            flowExt.SetAdaptiveExtensionRadius(1)    # scale radius to each boundary size
+            flowExt.SetNumberOfBoundaryPoints(50)    # circumferential resolution of extension
+            flowExt.Update()
+
+            result = flowExt.GetOutput()
+            if result and result.GetNumberOfPoints() > 0:
+                print(
+                    f"[FlowExtensions] Surface extended: "
+                    f"{surfacePolyData.GetNumberOfPoints()} -> {result.GetNumberOfPoints()} points"
+                )
+                return result
+
+            print("[FlowExtensions] Filter returned empty output, using original surface")
+            return surfacePolyData
+
+        except Exception as e:
+            print(f"[FlowExtensions] WARNING — failed to apply: {e}")
+            import traceback
+            traceback.print_exc()
+            return surfacePolyData
 
     def createZoneNode(self):
         """Create zone fiducial node if needed"""
