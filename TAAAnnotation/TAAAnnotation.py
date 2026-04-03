@@ -6,7 +6,8 @@ from slicer.util import VTKObservationMixin
 from TAAAnnotationLib import (
     OrthancClient, AnnotationStatus,
     WorkflowWidget, OrthancIntegrationWidget,
-    AutosaveManager, CenterlinePicker, ExportManager
+    AutosaveManager, CenterlinePicker, ExportManager,
+    OfflineLoadWidget,
 )
 from TAAAnnotationLib.DatasetProfile import (
     DatasetProfile, PROFILES,
@@ -100,6 +101,11 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         orLabel.setStyleSheet("color: #999; margin: 5px 0;")
         mainLayout.addWidget(orLabel)
         
+        # --- Offline / Dev Loading Widget ---
+        self.offlineWidget = OfflineLoadWidget()
+        self.offlineWidget.loadRequested.connect(self.onOfflineLoad)
+        mainLayout.addWidget(self.offlineWidget)
+        
         # --- Workflow Widget ---
         self.workflowWidget = WorkflowWidget()
         self.workflowWidget.setLogic(self.logic)
@@ -142,24 +148,49 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         
         folderPath = qt.QFileDialog.getExistingDirectory(self.parent, "Select Subject Directory")
         if folderPath:
-            # Disable buttons during load to prevent double-clicks
-            self.workflowWidget.setButtonsEnabled(False)
-            try:
-                success = self.logic.loadData(folderPath)
-                if success:
-                    profile = self.logic.activeProfile
-                    self.workflowWidget.setProfile(profile)
-                    self.workflowWidget.markDone(1, "Data Loaded")
-                    
-                    if profile and profile.has_precalculated_centerline and self.logic.centerlineNode:
-                        self.workflowWidget.markDone(3, "Centerline Pre-loaded")
-                    
-                    self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-                    profile_label = f" [{profile.name}]" if profile else ""
-                    self.workflowWidget.setStatus(f"✓ Loaded: {self.logic.currentId}{profile_label}")
-                    self.workflowWidget.setCurrentId(self.logic.currentId)
-            finally:
-                self.workflowWidget.setButtonsEnabled(True)
+            self._loadFromFolder(folderPath)
+
+    # --- Offline / Dev Load Handler ---
+    def onOfflineLoad(self, folderPath: str):
+        """Handle one-click offline data loading from the dev panel."""
+        if self.logic.hasUnsavedWork:
+            if not slicer.util.confirmYesNoDisplay(
+                "You have unsaved work. Loading new data will discard it.\n\nContinue?",
+                "Unsaved Work"
+            ):
+                self.offlineWidget.setStatus("Load cancelled.")
+                return
+        self._loadFromFolder(folderPath, statusWidget=self.offlineWidget)
+
+    def _loadFromFolder(self, folderPath: str, statusWidget=None):
+        """Shared helper: load data from a local folder and update UI."""
+        self.workflowWidget.setButtonsEnabled(False)
+        if statusWidget:
+            statusWidget.setEnabled(False)
+        try:
+            success = self.logic.loadData(folderPath)
+            if success:
+                profile = self.logic.activeProfile
+                self.workflowWidget.setProfile(profile)
+                self.workflowWidget.markDone(1, "Data Loaded")
+                
+                if profile and profile.has_precalculated_centerline and self.logic.centerlineNode:
+                    self.workflowWidget.markDone(3, "Centerline Pre-loaded")
+                
+                self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+                profile_label = f" [{profile.name}]" if profile else ""
+                msg = f"✓ Loaded: {self.logic.currentId}{profile_label}"
+                self.workflowWidget.setStatus(msg)
+                self.workflowWidget.setCurrentId(self.logic.currentId)
+                if statusWidget:
+                    statusWidget.setStatus(msg)
+            else:
+                if statusWidget:
+                    statusWidget.setStatus("⚠ Load failed — check the Slicer log.")
+        finally:
+            self.workflowWidget.setButtonsEnabled(True)
+            if statusWidget:
+                statusWidget.setEnabled(True)
 
     # --- Orthanc Handlers ---
     def onOrthancStudyLoaded(self, study_id: str, study_info: dict):
