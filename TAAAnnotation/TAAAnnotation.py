@@ -700,9 +700,6 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             )
             binarizedRefinedNode.CreateClosedSurfaceRepresentation()
             
-            # Clean up temporary label volume
-            slicer.mrmlScene.RemoveNode(tempRefinedLabel)
-            
             # Setup VMTK module
             slicer.util.selectModule("ExtractCenterline")
             slicer.app.processEvents()
@@ -734,7 +731,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                 binarizedRefinedNode.GetClosedSurfaceRepresentation(segmentId, polyData)
                 
                 if polyData.GetNumberOfPoints() > 0:
-                    polyData = self._applyFlowExtensions(polyData)
+                    polyData = self._applyFlowExtensions(polyData, tempRefinedLabel)
                     inputSurfaceModel.SetAndObservePolyData(polyData)
                     inputSurfaceModel.CreateDefaultDisplayNodes()
                     displayNode = inputSurfaceModel.GetDisplayNode()
@@ -750,6 +747,9 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             parameterNode.SetNodeReferenceID("CenterlineModel", self.centerlineNode.GetID())
             parameterNode.SetNodeReferenceID("NetworkModel", self.networkNode.GetID())
             parameterNode.SetNodeReferenceID("EndPoints", self.endpointNode.GetID())
+            
+            # Clean up temporary label volume (kept until after flow extensions)
+            slicer.mrmlScene.RemoveNode(tempRefinedLabel)
             
             # Hide other segmentations
             for node in [self.segNode, self.refNode, self.binarizedMergedNode]:
@@ -772,24 +772,77 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             traceback.print_exc()
             return False
 
-    def _applyFlowExtensions(self, surfacePolyData):
+    def _applyFlowExtensions(self, closedPolyData, labelMapNode):
         """Apply VMTK flow extensions to extend the surface at open boundaries.
 
-        This ensures that when auto-detect endpoints runs during centerline
-        extraction, the detected endpoints reach all the way to the ends of
-        the aortic surface.  Falls back to the original surface if VMTK
-        computational-geometry classes are unavailable or if the filter fails.
+        Slicer's ``CreateClosedSurfaceRepresentation`` pads the label map by
+        one voxel before running marching cubes, producing a watertight mesh
+        with no open boundaries.  To obtain boundaries suitable for flow
+        extensions we regenerate the surface directly from the *unpadded*
+        label map via ``vtkDiscreteMarchingCubes``, which preserves open
+        edges wherever the mask reaches the image border.  The boundaries
+        are then extended outward so that auto-detected endpoints reach the
+        ends of the aortic surface.
+
+        Falls back to *closedPolyData* when VMTK is unavailable, no open
+        boundaries exist, or the filter fails.
         """
+        import vtk
+
         try:
             import vtkvmtkComputationalGeometryPython as vtkvmtkCG
         except ImportError:
             print("[FlowExtensions] VMTK computational geometry not available, skipping")
-            return surfacePolyData
+            return closedPolyData
 
         try:
-            # Compute boundary reference systems for open boundary edges
+            # --- Step 1: Build an open surface from the unpadded label map ---
+            imageData = labelMapNode.GetImageData()
+            if not imageData:
+                print("[FlowExtensions] No image data in label map, skipping")
+                return closedPolyData
+
+            mc = vtk.vtkDiscreteMarchingCubes()
+            mc.SetInputData(imageData)
+            mc.SetValue(0, 1)  # must match binarisation in setupVMTK()
+            mc.Update()
+
+            rawSurface = mc.GetOutput()
+            if not rawSurface or rawSurface.GetNumberOfPoints() == 0:
+                print("[FlowExtensions] Marching cubes produced empty surface, skipping")
+                return closedPolyData
+
+            # Transform from IJK to RAS coordinates
+            ijkToRas = vtk.vtkMatrix4x4()
+            labelMapNode.GetIJKToRASMatrix(ijkToRas)
+            xform = vtk.vtkTransform()
+            xform.SetMatrix(ijkToRas)
+            xformFilter = vtk.vtkTransformPolyDataFilter()
+            xformFilter.SetInputData(rawSurface)
+            xformFilter.SetTransform(xform)
+            xformFilter.Update()
+
+            # Smooth the surface (Slicer default-like: 20 iterations, 0.1 pass band)
+            smoother = vtk.vtkWindowedSincPolyDataFilter()
+            smoother.SetInputData(xformFilter.GetOutput())
+            smoother.SetNumberOfIterations(20)
+            smoother.SetPassBand(0.1)
+            smoother.BoundarySmoothingOff()
+            smoother.NonManifoldSmoothingOn()
+            smoother.Update()
+
+            cleaner = vtk.vtkCleanPolyData()
+            cleaner.SetInputData(smoother.GetOutput())
+            cleaner.Update()
+
+            openSurface = cleaner.GetOutput()
+            print(
+                f"[FlowExtensions] Open surface: {openSurface.GetNumberOfPoints()} points"
+            )
+
+            # --- Step 2: Detect open boundaries ---
             boundaryRefSys = vtkvmtkCG.vtkvmtkBoundaryReferenceSystems()
-            boundaryRefSys.SetInputData(surfacePolyData)
+            boundaryRefSys.SetInputData(openSurface)
             boundaryRefSys.SetBoundaryRadiusArrayName('BoundaryRadius')
             boundaryRefSys.SetBoundaryNormalsArrayName('BoundaryNormals')
             boundaryRefSys.SetPoint1ArrayName('Point1')
@@ -799,14 +852,14 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             refSysOutput = boundaryRefSys.GetOutput()
             nBoundaries = refSysOutput.GetNumberOfPoints()
             if nBoundaries == 0:
-                print("[FlowExtensions] No open boundaries detected, skipping")
-                return surfacePolyData
+                print("[FlowExtensions] No open boundaries on marching-cubes surface, skipping")
+                return closedPolyData
 
             print(f"[FlowExtensions] {nBoundaries} open boundary(ies) found, applying extensions")
 
-            # Extend surface at each open boundary using boundary normals
+            # --- Step 3: Extend the surface at each open boundary ---
             flowExt = vtkvmtkCG.vtkvmtkFlowExtensionsFilter()
-            flowExt.SetInputData(surfacePolyData)
+            flowExt.SetInputData(openSurface)
             flowExt.SetCenterlines(refSysOutput)
             flowExt.SetExtensionModeToUseNormalToBoundary()
             flowExt.SetInterpolationModeToLinear()
@@ -821,18 +874,18 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             if result and result.GetNumberOfPoints() > 0:
                 print(
                     f"[FlowExtensions] Surface extended: "
-                    f"{surfacePolyData.GetNumberOfPoints()} -> {result.GetNumberOfPoints()} points"
+                    f"{openSurface.GetNumberOfPoints()} -> {result.GetNumberOfPoints()} points"
                 )
                 return result
 
             print("[FlowExtensions] Filter returned empty output, using original surface")
-            return surfacePolyData
+            return closedPolyData
 
         except Exception as e:
             print(f"[FlowExtensions] WARNING — failed to apply: {e}")
             import traceback
             traceback.print_exc()
-            return surfacePolyData
+            return closedPolyData
 
     def createZoneNode(self):
         """Create zone fiducial node if needed"""
