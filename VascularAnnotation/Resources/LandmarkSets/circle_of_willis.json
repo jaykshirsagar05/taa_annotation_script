@@ -1,0 +1,81 @@
+{
+  "landmark_schema_version": "1.0",
+  "id": "circle_of_willis",
+  "name": "Circle of Willis",
+  "description": "Circle of Willis intracranial vessel landmarks",
+  "max_landmarks": 6,
+  "landmarks": [
+    {
+      "id": 0,
+      "label": "ICA",
+      "name": "Internal Carotid Artery",
+      "description": "Intracranial internal carotid artery.",
+      "color": [
+        1.0,
+        0.2,
+        0.2
+      ],
+      "zone_after": "ICA Segment"
+    },
+    {
+      "id": 1,
+      "label": "ACA",
+      "name": "Anterior Cerebral Artery",
+      "description": "Anterior cerebral artery.",
+      "color": [
+        1.0,
+        0.55,
+        0.0
+      ],
+      "zone_after": "ACA Segment"
+    },
+    {
+      "id": 2,
+      "label": "MCA",
+      "name": "Middle Cerebral Artery",
+      "description": "Middle cerebral artery.",
+      "color": [
+        0.2,
+        0.8,
+        0.2
+      ],
+      "zone_after": "MCA Segment"
+    },
+    {
+      "id": 3,
+      "label": "PCA",
+      "name": "Posterior Cerebral Artery",
+      "description": "Posterior cerebral artery.",
+      "color": [
+        0.2,
+        0.4,
+        1.0
+      ],
+      "zone_after": "PCA Segment"
+    },
+    {
+      "id": 4,
+      "label": "ACOM",
+      "name": "Anterior Communicating",
+      "description": "Anterior communicating artery.",
+      "color": [
+        0.55,
+        0.0,
+        1.0
+      ],
+      "zone_after": "ACOM Segment"
+    },
+    {
+      "id": 5,
+      "label": "PCOM",
+      "name": "Posterior Communicating",
+      "description": "Posterior communicating artery.",
+      "color": [
+        0.9,
+        0.0,
+        0.9
+      ],
+      "zone_after": null
+    }
+  ]
+}

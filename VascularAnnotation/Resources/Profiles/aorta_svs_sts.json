@@ -1,0 +1,90 @@
+{
+  "profile_schema_version": "1.0",
+  "id": "aorta_svs_sts",
+  "name": "Aorta SVS/STS",
+  "description": "Thoracic aortic aneurysm annotation with SVS/STS 10-zone landmarks",
+  "version": "1.0.0",
+  "anatomy_tag": "thoracic_aorta",
+  "inputs": {
+    "ct": {
+      "label": "CT Volume",
+      "role": "volume",
+      "required": true,
+      "file_patterns": [
+        "ct_scan_{id}.nii.gz",
+        "ct_{id}.nii.gz",
+        "*.nii.gz"
+      ],
+      "mime": "application/nifti"
+    },
+    "seg_mask": {
+      "label": "Segmentation Mask",
+      "role": "mask",
+      "required": true,
+      "file_patterns": [
+        "{id}_unified_mask_smoothed.nii.gz",
+        "{id}_mask.nii.gz",
+        "{id}_seg*.nii.gz"
+      ],
+      "mime": "application/nifti"
+    },
+    "ref_mask": {
+      "label": "Reference Mask",
+      "role": "mask",
+      "required": false,
+      "file_patterns": [
+        "{id}_merged_mask.nii.gz",
+        "{id}_ref_mask.nii.gz"
+      ],
+      "mime": "application/nifti"
+    },
+    "centerline": {
+      "label": "Pre-computed Centerline",
+      "role": "centerline",
+      "required": false,
+      "file_patterns": [
+        "{id}_Centerline.vtk",
+        "{id}_centerline.vtk",
+        "{id}_centerline.vtp",
+        "*.vtp"
+      ],
+      "mime": "application/vtk"
+    }
+  },
+  "mask_handling": {
+    "binarize_before_refine": false,
+    "multi_segment": false,
+    "centerline_segment_index": 0
+  },
+  "phases": [
+    "load_data",
+    "refine_mask",
+    "extract_centerline",
+    "place_landmarks",
+    "export"
+  ],
+  "landmark_set": "aorta_svs_sts",
+  "export": {
+    "bundle_suffix": "_GT_Bundle",
+    "artifacts": {
+      "refined_mask": "{patient_id}_refined_mask.seg.nrrd",
+      "centerline": "{patient_id}_Centerline.vtk",
+      "network": "{patient_id}_Network.vtk",
+      "endpoints": "{patient_id}_Endpoints.fcsv",
+      "landmarks": "{patient_id}_Zones.fcsv",
+      "notes": "{patient_id}_notes.txt",
+      "metadata": "export_metadata.json"
+    }
+  },
+  "orthanc_attachments": {
+    "metadata": 1024,
+    "ct": 1025,
+    "seg_mask": 1026,
+    "ref_mask": 1027,
+    "refined_mask": 1028,
+    "centerline": 1029,
+    "landmarks": 1030,
+    "endpoints": 1031,
+    "notes": 1032
+  }
+}

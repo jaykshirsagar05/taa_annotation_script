@@ -1,0 +1,129 @@
+{
+  "landmark_schema_version": "1.0",
+  "id": "aorta_svs_sts",
+  "name": "Aorta SVS/STS 10 Zones",
+  "description": "SVS/STS reporting standards for thoracic aortic aneurysm (Fillinger et al., J Vasc Surg 2010)",
+  "max_landmarks": 10,
+  "landmarks": [
+    {
+      "id": 0,
+      "label": "STJ",
+      "name": "Sinotubular Junction",
+      "description": "Junction of the aortic root and ascending aorta, just above the sinuses of Valsalva.",
+      "color": [
+        1.0,
+        0.2,
+        0.2
+      ],
+      "zone_after": "Zone 0 \u2014 Ascending Aorta"
+    },
+    {
+      "id": 1,
+      "label": "BCA",
+      "name": "Brachiocephalic Artery",
+      "description": "Origin of the brachiocephalic (innominate) artery from the aortic arch.",
+      "color": [
+        1.0,
+        0.55,
+        0.0
+      ],
+      "zone_after": "Zone 1 \u2014 Proximal Arch"
+    },
+    {
+      "id": 2,
+      "label": "LCCA",
+      "name": "Left Common Carotid",
+      "description": "Origin of the left common carotid artery from the aortic arch.",
+      "color": [
+        0.9,
+        0.85,
+        0.0
+      ],
+      "zone_after": "Zone 2 \u2014 Distal Arch"
+    },
+    {
+      "id": 3,
+      "label": "LSA",
+      "name": "Left Subclavian Artery",
+      "description": "Origin of the left subclavian artery from the aortic arch.",
+      "color": [
+        0.2,
+        0.8,
+        0.2
+      ],
+      "zone_after": "Zone 3 \u2014 Prox. Descending"
+    },
+    {
+      "id": 4,
+      "label": "PDescA",
+      "name": "Proximal Descending",
+      "description": "Approximately 2 cm distal to the left subclavian artery origin.",
+      "color": [
+        0.0,
+        0.8,
+        0.8
+      ],
+      "zone_after": "Zone 4 \u2014 Mid Descending"
+    },
+    {
+      "id": 5,
+      "label": "MDescA",
+      "name": "Mid Descending",
+      "description": "Mid-level of the descending thoracic aorta (approximately at the pulmonary artery bifurcation).",
+      "color": [
+        0.2,
+        0.4,
+        1.0
+      ],
+      "zone_after": "Zone 5 \u2014 Distal Descending"
+    },
+    {
+      "id": 6,
+      "label": "CT",
+      "name": "Celiac Trunk",
+      "description": "Origin of the celiac trunk at the diaphragmatic level.",
+      "color": [
+        0.55,
+        0.0,
+        1.0
+      ],
+      "zone_after": "Zone 6 \u2014 Suprarenal Abdominal"
+    },
+    {
+      "id": 7,
+      "label": "SMA",
+      "name": "Superior Mesenteric Artery",
+      "description": "Origin of the superior mesenteric artery.",
+      "color": [
+        0.9,
+        0.0,
+        0.9
+      ],
+      "zone_after": "Zone 7 \u2014 Paravisceral"
+    },
+    {
+      "id": 8,
+      "label": "RA",
+      "name": "Renal Arteries",
+      "description": "Level of the most inferior (lowest) renal artery origin.",
+      "color": [
+        0.8,
+        0.4,
+        0.15
+      ],
+      "zone_after": "Zone 8 \u2014 Infrarenal"
+    },
+    {
+      "id": 9,
+      "label": "ABif",
+      "name": "Aortic Bifurcation",
+      "description": "Bifurcation of the aorta into the common iliac arteries.",
+      "color": [
+        0.55,
+        0.55,
+        0.55
+      ],
+      "zone_after": null
+    }
+  ]
+}
