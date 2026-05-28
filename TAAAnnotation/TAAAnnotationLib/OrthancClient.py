@@ -876,10 +876,10 @@ class OrthancClient:
 
     def _download_ct_dicom_series(self, study_id: str, output_dir: str) -> bool:
         """
-        Download a CT DICOM series from the study into output_dir.
+        Download the CT DICOM series from a study into output_dir.
 
-        Chooses the CT series with the most instances and extracts its
-        archive ZIP from Orthanc.
+        Selects the CT series with the most instances, then streams each
+        instance individually in parallel — no ZIP archive is buffered in RAM.
         """
         try:
             response = self.session.get(f"{self.server_url}/studies/{study_id}")
@@ -906,23 +906,7 @@ class OrthancClient:
             if not best_series_id:
                 return False
 
-            os.makedirs(output_dir, exist_ok=True)
-            archive_resp = self.session.get(f"{self.server_url}/series/{best_series_id}/archive")
-            if archive_resp.status_code != 200:
-                return False
-
-            zip_path = os.path.join(output_dir, "series.zip")
-            with open(zip_path, "wb") as f:
-                f.write(archive_resp.content)
-
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(output_dir)
-            os.remove(zip_path)
-
-            for root, _, files in os.walk(output_dir):
-                if any(name.lower().endswith(".dcm") for name in files):
-                    return True
-            return False
+            return self._stream_series_instances_to_dir(best_series_id, output_dir)
         except Exception as e:
             print(f"[OrthancClient] Error downloading CT DICOM series: {e}")
             return False
@@ -1320,8 +1304,9 @@ class OrthancClient:
                 )
             return False
 
-        # Determine instance count from cached data if possible
+        # Determine instance count and check for DICOM SEG in parent study
         ct_dicom = False
+        seg_dicom = False
         try:
             r = self.session.get(f"{self.server_url}/series/{series_id}")
             if r.status_code == 200:
@@ -1329,8 +1314,12 @@ class OrthancClient:
         except Exception:
             pass
 
+        if parent_study_id:
+            seg_dicom = self.get_dicom_seg_series_id(parent_study_id) is not None
+
         return {
             "ct_dicom":    ct_dicom,
+            "seg_dicom":   seg_dicom,
             "ct_nifti":    _series_or_study(self.ATTACHMENT_CT_NIFTI),
             "unified_mask": _series_or_study(self.ATTACHMENT_UNIFIED_MASK),
             "merged_mask": _series_or_study(self.ATTACHMENT_MERGED_MASK),
@@ -1383,9 +1372,9 @@ class OrthancClient:
                     suffix = self._get_extension_for_type(attachment_type)
                     fd, output_path = tempfile.mkstemp(suffix=suffix)
                     os.close(fd)
-                raw = resp.raw.read(decode_content=False)
                 with open(output_path, "wb") as f:
-                    f.write(raw)
+                    for chunk in resp.raw.stream(1 << 20, decode_content=False):
+                        f.write(chunk)
                 return self._validate_nifti_file(output_path)
             if resp.status_code != 404:
                 print(f"[OrthancClient] Series download HTTP {resp.status_code} "
@@ -1422,81 +1411,75 @@ class OrthancClient:
             return False
 
     def _download_dicom_series(self, series_id: str, output_dir: str) -> bool:
-        """Download a specific DICOM series by its Orthanc series ID into output_dir."""
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            archive_resp = self.session.get(
-                f"{self.server_url}/series/{series_id}/archive"
-            )
-            if archive_resp.status_code != 200:
-                return False
-            zip_path = os.path.join(output_dir, "series.zip")
-            with open(zip_path, "wb") as f:
-                f.write(archive_resp.content)
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(output_dir)
-            os.remove(zip_path)
-            for root, _, files in os.walk(output_dir):
-                if any(fn.lower().endswith(".dcm") for fn in files):
-                    return True
-            return False
-        except Exception as e:
-            print(f"[OrthancClient] Error downloading DICOM series {series_id}: {e}")
-            return False
+        """Stream all instances of a DICOM series into output_dir in parallel."""
+        return self._stream_series_instances_to_dir(series_id, output_dir)
 
     def download_files_for_series(self, series_id: str, patient_id: str,
                                    profile, temp_dir: str) -> Dict[str, Optional[str]]:
         """
         Download all files required by a DatasetProfile for a CT series.
 
-        CT data is fetched directly from the DICOM series.  All other
-        attachments are pulled from the series level with a fallback to
-        the parent study (for masks uploaded under the old study-level
-        workflow).
+        For the DICOM_NATIVE profile, CT instances and DICOM SEG are streamed
+        in parallel from the native DICOM series (no NIfTI attachments used).
+        All other profiles fetch Orthanc attachments, also in parallel.
 
         Returns:
             dict of {logical_name: local_path_or_None}
         """
-        from .DatasetProfile import download_filename
+        from .DatasetProfile import DatasetProfile as DP, download_filename
+
+        if profile.profile_type == DP.DICOM_NATIVE:
+            return self._download_dicom_native_profile(
+                series_id, patient_id, profile, temp_dir
+            )
+
+        # --- All non-native profiles: fetch attachments in parallel ---
         paths: Dict[str, Optional[str]] = {}
 
-        # --- CT: NIfTI attachment first, then DICOM series archive ---
-        ct_fname = download_filename("ct", patient_id)
-        ct_path = self.download_nifti_from_series(
-            series_id, self.ATTACHMENT_CT_NIFTI,
-            os.path.join(temp_dir, ct_fname),
-        )
-        if ct_path:
-            print(f"[OrthancClient] CT from NIfTI attachment (series): "
-                  f"{os.path.basename(ct_path)}")
-        else:
-            dicom_dir = os.path.join(temp_dir, f"{patient_id}_ct_dicom")
-            if self._download_dicom_series(series_id, dicom_dir):
-                ct_path = dicom_dir
-                print(f"[OrthancClient] CT from DICOM series: {dicom_dir}")
-            else:
-                print("[OrthancClient] CT download failed for series")
-        paths["ct"] = ct_path
-
-        # --- Required attachments ---
-        for logical_name, att_id in profile.required_attachments.items():
+        def _fetch_one(logical_name: str, att_id: int) -> tuple:
             if logical_name == "ct":
-                continue
-            fname = download_filename(logical_name, patient_id)
-            local_path = self.download_nifti_from_series(
-                series_id, att_id, os.path.join(temp_dir, fname)
-            )
-            if logical_name == "centerline" and local_path:
-                local_path = self._detect_and_fix_centerline_ext(local_path)
-            paths[logical_name] = local_path
+                # NIfTI attachment first, then DICOM series fallback
+                ct_fname = download_filename("ct", patient_id)
+                local = self.download_nifti_from_series(
+                    series_id, self.ATTACHMENT_CT_NIFTI,
+                    os.path.join(temp_dir, ct_fname),
+                )
+                if local:
+                    print(f"[OrthancClient] CT from NIfTI attachment: "
+                          f"{os.path.basename(local)}")
+                else:
+                    dicom_dir = os.path.join(temp_dir, f"{patient_id}_ct_dicom")
+                    if self._stream_series_instances_to_dir(series_id, dicom_dir):
+                        local = dicom_dir
+                        print(f"[OrthancClient] CT from DICOM series: {dicom_dir}")
+                    else:
+                        print("[OrthancClient] CT download failed for series")
+                return logical_name, local
 
-        # --- Optional attachments ---
-        for logical_name, att_id in profile.optional_attachments.items():
+            if att_id is None:
+                return logical_name, None
+
             fname = download_filename(logical_name, patient_id)
-            local_path = self.download_nifti_from_series(
+            local = self.download_nifti_from_series(
                 series_id, att_id, os.path.join(temp_dir, fname)
             )
-            paths[logical_name] = local_path
+            if logical_name == "centerline" and local:
+                local = self._detect_and_fix_centerline_ext(local)
+            return logical_name, local
+
+        tasks = {
+            **{name: att_id for name, att_id in profile.required_attachments.items()},
+            **{name: att_id for name, att_id in profile.optional_attachments.items()},
+        }
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(_fetch_one, name, att_id): name
+                for name, att_id in tasks.items()
+            }
+            for future in as_completed(futures):
+                logical_name, local_path = future.result()
+                paths[logical_name] = local_path
 
         return paths
 
@@ -1629,6 +1612,225 @@ class OrthancClient:
         if self.set_series_annotation_metadata(series_id, metadata):
             return True, "Series released successfully"
         return False, "Failed to update metadata"
+
+    # -------------------------------------------------------------------------
+    # DICOM-native streaming helpers (CT instance streaming + DICOM SEG)
+    # -------------------------------------------------------------------------
+
+    def _stream_series_instances_to_dir(self, series_id: str, output_dir: str,
+                                         max_workers: int = 8) -> bool:
+        """
+        Download all DICOM instances in a series to output_dir.
+
+        Primary path: /series/{id}/archive (single ZIP download).  One HTTP
+        request instead of N means far less round-trip overhead for large CT
+        series.  Falls back to per-instance parallel streaming if the archive
+        endpoint is unavailable or the ZIP extraction fails.
+
+        Returns True when at least one .dcm file was written.
+        """
+        import shutil
+
+        os.makedirs(output_dir, exist_ok=True)
+        archive_tmp = os.path.join(output_dir, "_series_archive.zip")
+
+        # --- Primary: single ZIP archive download ---
+        try:
+            r = self.session.get(
+                f"{self.server_url}/series/{series_id}/archive",
+                stream=True,
+                timeout=(15, 600),
+            )
+            if r.status_code == 200:
+                with open(archive_tmp, "wb") as fz:
+                    for chunk in r.raw.stream(1 << 20, decode_content=False):
+                        fz.write(chunk)
+
+                dcm_count = 0
+                with zipfile.ZipFile(archive_tmp) as zf:
+                    for member in zf.infolist():
+                        basename = os.path.basename(member.filename)
+                        if not basename:
+                            continue
+                        out_name = (basename if basename.lower().endswith(".dcm")
+                                    else basename + ".dcm")
+                        with zf.open(member) as src, \
+                                open(os.path.join(output_dir, out_name), "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        dcm_count += 1
+
+                os.remove(archive_tmp)
+                if dcm_count > 0:
+                    print(f"[OrthancClient] ZIP archive: extracted {dcm_count} instances "
+                          f"→ {os.path.basename(output_dir)}")
+                    return True
+        except Exception as e:
+            print(f"[OrthancClient] ZIP archive failed ({e}), falling back to per-instance")
+            if os.path.exists(archive_tmp):
+                try:
+                    os.remove(archive_tmp)
+                except OSError:
+                    pass
+
+        # --- Fallback: per-instance parallel download ---
+        try:
+            resp = self.session.get(f"{self.server_url}/series/{series_id}")
+            if resp.status_code != 200:
+                return False
+            instance_ids = resp.json().get("Instances", [])
+            if not instance_ids:
+                return False
+
+            def _fetch(iid: str) -> bool:
+                r = self.session.get(
+                    f"{self.server_url}/instances/{iid}/file",
+                    stream=True,
+                )
+                if r.status_code != 200:
+                    print(f"[OrthancClient] Instance {iid} HTTP {r.status_code}")
+                    return False
+                out = os.path.join(output_dir, f"{iid}.dcm")
+                with open(out, "wb") as f:
+                    for chunk in r.raw.stream(1 << 20, decode_content=False):
+                        f.write(chunk)
+                return True
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                results = list(pool.map(_fetch, instance_ids))
+
+            ok = any(results)
+            if ok:
+                print(f"[OrthancClient] Per-instance: {sum(results)}/{len(instance_ids)} "
+                      f"instances → {os.path.basename(output_dir)}")
+            return ok
+        except Exception as e:
+            print(f"[OrthancClient] Error streaming series {series_id}: {e}")
+            return False
+
+    def get_dicom_seg_series_id(self, study_id: str) -> Optional[str]:
+        """
+        Find the DICOM SEG series in a study.
+
+        Returns the Orthanc series ID of the first SEG-modality series, or None.
+        """
+        try:
+            r = self.session.get(f"{self.server_url}/studies/{study_id}")
+            if r.status_code != 200:
+                return None
+            for sid in r.json().get("Series", []):
+                series_r = self.session.get(f"{self.server_url}/series/{sid}")
+                if series_r.status_code == 200:
+                    mod = series_r.json().get("MainDicomTags", {}).get("Modality", "")
+                    if mod == "SEG":
+                        return sid
+        except Exception as e:
+            print(f"[OrthancClient] Error finding SEG series in study {study_id}: {e}")
+        return None
+
+    def download_dicom_seg_file(self, seg_series_id: str,
+                                 output_path: str) -> Optional[str]:
+        """
+        Download the DICOM SEG instance from a series to output_path.
+
+        DICOM SEG objects are normally a single instance.  If the series has
+        multiple instances, the first one is downloaded (unusual but safe as a
+        fallback — the Slicer loader handles multi-frame SEG in one file).
+
+        Returns the local file path on success, or None.
+        """
+        try:
+            r = self.session.get(f"{self.server_url}/series/{seg_series_id}")
+            if r.status_code != 200:
+                return None
+            instance_ids = r.json().get("Instances", [])
+            if not instance_ids:
+                return None
+
+            iid = instance_ids[0]
+            file_r = self.session.get(
+                f"{self.server_url}/instances/{iid}/file",
+                stream=True,
+            )
+            if file_r.status_code != 200:
+                print(f"[OrthancClient] DICOM SEG download HTTP {file_r.status_code}")
+                return None
+
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            with open(output_path, "wb") as f:
+                for chunk in file_r.raw.stream(1 << 20, decode_content=False):
+                    f.write(chunk)
+            print(f"[OrthancClient] DICOM SEG downloaded: {os.path.basename(output_path)}")
+            return output_path
+        except Exception as e:
+            print(f"[OrthancClient] Error downloading DICOM SEG {seg_series_id}: {e}")
+            return None
+
+    def _download_dicom_native_profile(self, series_id: str, patient_id: str,
+                                        profile, temp_dir: str) -> Dict[str, Optional[str]]:
+        """
+        Download CT instances + DICOM SEG for the DICOM_NATIVE profile.
+
+        CT streaming and SEG download run concurrently.  Optional attachment
+        downloads (e.g. a pre-computed centerline) are fetched afterwards.
+
+        Returns dict of {logical_name: local_path_or_None}.
+        """
+        from .DatasetProfile import download_filename
+        paths: Dict[str, Optional[str]] = {}
+
+        # Resolve parent study (SEG lives there alongside the CT series)
+        parent_study_id = ""
+        try:
+            r = self.session.get(f"{self.server_url}/series/{series_id}")
+            if r.status_code == 200:
+                parent_study_id = r.json().get("ParentStudy", "")
+        except Exception:
+            pass
+
+        # Find SEG series before launching parallel tasks
+        seg_series_id = (
+            self.get_dicom_seg_series_id(parent_study_id)
+            if parent_study_id else None
+        )
+
+        # CT and SEG download in parallel.
+        # SEG lives in its own subdirectory so that _loadDicomSeg's seg_dir
+        # (dirname of the .dcm path) contains only the one SEG file and never
+        # accidentally re-imports the 518-file CT folder alongside it.
+        ct_dir = os.path.join(temp_dir, f"{patient_id}_ct_dicom")
+        seg_subdir = os.path.join(temp_dir, f"{patient_id}_seg_dicom")
+        os.makedirs(seg_subdir, exist_ok=True)
+        seg_path = os.path.join(seg_subdir, f"{patient_id}_seg.dcm")
+
+        def _fetch_ct():
+            ok = self._stream_series_instances_to_dir(series_id, ct_dir)
+            return ct_dir if ok else None
+
+        def _fetch_seg():
+            if not seg_series_id:
+                print("[OrthancClient] No DICOM SEG series found in parent study")
+                return None
+            return self.download_dicom_seg_file(seg_series_id, seg_path)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ct_future  = pool.submit(_fetch_ct)
+            seg_future = pool.submit(_fetch_seg)
+            paths["ct"]       = ct_future.result()
+            paths["seg_mask"] = seg_future.result()
+
+        # Optional attachments (e.g. pre-computed centerline stored as attachment)
+        for logical_name, att_id in profile.optional_attachments.items():
+            if att_id is None:
+                continue
+            fname = download_filename(logical_name, patient_id)
+            local = self.download_nifti_from_series(
+                series_id, att_id, os.path.join(temp_dir, fname)
+            )
+            if logical_name == "centerline" and local:
+                local = self._detect_and_fix_centerline_ext(local)
+            paths[logical_name] = local
+
+        return paths
 
     def submit_annotation_on_series(self, series_id: str, files: Dict[str, str],
                                      notes: str = "") -> Tuple[bool, str]:

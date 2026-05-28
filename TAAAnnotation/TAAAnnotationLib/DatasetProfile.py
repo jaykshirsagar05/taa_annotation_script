@@ -45,6 +45,8 @@ class DatasetProfile:
         description:    Longer description for tooltips / info panels.
         required_attachments:  dict {logical_name: attachment_id}
                                All of these must be present to download.
+                               attachment_id=None means the data comes from a
+                               native DICOM series (not an Orthanc attachment).
         optional_attachments:  dict {logical_name: attachment_id}
                                Downloaded when available, not mandatory.
         skip_phases:    set of phase numbers skipped for this profile.
@@ -56,6 +58,7 @@ class DatasetProfile:
     CT_AND_SEG_MASK = "ct_and_seg_mask"
     DUAL_MASK = "dual_mask"
     MASK_AND_CENTERLINE = "mask_and_centerline"
+    DICOM_NATIVE = "dicom_native"
 
     def __init__(self, profile_type, name, description,
                  required_attachments, optional_attachments=None,
@@ -136,6 +139,28 @@ PROFILES = {
         skip_phases={3},           # Skip VMTK extraction
         has_precalculated_centerline=True,
     ),
+
+    DatasetProfile.DICOM_NATIVE: DatasetProfile(
+        profile_type=DatasetProfile.DICOM_NATIVE,
+        name="DICOM Native (CT + SEG)",
+        description=(
+            "Native DICOM CT series + DICOM SEG series. "
+            "No NIfTI conversion required. CT is streamed instance-by-instance "
+            "from Orthanc; segmentation is loaded directly from the DICOM SEG object. "
+            "Full workflow: refine mask, extract centerline via VMTK, place landmarks."
+        ),
+        # attachment_id=None → data comes from a native DICOM series, not an attachment
+        required_attachments={
+            "ct":       None,
+            "seg_mask": None,
+        },
+        optional_attachments={
+            "centerline": ATT_CENTERLINE,
+        },
+        skip_phases=set(),
+        has_precalculated_centerline=False,
+        binarize_mask_before_refine=True,
+    ),
 }
 
 
@@ -171,26 +196,34 @@ def detect_profile_from_attachments(available_attachments):
 
     Args:
         available_attachments: dict of {attachment_name: bool} as returned by
-                               OrthancClient.get_study_attachments()
+                               OrthancClient.get_series_attachments_info()
+                               Keys include: ct_nifti, ct_dicom, seg_dicom,
+                               unified_mask, merged_mask, centerline, …
 
     Returns:
         DatasetProfile instance, or None if no profile matches.
     """
-    has_ct        = (available_attachments.get("ct_nifti", False)
-                     or available_attachments.get("ct_dicom", False))
-    has_unified   = available_attachments.get("unified_mask", False)
-    has_merged    = available_attachments.get("merged_mask", False)
+    has_ct_nifti   = available_attachments.get("ct_nifti", False)
+    has_ct_dicom   = available_attachments.get("ct_dicom", False)
+    has_seg_dicom  = available_attachments.get("seg_dicom", False)
+    has_unified    = available_attachments.get("unified_mask", False)
+    has_merged     = available_attachments.get("merged_mask", False)
     has_centerline = available_attachments.get("centerline", False)
+    has_ct         = has_ct_nifti or has_ct_dicom
 
-    # Mask + Centerline takes priority when a centerline is present
+    # DICOM Native: native CT series + DICOM SEG — no NIfTI attachments needed
+    if has_ct_dicom and has_seg_dicom:
+        return PROFILES[DatasetProfile.DICOM_NATIVE]
+
+    # Mask + Centerline takes priority when a centerline attachment is present
     if has_ct and has_unified and has_centerline:
         return PROFILES[DatasetProfile.MASK_AND_CENTERLINE]
 
-    # Dual Mask when both masks are present
+    # Dual Mask when both NIfTI masks are present
     if has_ct and has_unified and has_merged:
         return PROFILES[DatasetProfile.DUAL_MASK]
 
-    # CT + seg mask only — default profile (mask will be binarized before refine)
+    # CT + NIfTI seg mask only
     if has_ct and has_unified:
         return PROFILES[DatasetProfile.CT_AND_SEG_MASK]
 

@@ -901,21 +901,45 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         errors = []
         slicer.mrmlScene.Clear(0)
 
-        # --- CT volume (always required; supports NIfTI file or DICOM folder) ---
         ct_path = file_paths.get("ct")
         if not ct_path or not os.path.exists(ct_path):
             raise RuntimeError(f"CT scan path missing or not found: {ct_path}")
-        try:
-            print(f"[Loading] CT from: {ct_path}")
-            self.volNode = self._loadCtVolume(ct_path)
-            if not self.volNode:
-                raise RuntimeError("Failed to load CT volume")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load CT volume from {ct_path}: {e}")
+
+        # --- DICOM_NATIVE: load CT + SEG together in one TemporaryDICOMDatabase ---
+        # This avoids re-importing 518 CT files a second time and lets the
+        # DICOMSegPlugin resolve the referenced CT series without opening a
+        # second database context.
+        _dicom_native_loaded = False
+        if profile.profile_type == "dicom_native" and os.path.isdir(ct_path):
+            _seg_path_raw = file_paths.get("seg_mask", "")
+            if _seg_path_raw and os.path.exists(_seg_path_raw):
+                print(f"[Loading] DICOM native: combined CT+SEG load")
+                vol, seg = self._loadDicomNativeAll(ct_path, _seg_path_raw)
+                if not vol:
+                    raise RuntimeError(
+                        f"Failed to load CT volume (DICOM native) from {ct_path}")
+                self.volNode = vol
+                if seg:
+                    self.segNode = seg
+                    self.segNode.CreateClosedSurfaceRepresentation()
+                    print("[Loading] Segmentation mask loaded successfully")
+                else:
+                    errors.append("DICOM SEG segmentation could not be loaded")
+                _dicom_native_loaded = True
+
+        # --- CT volume (NIfTI / NRRD / non-native DICOM folder) ---
+        if not _dicom_native_loaded:
+            try:
+                print(f"[Loading] CT from: {ct_path}")
+                self.volNode = self._loadCtVolume(ct_path)
+                if not self.volNode:
+                    raise RuntimeError("Failed to load CT volume")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load CT volume from {ct_path}: {e}")
 
         # --- Segmentation mask ---
         seg_path = file_paths.get("seg_mask")
-        if seg_path and os.path.exists(seg_path):
+        if not _dicom_native_loaded and seg_path and os.path.exists(seg_path):
             try:
                 seg_path = self._fixFileExtension(seg_path)
                 file_size = os.path.getsize(seg_path)
@@ -931,6 +955,18 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                     if not self.segNode:
                         raise RuntimeError(
                             "Failed to load NRRD segmentation mask")
+                elif seg_path.lower().endswith('.dcm') or (
+                    os.path.isdir(seg_path)
+                    and any(f.lower().endswith('.dcm') for f in os.listdir(seg_path))
+                ):
+                    # DICOM SEG via legacy separate-database path
+                    # (reached only for non-DICOM_NATIVE profiles that somehow
+                    # have a .dcm seg — the DICOM_NATIVE branch above handles
+                    # the normal case)
+                    _ct_dicom_dir = ct_path if os.path.isdir(ct_path) else None
+                    self.segNode = self._loadDicomSeg(seg_path, ct_dicom_dir=_ct_dicom_dir)
+                    if not self.segNode:
+                        raise RuntimeError("Failed to load DICOM SEG segmentation")
                 else:
                     # NIfTI path: label-map → segmentation
                     unifiedLabelNode = self._loadNiftiAsLabelMap(seg_path)
@@ -953,7 +989,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                 msg = f"Segmentation mask: {e}"
                 print(f"[Loading] ERROR — {msg}")
                 errors.append(msg)
-        elif seg_path:
+        elif not _dicom_native_loaded and seg_path:
             msg = f"Segmentation mask file not found: {seg_path}"
             print(f"[Loading] ERROR — {msg}")
             errors.append(msg)
@@ -1123,6 +1159,132 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             print(f"[Loading] Failed to load DICOM CT from folder '{dicom_folder}': {e}")
             return None
 
+    def _loadDicomNativeAll(self, ct_dir: str, seg_path: str):
+        """
+        Load CT DICOM folder and DICOM SEG in a single TemporaryDICOMDatabase.
+
+        Using one shared database ensures:
+        - CT DICOM files are indexed exactly once (not once per load call).
+        - The DICOMSegPlugin finds the referenced CT series inside the same DB
+          when it resolves the SEG geometry, so no second CT volume is needed.
+        - Any duplicate vtkMRMLScalarVolumeNode created by the DICOMSegPlugin
+          as a by-product is detected and removed immediately.
+
+        Returns (vtkMRMLScalarVolumeNode, vtkMRMLSegmentationNode);
+        either element may be None on failure.
+        """
+        vol_node = None
+        seg_node = None
+
+        if not ct_dir or not os.path.isdir(ct_dir):
+            print(f"[Loading] CT DICOM directory not found: {ct_dir}")
+            return None, None
+
+        # seg_dir must be a dedicated folder containing only the SEG .dcm so
+        # that the importDicom call below does not accidentally sweep in CT files.
+        seg_dir = (os.path.dirname(os.path.abspath(seg_path))
+                   if seg_path and os.path.exists(seg_path) else None)
+
+        try:
+            from DICOMLib import DICOMUtils
+
+            ct_count = len([f for f in os.listdir(ct_dir)
+                            if f.lower().endswith(".dcm")])
+            print(f"[Loading] DICOM native: importing {ct_count} CT + SEG "
+                  f"into shared TemporaryDICOMDatabase…")
+
+            with DICOMUtils.TemporaryDICOMDatabase() as db:
+                # One import pass covers both datasets
+                DICOMUtils.importDicom(ct_dir, db)
+                if seg_dir and os.path.isdir(seg_dir):
+                    DICOMUtils.importDicom(seg_dir, db)
+
+                # Identify SEG series UID so we can skip it during CT load
+                seg_series_uid = None
+                if seg_path and os.path.exists(seg_path):
+                    try:
+                        import pydicom
+                        ds = pydicom.dcmread(seg_path, stop_before_pixels=True)
+                        seg_series_uid = str(
+                            getattr(ds, "SeriesInstanceUID", "") or "")
+                    except Exception as e_uid:
+                        print(f"[Loading] Could not read SEG SeriesUID: {e_uid}")
+
+                # Load CT series (all series that are not the SEG)
+                for patient_uid in db.patients():
+                    if vol_node:
+                        break
+                    for study_uid in db.studiesForPatient(patient_uid):
+                        if vol_node:
+                            break
+                        for series_uid in db.seriesForStudy(study_uid):
+                            if series_uid == seg_series_uid:
+                                continue
+                            loaded = DICOMUtils.loadSeriesByUID([series_uid])
+                            for nid in loaded:
+                                node = slicer.mrmlScene.GetNodeByID(nid)
+                                if node and node.IsA("vtkMRMLScalarVolumeNode"):
+                                    vol_node = node
+                                    vol_node.SetName(f"{self.currentId}_CT")
+                                    break
+                            if vol_node:
+                                break
+
+                if not vol_node:
+                    print("[Loading] No CT volume found in DICOM native database")
+                    return None, None
+
+                print(f"[Loading] CT loaded: {vol_node.GetName()}")
+
+                # Load SEG — DICOMSegPlugin can resolve CT geometry from the
+                # same database without making a second HTTP fetch.
+                if seg_series_uid:
+                    # Record existing scalar volume IDs so we can spot duplicates
+                    existing_vol_ids = set()
+                    c = slicer.mrmlScene.GetNodesByClass(
+                        "vtkMRMLScalarVolumeNode")
+                    for i in range(c.GetNumberOfItems()):
+                        existing_vol_ids.add(c.GetItemAsObject(i).GetID())
+
+                    loaded_seg = DICOMUtils.loadSeriesByUID([seg_series_uid])
+                    for nid in loaded_seg:
+                        node = slicer.mrmlScene.GetNodeByID(nid)
+                        if node and node.IsA("vtkMRMLSegmentationNode"):
+                            seg_node = node
+                            seg_node.SetName(f"{self.currentId}_Segmentation")
+                            print(f"[Loading] DICOM SEG loaded: "
+                                  f"{seg_node.GetName()}")
+                            break
+
+                    if not seg_node:
+                        print(f"[Loading] loadSeriesByUID for SEG returned "
+                              f"{len(loaded_seg)} node(s), none are SegmentationNode")
+
+                    # DICOMSegPlugin may load a duplicate CT volume as a side
+                    # effect — remove any new scalar volumes it added.
+                    dup_ids = []
+                    c = slicer.mrmlScene.GetNodesByClass(
+                        "vtkMRMLScalarVolumeNode")
+                    for i in range(c.GetNumberOfItems()):
+                        n = c.GetItemAsObject(i)
+                        if n.GetID() not in existing_vol_ids:
+                            dup_ids.append(n.GetID())
+                    for dup_id in dup_ids:
+                        dup = slicer.mrmlScene.GetNodeByID(dup_id)
+                        if dup:
+                            print(f"[Loading] Removing duplicate CT node "
+                                  f"(DICOMSegPlugin artefact): {dup.GetName()}")
+                            slicer.mrmlScene.RemoveNode(dup)
+                else:
+                    print("[Loading] SEG series UID not resolved — SEG not loaded")
+
+        except Exception as e:
+            print(f"[Loading] _loadDicomNativeAll failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return vol_node, seg_node
+
     # -----------------------------------------------------------------
     # File-format loading helpers
     # -----------------------------------------------------------------
@@ -1168,6 +1330,108 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         except Exception as e2:
             print(f"[Loading]   NRRD label-volume fallback failed: {e2}")
 
+        return None
+
+    def _loadDicomSeg(self, path: str, ct_dicom_dir: str = None):
+        """
+        Load a DICOM SEG file (or a directory containing one) as a
+        vtkMRMLSegmentationNode.
+
+        The DICOMSegmentation plugin (Strategy 1) needs the referenced CT
+        series to be present in the same DICOM database so it can resolve
+        the geometry.  Pass ``ct_dicom_dir`` to co-import the CT alongside
+        the SEG file, which is the normal case for the DICOM_NATIVE profile.
+
+        slicer.util.loadSegmentation() only handles Slicer-native formats
+        (.seg.nrrd, .nrrd); it does not route .dcm files through the DICOM
+        plugin and is therefore used only as a last-resort fallback.
+
+        Returns:
+            vtkMRMLSegmentationNode on success, or None.
+        """
+        # Resolve a single .dcm file when path is a directory
+        if os.path.isdir(path):
+            dcm_files = [
+                os.path.join(path, f)
+                for f in os.listdir(path)
+                if f.lower().endswith(".dcm")
+            ]
+            if not dcm_files:
+                print(f"[Loading] No .dcm files in DICOM SEG directory: {path}")
+                return None
+            path = dcm_files[0]
+
+        seg_dir = os.path.dirname(os.path.abspath(path))
+
+        # --- Strategy 1: DICOM database import (primary path for .dcm SEG) ---
+        # Co-import the CT DICOM directory so the DICOMSegPlugin can resolve
+        # the referenced CT series by SeriesInstanceUID.
+        try:
+            from DICOMLib import DICOMUtils
+            with DICOMUtils.TemporaryDICOMDatabase() as db:
+                if ct_dicom_dir and os.path.isdir(ct_dicom_dir):
+                    print(f"[Loading]   Importing CT DICOM into temp DB for SEG reference")
+                    DICOMUtils.importDicom(ct_dicom_dir, db)
+                DICOMUtils.importDicom(seg_dir, db)
+
+                # Locate the SEG series by its DICOM SeriesInstanceUID.
+                # Path-matching against db.filesForSeries() is unreliable because
+                # DICOMUtils.importDicom() may copy files into its own storage
+                # folder, so the returned paths won't match the original download
+                # path (and Windows 8.3 short-path vs long-path adds another
+                # mismatch layer).  Reading the UID directly from the file and
+                # looking it up in the indexed series is robust.
+                seg_series_uid = None
+                try:
+                    import pydicom
+                    ds = pydicom.dcmread(path, stop_before_pixels=True)
+                    file_series_uid = str(getattr(ds, "SeriesInstanceUID", "") or "")
+                    if file_series_uid:
+                        for patient in db.patients():
+                            for study in db.studiesForPatient(patient):
+                                for series in db.seriesForStudy(study):
+                                    if series == file_series_uid:
+                                        seg_series_uid = series
+                                        break
+                                if seg_series_uid:
+                                    break
+                            if seg_series_uid:
+                                break
+                    if not seg_series_uid:
+                        print(f"[Loading]   SEG SeriesInstanceUID {file_series_uid!r} "
+                              f"not found in temp DB after import")
+                except Exception as e_uid:
+                    print(f"[Loading]   Could not resolve SEG series via UID: {e_uid}")
+
+                if not seg_series_uid:
+                    print(f"[Loading]   SEG file not indexed in temp DB after import: "
+                          f"{os.path.basename(path)}")
+                else:
+                    loaded_ids = DICOMUtils.loadSeriesByUID([seg_series_uid])
+                    for nid in loaded_ids:
+                        node = slicer.mrmlScene.GetNodeByID(nid)
+                        if node and node.IsA("vtkMRMLSegmentationNode"):
+                            node.SetName(f"{self.currentId}_Segmentation")
+                            print(f"[Loading]   DICOM SEG loaded via DICOM database "
+                                  f"(series {seg_series_uid[:8]}…)")
+                            return node
+                    print(f"[Loading]   loadSeriesByUID returned {len(loaded_ids)} node(s), "
+                          f"none are SegmentationNode")
+        except Exception as e1:
+            print(f"[Loading]   DICOM database strategy failed: {e1}")
+
+        # --- Strategy 2: last-resort direct load (works for .seg.nrrd, rarely .dcm) ---
+        try:
+            node = slicer.util.loadSegmentation(path)
+            if node:
+                node.SetName(f"{self.currentId}_Segmentation")
+                print(f"[Loading]   DICOM SEG loaded via loadSegmentation fallback: "
+                      f"{os.path.basename(path)}")
+                return node
+        except Exception as e2:
+            print(f"[Loading]   loadSegmentation fallback failed: {e2}")
+
+        print(f"[Loading] ERROR — could not load DICOM SEG: {path}")
         return None
 
     @staticmethod
