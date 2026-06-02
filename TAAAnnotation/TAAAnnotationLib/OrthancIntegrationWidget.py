@@ -321,12 +321,7 @@ class OrthancIntegrationWidget(qt.QWidget):
                 )
                 return
 
-            # Enable action buttons
-            if self.userRole == "annotator":
-                self.btnSubmit.setEnabled(True)
-            else:
-                self.btnApprove.setEnabled(True)
-                self.btnReject.setEnabled(True)
+            self._configureActionsForLoadedSeries(series_info)
 
             # Enrich series_info with local file paths and profile
             series_info['_file_paths'] = paths
@@ -351,6 +346,27 @@ class OrthancIntegrationWidget(qt.QWidget):
     def _onSubmit(self):
         """Submit annotation to Orthanc."""
         self.annotationSubmitted.emit(self.currentStudyId)
+
+    def _configureActionsForLoadedSeries(self, series_info: dict):
+        """Enable the actions that match the loaded series and current role."""
+        self.btnSubmit.setEnabled(False)
+        self.btnApprove.setEnabled(False)
+        self.btnReject.setEnabled(False)
+
+        status = (series_info or {}).get("annotation_status", "")
+
+        if self.userRole == "annotator":
+            self.btnSubmit.setEnabled(True)
+        elif self.userRole == "admin":
+            if status == AnnotationStatus.IN_PROGRESS.value:
+                self.btnSubmit.setEnabled(True)
+            elif status in (AnnotationStatus.ANNOTATED.value,
+                            AnnotationStatus.IN_REVIEW.value):
+                self.btnApprove.setEnabled(True)
+                self.btnReject.setEnabled(True)
+        else:
+            self.btnApprove.setEnabled(True)
+            self.btnReject.setEnabled(True)
         
     def _onApprove(self):
         """Approve annotation."""
