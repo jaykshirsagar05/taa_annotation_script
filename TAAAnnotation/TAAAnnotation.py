@@ -63,6 +63,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Orthanc integration
         self.orthancClient = OrthancClient()
         self.orthancTempDir = None
+        self._stagedCtDir = None  # set when CT is loaded in Phase 1; cleared in Phase 2
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
@@ -83,6 +84,7 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # --- Orthanc Integration Widget ---
         self.orthancWidget = OrthancIntegrationWidget(self.orthancClient)
         self.orthancWidget.studyLoaded.connect(self.onOrthancStudyLoaded)
+        self.orthancWidget.ctReadyForStaging.connect(self.onCtReadyForStaging)
         self.orthancWidget.annotationSubmitted.connect(self.onSubmitToOrthanc)
         self.orthancWidget.annotationApproved.connect(self.onApproveAnnotation)
         self.orthancWidget.annotationRejected.connect(self.onRejectAnnotation)
@@ -162,9 +164,114 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.workflowWidget.setButtonsEnabled(True)
 
     # --- Orthanc Handlers ---
+    def onCtReadyForStaging(self, series_id: str, ct_dir: str, series_info: dict):
+        """Phase 1 of staged DICOM load: CT downloaded — index + load CT immediately."""
+        try:
+            patient_id = series_info.get('patient_id', series_id)
+            dicom_native_profile = PROFILES[DatasetProfile.DICOM_NATIVE]
+
+            # Reset scene and logic state before loading new data.
+            self.centerlinePicker.cleanup()
+            self.logic.reset()
+            self.logic.currentId = patient_id
+            self.logic.rootDir = os.path.dirname(ct_dir)
+            self.logic.activeProfile = dicom_native_profile
+
+            slicer.util.showStatusMessage(f"Loading CT for {patient_id}…")
+            slicer.app.processEvents()
+
+            vol_node = self.logic._loadDicomNativeCtOnly(ct_dir)
+            if vol_node:
+                self.logic.volNode = vol_node
+                self.logic.applyConfiguredCtWindowLevel()
+                self._stagedCtDir = ct_dir
+                self.workflowWidget.setCurrentId(patient_id, "loading segmentation…")
+                self.workflowWidget.setStatus(
+                    f"CT loaded for {patient_id} — segmentation downloading…"
+                )
+                slicer.util.showStatusMessage(
+                    f"CT loaded — segmentation downloading…", 10000
+                )
+                print(f"[Orthanc] Staged Phase 1 complete: CT visible for {patient_id}")
+            else:
+                print(f"[Orthanc] Staged Phase 1 failed: CT not loaded for {patient_id}")
+                self._stagedCtDir = None
+        except Exception as e:
+            print(f"[Orthanc] onCtReadyForStaging error: {e}")
+            import traceback
+            traceback.print_exc()
+            self._stagedCtDir = None
+
+    def _completeStagedDicomLoad(self, series_id: str, study_info: dict):
+        """Phase 2 of staged DICOM load: CT is in scene — add SEG and finalize."""
+        try:
+            profile    = study_info.get('_profile')
+            file_paths = study_info.get('_file_paths', {})
+            self.orthancTempDir = study_info.get('_temp_dir')
+            ct_dir = self._stagedCtDir
+            self._stagedCtDir = None
+
+            errors = []
+            seg_path = file_paths.get('seg_mask')
+
+            if seg_path and os.path.exists(seg_path):
+                slicer.util.showStatusMessage("Loading segmentation mask…")
+                slicer.app.processEvents()
+                seg_node = self.logic._loadDicomSeg(seg_path, ct_dicom_dir=ct_dir)
+                if seg_node:
+                    self.logic.segNode = seg_node
+                    seg_node.CreateClosedSurfaceRepresentation()
+                    if seg_node.GetDisplayNode():
+                        seg_node.GetDisplayNode().SetVisibility(True)
+                    print("[Orthanc] Staged Phase 2: segmentation loaded")
+                else:
+                    errors.append("DICOM SEG segmentation could not be loaded")
+            elif seg_path:
+                errors.append(f"Segmentation file not found: {seg_path}")
+
+            # Optional pre-computed centerline
+            centerline_path = file_paths.get('centerline')
+            if centerline_path and os.path.exists(centerline_path):
+                try:
+                    self.logic.centerlineNode = self.logic._loadCenterlineModel(centerline_path)
+                except Exception as e:
+                    errors.append(f"Centerline: {e}")
+
+            self.logic.workflowState["phase"] = 1
+            self.logic.hasUnsavedWork = False
+
+            if profile:
+                self.workflowWidget.setProfile(profile)
+            self.workflowWidget.setCurrentId(
+                study_info.get('patient_id', series_id),
+                f"from Orthanc — {profile.name if profile else 'DICOM Native'}"
+            )
+            self.workflowWidget.markDone(1, "Data Loaded (Orthanc)")
+            if profile and profile.has_precalculated_centerline and self.logic.centerlineNode:
+                self.workflowWidget.markDone(3, "Centerline Pre-loaded")
+            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+
+            if errors:
+                slicer.util.warningDisplay(
+                    "Some files could not be loaded:\n\n" + "\n".join(errors),
+                    "Partial Load"
+                )
+            if self.orthancWidget.getRole() == "reviewer":
+                self._loadExistingAnnotations(series_id, self.orthancTempDir)
+        except Exception as e:
+            slicer.util.errorDisplay(f"Failed to complete staged load:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
+
     def onOrthancStudyLoaded(self, study_id: str, study_info: dict):
         """Handle study loaded from Orthanc (profile-aware)."""
         try:
+            # DICOM_NATIVE staged path: CT already loaded in onCtReadyForStaging.
+            # Only add SEG and finalize.
+            if self._stagedCtDir is not None:
+                self._completeStagedDicomLoad(study_id, study_info)
+                return
+
             profile = study_info.get('_profile')
             file_paths = study_info.get('_file_paths', {})
             self.orthancTempDir = study_info.get('_temp_dir')
@@ -906,9 +1013,6 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             raise RuntimeError(f"CT scan path missing or not found: {ct_path}")
 
         # --- DICOM_NATIVE: load CT + SEG together in one TemporaryDICOMDatabase ---
-        # This avoids re-importing 518 CT files a second time and lets the
-        # DICOMSegPlugin resolve the referenced CT series without opening a
-        # second database context.
         _dicom_native_loaded = False
         if profile.profile_type == "dicom_native" and os.path.isdir(ct_path):
             _seg_path_raw = file_paths.get("seg_mask", "")
@@ -1187,6 +1291,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
 
         try:
             from DICOMLib import DICOMUtils
+            import ctk
 
             ct_count = len([f for f in os.listdir(ct_dir)
                             if f.lower().endswith(".dcm")])
@@ -1194,10 +1299,23 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                   f"into shared TemporaryDICOMDatabase…")
 
             with DICOMUtils.TemporaryDICOMDatabase() as db:
-                # One import pass covers both datasets
-                DICOMUtils.importDicom(ct_dir, db)
+                # Use ctkDICOMIndexer directly so waitForImportFinished()
+                # pumps Qt processEvents() while the background thread pool
+                # indexes files.  This keeps Slicer responsive during indexing.
+                ct_indexer = ctk.ctkDICOMIndexer()
+                slicer.util.showStatusMessage(
+                    f"Indexing {ct_count} CT DICOM files…"
+                )
+                slicer.app.processEvents()
+                ct_indexer.addDirectory(db, ct_dir, False)
+                ct_indexer.waitForImportFinished()
+                slicer.app.processEvents()
+
                 if seg_dir and os.path.isdir(seg_dir):
-                    DICOMUtils.importDicom(seg_dir, db)
+                    seg_indexer = ctk.ctkDICOMIndexer()
+                    seg_indexer.addDirectory(db, seg_dir, False)
+                    seg_indexer.waitForImportFinished()
+                    slicer.app.processEvents()
 
                 # Identify SEG series UID so we can skip it during CT load
                 seg_series_uid = None
@@ -1284,6 +1402,80 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             traceback.print_exc()
 
         return vol_node, seg_node
+
+    def _loadDicomNativeCtOnly(self, ct_dir: str):
+        """Index CT DICOM and load the CT volume — Phase 1 of the staged load.
+
+        Annotates the returned volume node with DICOM.instanceUIDs so that
+        DICOMSegPlugin can resolve SEG geometry in Phase 2 without reloading
+        CT pixel data.
+
+        Returns:
+            vtkMRMLScalarVolumeNode on success, or None.
+        """
+        if not ct_dir or not os.path.isdir(ct_dir):
+            print(f"[Loading] CT DICOM directory not found: {ct_dir}")
+            return None
+
+        try:
+            from DICOMLib import DICOMUtils
+            import ctk
+
+            ct_count = len([f for f in os.listdir(ct_dir) if f.lower().endswith(".dcm")])
+            print(f"[Loading] Staged Phase 1: indexing {ct_count} CT DICOM files…")
+
+            with DICOMUtils.TemporaryDICOMDatabase() as db:
+                ct_indexer = ctk.ctkDICOMIndexer()
+                slicer.util.showStatusMessage(f"Indexing {ct_count} CT DICOM files…")
+                slicer.app.processEvents()
+                ct_indexer.addDirectory(db, ct_dir, False)
+                ct_indexer.waitForImportFinished()
+                slicer.app.processEvents()
+
+                vol_node = None
+                ct_series_uid = None
+                for patient_uid in db.patients():
+                    if vol_node:
+                        break
+                    for study_uid in db.studiesForPatient(patient_uid):
+                        if vol_node:
+                            break
+                        for series_uid in db.seriesForStudy(study_uid):
+                            loaded = DICOMUtils.loadSeriesByUID([series_uid])
+                            for nid in loaded:
+                                node = slicer.mrmlScene.GetNodeByID(nid)
+                                if node and node.IsA("vtkMRMLScalarVolumeNode"):
+                                    vol_node = node
+                                    vol_node.SetName(f"{self.currentId}_CT")
+                                    ct_series_uid = series_uid
+                                    break
+                            if vol_node:
+                                break
+
+                if not vol_node:
+                    print("[Loading] Staged Phase 1: no CT volume found in DICOM DB")
+                    return None
+
+                # Annotate vol_node with DICOM instance UIDs. DICOMSegPlugin
+                # checks this attribute and reuses the existing volume instead
+                # of loading CT pixel data a second time in Phase 2.
+                if ct_series_uid:
+                    inst_uids = db.instancesForSeries(ct_series_uid)
+                    if inst_uids:
+                        vol_node.SetAttribute(
+                            "DICOM.instanceUIDs", " ".join(inst_uids)
+                        )
+                        print(f"[Loading] Staged Phase 1: CT loaded + annotated with "
+                              f"{len(inst_uids)} DICOM instance UIDs")
+
+            self._setupViews()
+            return vol_node
+
+        except Exception as e:
+            print(f"[Loading] _loadDicomNativeCtOnly failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     # -----------------------------------------------------------------
     # File-format loading helpers

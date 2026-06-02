@@ -18,7 +18,11 @@
       "Bash(curl -s -u \"orthanc:orthanc\" \"http://10.16.65.17:8042/series/ef0d134d-84d675fd-ac0b5f37-677c6ae1-e3d22503\")",
       "Bash(curl -s -u \"orthanc:orthanc\" \"http://10.16.65.17:8042/instances/42160adc-f6d09fb4-6261619f-94d4c023-a50cd9ff/tags?short\")",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({k:v for k,v in d.items\\(\\) if k in ['0020,000E','0008,0060','0062,0002','0008,103E','0008,0070','ReferencedSeriesSequence','0008,1115']}, indent=2\\)\\)\")",
-      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('CT instances:', len\\(d['Instances']\\)\\); print\\('Modality:', d['MainDicomTags'].get\\('Modality'\\)\\); print\\('SeriesDesc:', d['MainDicomTags'].get\\('SeriesDescription'\\)\\); print\\('SeriesUID:', d['MainDicomTags'].get\\('SeriesInstanceUID'\\)\\)\")"
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('CT instances:', len\\(d['Instances']\\)\\); print\\('Modality:', d['MainDicomTags'].get\\('Modality'\\)\\); print\\('SeriesDesc:', d['MainDicomTags'].get\\('SeriesDescription'\\)\\); print\\('SeriesUID:', d['MainDicomTags'].get\\('SeriesInstanceUID'\\)\\)\")",
+      "Bash(curl -s http://10.16.65.17:8042/plugins)",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri \"http://10.16.65.17:8042/plugins\" -UseBasicParsing -TimeoutSec 5; $r.Content } catch { $_.Exception.Message })",
+      "Bash(git cherry-pick *)",
+      "Bash(git stash *)"
     ]
   }
 }

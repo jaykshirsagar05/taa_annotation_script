@@ -8,7 +8,9 @@ Provides a unified widget that handles:
 """
 
 import os
+import queue
 import tempfile
+import threading
 import qt
 import slicer
 from typing import Optional, Callable
@@ -26,6 +28,7 @@ class OrthancIntegrationWidget(qt.QWidget):
     
     # Signals
     studyLoaded = qt.Signal(str, dict)  # (study_id, study_info) - emitted when data is loaded
+    ctReadyForStaging = qt.Signal(str, str, dict)  # (series_id, ct_dir, series_info) - CT downloaded, load now
     annotationSubmitted = qt.Signal(str)  # study_id
     annotationApproved = qt.Signal(str)  # study_id
     annotationRejected = qt.Signal(str, str)  # (study_id, reason)
@@ -270,15 +273,19 @@ class OrthancIntegrationWidget(qt.QWidget):
         self.loggedOut.emit()
         
     def _onSeriesSelected(self, series_id: str, series_info: dict):
-        """Handle CT series selection from worklist — profile-aware download and load."""
-        self.currentStudyId = series_id          # kept as currentStudyId for compat
+        """Handle CT series selection — profile-aware download with progress dialog.
+
+        Downloads run in a background thread so the Slicer UI stays responsive.
+        A Qt progress dialog shows per-instance progress for DICOM_NATIVE series
+        (WADO-RS path) and a busy indicator for NIfTI attachment profiles.
+        """
+        self.currentStudyId = series_id
         self.currentStudyInfo = series_info
 
         try:
             slicer.util.showStatusMessage("Detecting dataset profile for series...")
             slicer.app.processEvents()
 
-            # Auto-detect profile from series-level (+ parent study fallback) attachments
             profile = self.orthancClient.detect_dataset_profile_for_series(series_id)
             if profile is None:
                 slicer.util.errorDisplay(
@@ -289,22 +296,103 @@ class OrthancIntegrationWidget(qt.QWidget):
                 return
 
             patient_id = series_info.get("patient_id", series_id)
+            total_ct_instances = series_info.get("instance_count", 0)
             print(f"[Orthanc] Series {series_id} — profile: {profile.name}, "
-                  f"patient: {patient_id}")
-
-            slicer.util.showStatusMessage(
-                f"Downloading series data from Orthanc ({profile.name})..."
-            )
-            slicer.app.processEvents()
+                  f"patient: {patient_id}, instances: {total_ct_instances}")
 
             self.tempDir = tempfile.mkdtemp(prefix=f"orthanc_{patient_id}_")
 
-            # Download using series-level method (transparent study-level fallback)
-            paths = self.orthancClient.download_files_for_series(
-                series_id, patient_id, profile, self.tempDir
+            # ---- Progress dialog ----
+            progress_max = total_ct_instances if total_ct_instances > 0 else 0
+            progress = qt.QProgressDialog(
+                f"Downloading {profile.name} from Orthanc…",
+                None,          # no cancel button — downloads cannot safely abort mid-stream
+                0, progress_max,
+                self,
             )
+            progress.setWindowTitle(f"Loading {patient_id}")
+            progress.setWindowModality(qt.Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            # Indeterminate bar for NIfTI profiles (no instance-level granularity)
+            if progress_max == 0:
+                progress.setMaximum(0)
+            progress.setValue(0)
+            progress.show()
+            slicer.app.processEvents()
 
-            # Validate required files
+            # ---- Background download ----
+            msg_queue = queue.Queue()
+
+            def _progress_cb(n: int):
+                msg_queue.put(('progress', n))
+
+            def _ct_ready_cb(ct_dir: str):
+                msg_queue.put(('ct_ready', ct_dir))
+
+            def _do_download():
+                try:
+                    paths = self.orthancClient.download_files_for_series(
+                        series_id, patient_id, profile, self.tempDir,
+                        progress_callback=_progress_cb,
+                        ct_ready_callback=_ct_ready_cb,
+                    )
+                    msg_queue.put(('done', paths))
+                except Exception as exc:
+                    msg_queue.put(('error', exc))
+
+            dl_thread = threading.Thread(target=_do_download, daemon=True)
+            dl_thread.start()
+
+            # Spin the Qt event loop while the download runs so the UI stays
+            # alive and the progress dialog updates.
+            paths = None
+            download_error = None
+            while dl_thread.is_alive() or not msg_queue.empty():
+                slicer.app.processEvents()
+                # Drain all queued messages in one pass
+                while True:
+                    try:
+                        msg = msg_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if msg[0] == 'progress':
+                        n = msg[1]
+                        if progress_max > 0:
+                            progress.setValue(min(n, progress_max))
+                        progress.setLabelText(
+                            f"Downloading {profile.name}…  "
+                            + (f"{n}/{total_ct_instances} slices"
+                               if total_ct_instances > 0 else f"{n} slices")
+                        )
+                    elif msg[0] == 'ct_ready':
+                        # CT download complete — start loading CT into scene
+                        # immediately while SEG continues downloading.
+                        ct_dir = msg[1]
+                        progress.setLabelText(
+                            f"CT downloaded ({total_ct_instances} slices) — "
+                            f"loading CT volume…"
+                        )
+                        if progress_max > 0:
+                            progress.setValue(progress_max)
+                        slicer.app.processEvents()
+                        self.ctReadyForStaging.emit(series_id, ct_dir, dict(series_info))
+                    elif msg[0] == 'done':
+                        paths = msg[1]
+                    elif msg[0] == 'error':
+                        download_error = msg[1]
+                qt.QThread.msleep(40)
+
+            progress.close()
+            slicer.app.processEvents()
+
+            if download_error is not None:
+                raise download_error
+
+            if paths is None:
+                slicer.util.errorDisplay("Download did not complete.")
+                return
+
+            # ---- Validate required files ----
             missing = [name for name in profile.required_attachments
                        if not paths.get(name)]
             if missing:
