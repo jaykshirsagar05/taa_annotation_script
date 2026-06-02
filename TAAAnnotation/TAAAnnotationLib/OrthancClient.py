@@ -93,7 +93,11 @@ class OrthancClient:
         
         # Orthanc basic auth (obtained from AdminDashboard or config)
         self.orthanc_auth: Optional[Tuple[str, str]] = None
-        
+
+        # DICOMweb availability cache — None means not yet probed.
+        # Reset on logout/credential change so a reconnect re-probes.
+        self._dicomweb_available: Optional[bool] = None
+
         self.session = requests.Session()
         
     def login(self, username: str, password: str) -> Tuple[bool, str]:
@@ -245,7 +249,8 @@ class OrthancClient:
         self.assigned_series = []
         self.orthanc_auth = None
         self.session.auth = None
-        self.dashboard_available = True  # Reset for next login attempt
+        self.dashboard_available = True   # Reset for next login attempt
+        self._dicomweb_available = None   # Re-probe on next connection
         
     def is_authenticated(self) -> bool:
         """Check if client is authenticated with AdminDashboard."""
@@ -876,10 +881,10 @@ class OrthancClient:
 
     def _download_ct_dicom_series(self, study_id: str, output_dir: str) -> bool:
         """
-        Download a CT DICOM series from the study into output_dir.
+        Download the CT DICOM series from a study into output_dir.
 
-        Chooses the CT series with the most instances and extracts its
-        archive ZIP from Orthanc.
+        Selects the CT series with the most instances, then streams each
+        instance individually in parallel — no ZIP archive is buffered in RAM.
         """
         try:
             response = self.session.get(f"{self.server_url}/studies/{study_id}")
@@ -906,23 +911,7 @@ class OrthancClient:
             if not best_series_id:
                 return False
 
-            os.makedirs(output_dir, exist_ok=True)
-            archive_resp = self.session.get(f"{self.server_url}/series/{best_series_id}/archive")
-            if archive_resp.status_code != 200:
-                return False
-
-            zip_path = os.path.join(output_dir, "series.zip")
-            with open(zip_path, "wb") as f:
-                f.write(archive_resp.content)
-
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(output_dir)
-            os.remove(zip_path)
-
-            for root, _, files in os.walk(output_dir):
-                if any(name.lower().endswith(".dcm") for name in files):
-                    return True
-            return False
+            return self._stream_series_instances_to_dir(best_series_id, output_dir)
         except Exception as e:
             print(f"[OrthancClient] Error downloading CT DICOM series: {e}")
             return False
@@ -1320,8 +1309,9 @@ class OrthancClient:
                 )
             return False
 
-        # Determine instance count from cached data if possible
+        # Determine instance count and check for DICOM SEG in parent study
         ct_dicom = False
+        seg_dicom = False
         try:
             r = self.session.get(f"{self.server_url}/series/{series_id}")
             if r.status_code == 200:
@@ -1329,8 +1319,12 @@ class OrthancClient:
         except Exception:
             pass
 
+        if parent_study_id:
+            seg_dicom = self.get_dicom_seg_series_id(parent_study_id) is not None
+
         return {
             "ct_dicom":    ct_dicom,
+            "seg_dicom":   seg_dicom,
             "ct_nifti":    _series_or_study(self.ATTACHMENT_CT_NIFTI),
             "unified_mask": _series_or_study(self.ATTACHMENT_UNIFIED_MASK),
             "merged_mask": _series_or_study(self.ATTACHMENT_MERGED_MASK),
@@ -1383,9 +1377,9 @@ class OrthancClient:
                     suffix = self._get_extension_for_type(attachment_type)
                     fd, output_path = tempfile.mkstemp(suffix=suffix)
                     os.close(fd)
-                raw = resp.raw.read(decode_content=False)
                 with open(output_path, "wb") as f:
-                    f.write(raw)
+                    for chunk in resp.raw.stream(1 << 20, decode_content=False):
+                        f.write(chunk)
                 return self._validate_nifti_file(output_path)
             if resp.status_code != 404:
                 print(f"[OrthancClient] Series download HTTP {resp.status_code} "
@@ -1422,81 +1416,82 @@ class OrthancClient:
             return False
 
     def _download_dicom_series(self, series_id: str, output_dir: str) -> bool:
-        """Download a specific DICOM series by its Orthanc series ID into output_dir."""
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            archive_resp = self.session.get(
-                f"{self.server_url}/series/{series_id}/archive"
-            )
-            if archive_resp.status_code != 200:
-                return False
-            zip_path = os.path.join(output_dir, "series.zip")
-            with open(zip_path, "wb") as f:
-                f.write(archive_resp.content)
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(output_dir)
-            os.remove(zip_path)
-            for root, _, files in os.walk(output_dir):
-                if any(fn.lower().endswith(".dcm") for fn in files):
-                    return True
-            return False
-        except Exception as e:
-            print(f"[OrthancClient] Error downloading DICOM series {series_id}: {e}")
-            return False
+        """Stream all instances of a DICOM series into output_dir in parallel."""
+        return self._stream_series_instances_to_dir(series_id, output_dir)
 
     def download_files_for_series(self, series_id: str, patient_id: str,
-                                   profile, temp_dir: str) -> Dict[str, Optional[str]]:
-        """
-        Download all files required by a DatasetProfile for a CT series.
+                                   profile, temp_dir: str,
+                                   progress_callback=None,
+                                   ct_ready_callback=None) -> Dict[str, Optional[str]]:
+        """Download all files required by a DatasetProfile for a CT series.
 
-        CT data is fetched directly from the DICOM series.  All other
-        attachments are pulled from the series level with a fallback to
-        the parent study (for masks uploaded under the old study-level
-        workflow).
+        For the DICOM_NATIVE profile, CT instances and DICOM SEG are streamed
+        in parallel from the native DICOM series (no NIfTI attachments used).
+        All other profiles fetch Orthanc attachments, also in parallel.
+
+        ``progress_callback``, when provided, is forwarded to the DICOM_NATIVE
+        CT streamer and called as ``progress_callback(n)`` after each instance
+        is written to disk.  For other profiles it has no effect.
 
         Returns:
             dict of {logical_name: local_path_or_None}
         """
-        from .DatasetProfile import download_filename
+        from .DatasetProfile import DatasetProfile as DP, download_filename
+
+        if profile.profile_type == DP.DICOM_NATIVE:
+            return self._download_dicom_native_profile(
+                series_id, patient_id, profile, temp_dir,
+                progress_callback=progress_callback,
+                ct_ready_callback=ct_ready_callback,
+            )
+
+        # --- All non-native profiles: fetch attachments in parallel ---
         paths: Dict[str, Optional[str]] = {}
 
-        # --- CT: NIfTI attachment first, then DICOM series archive ---
-        ct_fname = download_filename("ct", patient_id)
-        ct_path = self.download_nifti_from_series(
-            series_id, self.ATTACHMENT_CT_NIFTI,
-            os.path.join(temp_dir, ct_fname),
-        )
-        if ct_path:
-            print(f"[OrthancClient] CT from NIfTI attachment (series): "
-                  f"{os.path.basename(ct_path)}")
-        else:
-            dicom_dir = os.path.join(temp_dir, f"{patient_id}_ct_dicom")
-            if self._download_dicom_series(series_id, dicom_dir):
-                ct_path = dicom_dir
-                print(f"[OrthancClient] CT from DICOM series: {dicom_dir}")
-            else:
-                print("[OrthancClient] CT download failed for series")
-        paths["ct"] = ct_path
-
-        # --- Required attachments ---
-        for logical_name, att_id in profile.required_attachments.items():
+        def _fetch_one(logical_name: str, att_id: int) -> tuple:
             if logical_name == "ct":
-                continue
-            fname = download_filename(logical_name, patient_id)
-            local_path = self.download_nifti_from_series(
-                series_id, att_id, os.path.join(temp_dir, fname)
-            )
-            if logical_name == "centerline" and local_path:
-                local_path = self._detect_and_fix_centerline_ext(local_path)
-            paths[logical_name] = local_path
+                # NIfTI attachment first, then DICOM series fallback
+                ct_fname = download_filename("ct", patient_id)
+                local = self.download_nifti_from_series(
+                    series_id, self.ATTACHMENT_CT_NIFTI,
+                    os.path.join(temp_dir, ct_fname),
+                )
+                if local:
+                    print(f"[OrthancClient] CT from NIfTI attachment: "
+                          f"{os.path.basename(local)}")
+                else:
+                    dicom_dir = os.path.join(temp_dir, f"{patient_id}_ct_dicom")
+                    if self._stream_series_instances_to_dir(series_id, dicom_dir):
+                        local = dicom_dir
+                        print(f"[OrthancClient] CT from DICOM series: {dicom_dir}")
+                    else:
+                        print("[OrthancClient] CT download failed for series")
+                return logical_name, local
 
-        # --- Optional attachments ---
-        for logical_name, att_id in profile.optional_attachments.items():
+            if att_id is None:
+                return logical_name, None
+
             fname = download_filename(logical_name, patient_id)
-            local_path = self.download_nifti_from_series(
+            local = self.download_nifti_from_series(
                 series_id, att_id, os.path.join(temp_dir, fname)
             )
-            paths[logical_name] = local_path
+            if logical_name == "centerline" and local:
+                local = self._detect_and_fix_centerline_ext(local)
+            return logical_name, local
+
+        tasks = {
+            **{name: att_id for name, att_id in profile.required_attachments.items()},
+            **{name: att_id for name, att_id in profile.optional_attachments.items()},
+        }
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(_fetch_one, name, att_id): name
+                for name, att_id in tasks.items()
+            }
+            for future in as_completed(futures):
+                logical_name, local_path = future.result()
+                paths[logical_name] = local_path
 
         return paths
 
@@ -1629,6 +1624,499 @@ class OrthancClient:
         if self.set_series_annotation_metadata(series_id, metadata):
             return True, "Series released successfully"
         return False, "Failed to update metadata"
+
+    # -------------------------------------------------------------------------
+    # DICOM-native streaming helpers (CT instance streaming + DICOM SEG)
+    # -------------------------------------------------------------------------
+
+    def _stream_series_instances_to_dir(self, series_id: str, output_dir: str,
+                                         max_workers: int = 8,
+                                         progress_callback=None) -> bool:
+        """Download all DICOM instances in a series to output_dir.
+
+        Tries three paths in order of preference:
+
+        1. WADO-RS multipart streaming (fastest perceived load — instances land
+           on disk as the HTTP response arrives, no ZIP buffering needed).
+           Only attempted when Orthanc's DICOMweb plugin is available.
+        2. Single ZIP archive download (/series/{id}/archive).
+        3. Per-instance parallel download (/instances/{id}/file).
+
+        ``progress_callback``, when provided, is forwarded to the WADO-RS path
+        and called as ``progress_callback(n)`` after each instance is written.
+
+        Returns True when at least one .dcm file was written.
+        """
+        import shutil
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # --- Primary: WADO-RS multipart streaming ---
+        if self.check_dicomweb_available():
+            uids = self._get_dicom_uids_for_series(series_id)
+            if uids:
+                study_uid, series_uid = uids
+                n = self._wado_rs_stream_series(
+                    study_uid, series_uid, output_dir, progress_callback
+                )
+                if n > 0:
+                    return True
+                print("[OrthancClient] WADO-RS returned 0 instances — "
+                      "falling back to ZIP archive")
+
+        archive_tmp = os.path.join(output_dir, "_series_archive.zip")
+
+        # --- Secondary: single ZIP archive download ---
+        try:
+            r = self.session.get(
+                f"{self.server_url}/series/{series_id}/archive",
+                stream=True,
+                timeout=(15, 600),
+            )
+            if r.status_code == 200:
+                with open(archive_tmp, "wb") as fz:
+                    for chunk in r.raw.stream(1 << 20, decode_content=False):
+                        fz.write(chunk)
+
+                dcm_count = 0
+                with zipfile.ZipFile(archive_tmp) as zf:
+                    for member in zf.infolist():
+                        basename = os.path.basename(member.filename)
+                        if not basename:
+                            continue
+                        out_name = (basename if basename.lower().endswith(".dcm")
+                                    else basename + ".dcm")
+                        with zf.open(member) as src, \
+                                open(os.path.join(output_dir, out_name), "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        dcm_count += 1
+
+                os.remove(archive_tmp)
+                if dcm_count > 0:
+                    print(f"[OrthancClient] ZIP archive: extracted {dcm_count} instances "
+                          f"→ {os.path.basename(output_dir)}")
+                    return True
+        except Exception as e:
+            print(f"[OrthancClient] ZIP archive failed ({e}), falling back to per-instance")
+            if os.path.exists(archive_tmp):
+                try:
+                    os.remove(archive_tmp)
+                except OSError:
+                    pass
+
+        # --- Fallback: per-instance parallel download ---
+        try:
+            resp = self.session.get(f"{self.server_url}/series/{series_id}")
+            if resp.status_code != 200:
+                return False
+            instance_ids = resp.json().get("Instances", [])
+            if not instance_ids:
+                return False
+
+            def _fetch(iid: str) -> bool:
+                r = self.session.get(
+                    f"{self.server_url}/instances/{iid}/file",
+                    stream=True,
+                )
+                if r.status_code != 200:
+                    print(f"[OrthancClient] Instance {iid} HTTP {r.status_code}")
+                    return False
+                out = os.path.join(output_dir, f"{iid}.dcm")
+                with open(out, "wb") as f:
+                    for chunk in r.raw.stream(1 << 20, decode_content=False):
+                        f.write(chunk)
+                return True
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                results = list(pool.map(_fetch, instance_ids))
+
+            ok = any(results)
+            if ok:
+                print(f"[OrthancClient] Per-instance: {sum(results)}/{len(instance_ids)} "
+                      f"instances → {os.path.basename(output_dir)}")
+            return ok
+        except Exception as e:
+            print(f"[OrthancClient] Error streaming series {series_id}: {e}")
+            return False
+
+    # -------------------------------------------------------------------------
+    # DICOMweb / WADO-RS helpers
+    # -------------------------------------------------------------------------
+
+    def check_dicomweb_available(self) -> bool:
+        """Return True when Orthanc's DICOMweb plugin is enabled and reachable.
+
+        The result is cached per-connection and reset on logout / credential
+        change so a new login always re-probes.
+        """
+        if self._dicomweb_available is not None:
+            return self._dicomweb_available
+        try:
+            r = self.session.get(
+                f"{self.server_url}/dicom-web/studies",
+                headers={"Accept": "application/dicom+json"},
+                timeout=5,
+            )
+            self._dicomweb_available = r.status_code in (200, 204)
+        except Exception:
+            self._dicomweb_available = False
+        if self._dicomweb_available:
+            print("[OrthancClient] DICOMweb plugin available — WADO-RS enabled")
+        else:
+            print("[OrthancClient] DICOMweb plugin not available — WADO-RS disabled")
+        return self._dicomweb_available
+
+    def _get_dicom_uids_for_series(self, orthanc_series_id: str) -> Optional[Tuple[str, str]]:
+        """Resolve (StudyInstanceUID, SeriesInstanceUID) from an Orthanc series ID.
+
+        Returns:
+            Tuple (study_uid, series_uid) or None on failure.
+        """
+        try:
+            r = self.session.get(f"{self.server_url}/series/{orthanc_series_id}")
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            series_uid = data.get("MainDicomTags", {}).get("SeriesInstanceUID", "")
+            parent = data.get("ParentStudy", "")
+            if not series_uid or not parent:
+                return None
+            r2 = self.session.get(f"{self.server_url}/studies/{parent}")
+            if r2.status_code != 200:
+                return None
+            study_uid = r2.json().get("MainDicomTags", {}).get("StudyInstanceUID", "")
+            return (study_uid, series_uid) if study_uid else None
+        except Exception as e:
+            print(f"[OrthancClient] UID resolution error: {e}")
+            return None
+
+    @staticmethod
+    def _extract_multipart_boundary(content_type: str) -> Optional[str]:
+        """Extract the boundary token from a multipart/related Content-Type header."""
+        for param in content_type.split(';'):
+            p = param.strip()
+            if p.lower().startswith('boundary='):
+                return p[9:].strip('"\'')
+        return None
+
+    @staticmethod
+    def _write_wado_multipart(raw_stream, boundary: str, output_dir: str,
+                               progress_callback=None) -> int:
+        """Parse a WADO-RS multipart/related stream and write DICOM instances to disk.
+
+        Instances are written as each part's body arrives — no need to wait for
+        the complete response before any .dcm file is available.
+
+        Uses Content-Length-guided body reading when available (Orthanc always
+        provides it).  Falls back to boundary-delimiter scanning for PACS that
+        omit Content-Length.
+
+        Args:
+            raw_stream:        urllib3 response raw stream (``response.raw``).
+            boundary:          Boundary token extracted from Content-Type.
+            output_dir:        Directory where .dcm files are written.
+            progress_callback: Optional ``callable(n: int)`` called after each
+                               instance is written; n is the running count.
+
+        Returns:
+            Number of instances written.
+        """
+        CHUNK = 1 << 20  # 1 MB per read
+        b_bnd = boundary.encode('ascii') if isinstance(boundary, str) else boundary
+        INIT_MARKER = b'--' + b_bnd        # opening boundary (no leading CRLF)
+        NEXT_SEP    = b'\r\n--' + b_bnd    # separator between parts
+
+        buf = bytearray()
+        count = 0
+
+        def _refill() -> bool:
+            chunk = raw_stream.read(CHUNK, decode_content=False)
+            if chunk:
+                buf.extend(chunk)
+                return True
+            return False
+
+        def _ensure(n: int) -> bool:
+            while len(buf) < n:
+                if not _refill():
+                    return len(buf) >= n
+            return True
+
+        def _find(needle: bytes) -> int:
+            """Return index of needle in buf, filling as needed. -1 if not found."""
+            while True:
+                idx = buf.find(needle)
+                if idx != -1:
+                    return idx
+                if not _refill():
+                    return buf.find(needle)
+
+        def _consume(n: int) -> bytes:
+            data = bytes(buf[:n])
+            del buf[:n]
+            return data
+
+        # ---- Skip preamble; locate and consume opening boundary line ----
+        pos = _find(INIT_MARKER)
+        if pos < 0:
+            return 0
+        _consume(pos + len(INIT_MARKER))   # discard preamble + --boundary
+        eol = _find(b'\r\n')               # skip rest of boundary line
+        if eol < 0:
+            return 0
+        _consume(eol + 2)
+
+        # ---- Process parts ----
+        while True:
+            # Read MIME headers up to the blank line
+            hdr_end = _find(b'\r\n\r\n')
+            if hdr_end < 0:
+                break
+            headers_bytes = _consume(hdr_end)
+            _consume(4)  # discard \r\n\r\n
+
+            # Extract Content-Length (Orthanc always supplies it)
+            content_length = None
+            for line in headers_bytes.split(b'\r\n'):
+                lo = line.lower()
+                if lo.startswith(b'content-length:'):
+                    try:
+                        content_length = int(lo[15:].strip())
+                    except (ValueError, IndexError):
+                        pass
+
+            # Read the instance body
+            if content_length is not None:
+                _ensure(content_length)
+                dicom_data = _consume(content_length)
+            else:
+                # Delimiter-scan fallback for servers without Content-Length
+                sep_pos = _find(NEXT_SEP)
+                if sep_pos < 0:
+                    dicom_data = bytes(buf)
+                    buf.clear()
+                else:
+                    dicom_data = _consume(sep_pos)
+
+            # Write instance to disk
+            if len(dicom_data) > 132:   # sanity: min valid DICOM size
+                out = os.path.join(output_dir, f'wado_{count:06d}.dcm')
+                with open(out, 'wb') as f:
+                    f.write(dicom_data)
+                count += 1
+                if progress_callback:
+                    progress_callback(count)
+
+            # Advance past \r\n--{boundary}; check for end marker
+            # After either read path, buf begins with \r\n--{boundary}...
+            _ensure(len(NEXT_SEP) + 2)
+            if bytes(buf[:len(NEXT_SEP)]) != NEXT_SEP:
+                break  # stream desync or EOF
+            _consume(len(NEXT_SEP))
+
+            # Examine the two bytes that follow --{boundary}:
+            #   \r\n  → more parts follow (boundary-line terminator)
+            #   --    → end marker; no more parts
+            _ensure(2)
+            if len(buf) < 2:
+                break
+            suffix = bytes(buf[:2])
+            if suffix == b'--':
+                break            # end of multipart body
+            if suffix == b'\r\n':
+                _consume(2)      # skip CRLF; next iteration reads next part headers
+            else:
+                break            # unexpected content
+
+        return count
+
+    def _wado_rs_stream_series(self, study_uid: str, series_uid: str,
+                                output_dir: str,
+                                progress_callback=None) -> int:
+        """Retrieve a DICOM series from Orthanc via WADO-RS multipart streaming.
+
+        Instances are written to output_dir as each part arrives in the HTTP
+        response — enabling Slicer to begin DICOM import before the series is
+        fully transferred.
+
+        Args:
+            study_uid:         DICOM StudyInstanceUID.
+            series_uid:        DICOM SeriesInstanceUID.
+            output_dir:        Directory for output .dcm files.
+            progress_callback: Optional ``callable(n: int)`` → None, called
+                               after each instance is written.
+
+        Returns:
+            Number of instances written, or 0 on failure.
+        """
+        url = (f"{self.server_url}/dicom-web"
+               f"/studies/{study_uid}/series/{series_uid}")
+        os.makedirs(output_dir, exist_ok=True)
+        try:
+            r = self.session.get(
+                url,
+                headers={"Accept": 'multipart/related; type="application/dicom"'},
+                stream=True,
+                timeout=(15, 600),
+            )
+            if r.status_code == 404:
+                print("[OrthancClient] WADO-RS: series not found or plugin absent")
+                return 0
+            if r.status_code != 200:
+                print(f"[OrthancClient] WADO-RS HTTP {r.status_code}")
+                return 0
+
+            boundary = self._extract_multipart_boundary(
+                r.headers.get("Content-Type", "")
+            )
+            if not boundary:
+                print("[OrthancClient] WADO-RS: no boundary in Content-Type — "
+                      f"got: {r.headers.get('Content-Type', '')!r}")
+                return 0
+
+            n = self._write_wado_multipart(r.raw, boundary, output_dir,
+                                           progress_callback)
+            print(f"[OrthancClient] WADO-RS: {n} instances → "
+                  f"{os.path.basename(output_dir)}")
+            return n
+
+        except Exception as e:
+            print(f"[OrthancClient] WADO-RS streaming error: {e}")
+            return 0
+
+    def get_dicom_seg_series_id(self, study_id: str) -> Optional[str]:
+        """
+        Find the DICOM SEG series in a study.
+
+        Returns the Orthanc series ID of the first SEG-modality series, or None.
+        """
+        try:
+            r = self.session.get(f"{self.server_url}/studies/{study_id}")
+            if r.status_code != 200:
+                return None
+            for sid in r.json().get("Series", []):
+                series_r = self.session.get(f"{self.server_url}/series/{sid}")
+                if series_r.status_code == 200:
+                    mod = series_r.json().get("MainDicomTags", {}).get("Modality", "")
+                    if mod == "SEG":
+                        return sid
+        except Exception as e:
+            print(f"[OrthancClient] Error finding SEG series in study {study_id}: {e}")
+        return None
+
+    def download_dicom_seg_file(self, seg_series_id: str,
+                                 output_path: str) -> Optional[str]:
+        """
+        Download the DICOM SEG instance from a series to output_path.
+
+        DICOM SEG objects are normally a single instance.  If the series has
+        multiple instances, the first one is downloaded (unusual but safe as a
+        fallback — the Slicer loader handles multi-frame SEG in one file).
+
+        Returns the local file path on success, or None.
+        """
+        try:
+            r = self.session.get(f"{self.server_url}/series/{seg_series_id}")
+            if r.status_code != 200:
+                return None
+            instance_ids = r.json().get("Instances", [])
+            if not instance_ids:
+                return None
+
+            iid = instance_ids[0]
+            file_r = self.session.get(
+                f"{self.server_url}/instances/{iid}/file",
+                stream=True,
+            )
+            if file_r.status_code != 200:
+                print(f"[OrthancClient] DICOM SEG download HTTP {file_r.status_code}")
+                return None
+
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            with open(output_path, "wb") as f:
+                for chunk in file_r.raw.stream(1 << 20, decode_content=False):
+                    f.write(chunk)
+            print(f"[OrthancClient] DICOM SEG downloaded: {os.path.basename(output_path)}")
+            return output_path
+        except Exception as e:
+            print(f"[OrthancClient] Error downloading DICOM SEG {seg_series_id}: {e}")
+            return None
+
+    def _download_dicom_native_profile(self, series_id: str, patient_id: str,
+                                        profile, temp_dir: str,
+                                        progress_callback=None,
+                                        ct_ready_callback=None) -> Dict[str, Optional[str]]:
+        """Download CT instances + DICOM SEG for the DICOM_NATIVE profile.
+
+        CT streaming and SEG download run concurrently.  Optional attachment
+        downloads (e.g. a pre-computed centerline) are fetched afterwards.
+
+        ``progress_callback``, when provided, is forwarded to the CT instance
+        streamer and called as ``progress_callback(n)`` after each slice lands.
+
+        Returns dict of {logical_name: local_path_or_None}.
+        """
+        from .DatasetProfile import download_filename
+        paths: Dict[str, Optional[str]] = {}
+
+        # Resolve parent study (SEG lives there alongside the CT series)
+        parent_study_id = ""
+        try:
+            r = self.session.get(f"{self.server_url}/series/{series_id}")
+            if r.status_code == 200:
+                parent_study_id = r.json().get("ParentStudy", "")
+        except Exception:
+            pass
+
+        # Find SEG series before launching parallel tasks
+        seg_series_id = (
+            self.get_dicom_seg_series_id(parent_study_id)
+            if parent_study_id else None
+        )
+
+        # CT and SEG download in parallel.
+        # SEG lives in its own subdirectory so that _loadDicomSeg's seg_dir
+        # (dirname of the .dcm path) contains only the one SEG file and never
+        # accidentally re-imports the 518-file CT folder alongside it.
+        ct_dir = os.path.join(temp_dir, f"{patient_id}_ct_dicom")
+        seg_subdir = os.path.join(temp_dir, f"{patient_id}_seg_dicom")
+        os.makedirs(seg_subdir, exist_ok=True)
+        seg_path = os.path.join(seg_subdir, f"{patient_id}_seg.dcm")
+
+        def _fetch_ct():
+            ok = self._stream_series_instances_to_dir(
+                series_id, ct_dir, progress_callback=progress_callback
+            )
+            result = ct_dir if ok else None
+            if result and ct_ready_callback:
+                ct_ready_callback(result)
+            return result
+
+        def _fetch_seg():
+            if not seg_series_id:
+                print("[OrthancClient] No DICOM SEG series found in parent study")
+                return None
+            return self.download_dicom_seg_file(seg_series_id, seg_path)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ct_future  = pool.submit(_fetch_ct)
+            seg_future = pool.submit(_fetch_seg)
+            paths["ct"]       = ct_future.result()
+            paths["seg_mask"] = seg_future.result()
+
+        # Optional attachments (e.g. pre-computed centerline stored as attachment)
+        for logical_name, att_id in profile.optional_attachments.items():
+            if att_id is None:
+                continue
+            fname = download_filename(logical_name, patient_id)
+            local = self.download_nifti_from_series(
+                series_id, att_id, os.path.join(temp_dir, fname)
+            )
+            if logical_name == "centerline" and local:
+                local = self._detect_and_fix_centerline_ext(local)
+            paths[logical_name] = local
+
+        return paths
 
     def submit_annotation_on_series(self, series_id: str, files: Dict[str, str],
                                      notes: str = "") -> Tuple[bool, str]:

@@ -10,12 +10,15 @@ A specialized 3D Slicer extension for Thoracic Aortic Aneurysm (TAA) annotation 
 - [Workflow Components](#workflow-components)
 - [Orthanc Integration](#orthanc-integration)
 - [Role-Based Access](#role-based-access)
+- [Dataset Profiles](#dataset-profiles)
 - [Data Flow](#data-flow)
 - [Key Features](#key-features)
 - [Installation & Dependencies](#installation--dependencies)
 - [Configuration](#configuration)
+- [Auto-Update](#auto-update)
 - [API Reference](#api-reference)
 - [Extending the Module](#extending-the-module)
+- [Version History](#version-history)
 
 ---
 
@@ -23,15 +26,17 @@ A specialized 3D Slicer extension for Thoracic Aortic Aneurysm (TAA) annotation 
 
 The TAA Annotation Module provides a guided 5-phase workflow for medical image annotation:
 
-1. **Load Data** - Import CT scans and pre-computed segmentation masks
+1. **Load Data** - Import CT scans and pre-computed segmentation masks (NIfTI or native DICOM)
 2. **Refine Mask** - Manual correction of aorta segmentation using Segment Editor
-3. **Extract Centerline** - VMTK-based centerline extraction
-4. **Zone Landmarks** - Interactive placement of 10 anatomical zone markers on the centerline
+3. **Extract Centerline** - VMTK-based centerline extraction (skipped for pre-computed centerline profiles)
+4. **Zone Landmarks** - Interactive placement of SVS/STS zonal landmarks on the centerline
 5. **Export** - Package refined annotations for storage/review
 
 The module supports two data loading paths:
 - **Manual loading** from local filesystem
 - **Orthanc PACS integration** with role-based worklist management
+
+Current version: **1.0.1**
 
 ---
 
@@ -44,11 +49,13 @@ The module supports two data loading paths:
 │  │  TAAAnnotationWidget (UI Controller)                            ││
 │  │  - Orchestrates all UI components                               ││
 │  │  - Handles signals/callbacks between components                  ││
-│  │  - Manages Orthanc study loading and submission                 ││
+│  │  - Manages Orthanc study/series loading and submission          ││
 │  └─────────────────────────────────────────────────────────────────┘│
 │  ┌─────────────────────────────────────────────────────────────────┐│
 │  │  TAAAnnotationLogic (Business Logic)                            ││
 │  │  - Data loading (loadData, loadProcedureDataFromPaths)          ││
+│  │  - DICOM SEG loading (_loadDicomSeg)                            ││
+│  │  - CT window/level configuration                                 ││
 │  │  - Workflow state management                                     ││
 │  │  - Segmentation/VMTK setup                                       ││
 │  │  - Zone point management                                         ││
@@ -59,17 +66,21 @@ The module supports two data loading paths:
 │                       TAAAnnotationLib/                             │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
 │  │  WorkflowWidget  │  │  OrthancClient   │  │ CenterlinePicker │  │
-│  │  (Step-by-step   │  │  (REST API)      │  │ (VTK picking)    │  │
-│  │   annotation UI) │  │                  │  │                  │  │
+│  │  (Step-by-step   │  │  (REST API +     │  │ (VTK picking +   │  │
+│  │   annotation UI) │  │   async streams) │  │  scroll nav)     │  │
 │  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
 │  │ OrthancIntegrat- │  │ OrthancWorklist  │  │  AutosaveManager │  │
 │  │   ionWidget      │  │     Widget       │  │                  │  │
 │  │ (Login + Actions)│  │ (Table + Filter) │  │                  │  │
 │  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │  ExportManager   │  │  DatasetProfile  │  │   AutoUpdater    │  │
+│  │ (File bundling)  │  │  (Profile defs)  │  │ (GitHub updates) │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
 │  ┌──────────────────┐                                               │
-│  │  ExportManager   │                                               │
-│  │ (File bundling)  │                                               │
+│  │    config.py     │                                               │
+│  │ (Server settings)│                                               │
 │  └──────────────────┘                                               │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -81,12 +92,16 @@ The module supports two data loading paths:
 ```
 TAAAnnotation/
 ├── TAAAnnotation.py           # Main module: Widget, Logic, Test classes
+├── VERSION                    # Current version string (e.g. 1.0.1)
 └── TAAAnnotationLib/
     ├── __init__.py            # Package exports
     ├── AutosaveManager.py     # Session persistence & crash recovery
-    ├── CenterlinePicker.py    # Interactive 3D centerline point selection
+    ├── AutoUpdater.py         # GitHub-based auto-update
+    ├── CenterlinePicker.py    # Interactive 3D centerline zone picking
+    ├── config.py              # Server URLs, credentials, CT display defaults
+    ├── DatasetProfile.py      # Dataset profile definitions & auto-detection
     ├── ExportManager.py       # Data export bundling
-    ├── OrthancClient.py       # Orthanc REST API client
+    ├── OrthancClient.py       # Orthanc REST API client (series-level)
     ├── OrthancIntegrationWidget.py  # Combined login/worklist/actions UI
     ├── OrthancWorklistWidget.py     # Login panel & worklist table
     └── WorkflowWidget.py      # 5-phase annotation workflow UI
@@ -106,16 +121,19 @@ The main annotation workflow UI component providing a step-by-step interface.
 |-------|--------|----------|--------------|
 | 1 | Load Data & Initialize | Load CT + masks | Always |
 | 2 | Refine Mask | Opens Segment Editor | Phase ≥ 1 |
-| 3 | Extract VMTK Centerline | Launches VMTK module | Phase ≥ 2 |
-| 4 | Zonal Landmarks | Interactive zone picking | Phase ≥ 3 |
+| 3 | Extract VMTK Centerline | Launches VMTK module | Phase ≥ 2 (skipped for pre-computed centerline profiles) |
+| 4 | Zonal Landmarks | Interactive SVS/STS zone picking | Phase ≥ 3 |
 | 5 | Export & Reset | Bundle outputs | Phase ≥ 3 |
 
 **UI Elements:**
 - Phase buttons with visual state (default/active/done)
 - Recovery banner for crash recovery
 - Centerline selector combo box
-- Zone picker controls (Start/Confirm/Undo)
-- Zone list with jump-to-point functionality
+- **SVS/STS Zonal Landmarks** zone picker:
+  - Zone dropdown with anatomical placement instructions per zone
+  - Progress table displaying landmark name, status, and coordinates
+  - Start/Confirm/Undo controls
+  - Context menu: jump to point, delete
 - Notes text area
 - Status label
 - Quick Save button
@@ -134,29 +152,42 @@ notesChanged = qt.Signal(str)        # Notes text changed
 
 ### CenterlinePicker
 
-Interactive 3D picking for zone landmark placement on extracted centerlines.
+Interactive 3D picking for SVS/STS zone landmark placement on extracted centerlines.
 
 **Features:**
 - VTK cell picker for precise centerline selection
+- Hover preview — point snaps to nearest centerline location before click
 - Preview point with cyan color before confirmation
+- Preview cross-section plane aligned to centerline tangent
 - Cross-sectional slice alignment (Yellow slice perpendicular to centerline tangent)
+- Cross-section diameter chords rendered at each confirmed landmark
+- Cumulative distance tracking along centerline path
+- **Scroll navigation** — mouse-wheel on the Yellow view scrolls along the centerline
+- Zone-specific anatomical landmark definitions (`getLandmarkDefs()`)
+- Named zone targeting (`setSelectedZone()`)
 - Real-time zone count tracking
 - Undo support
 
 **Key Methods:**
 ```python
-enable(centerlineNode)     # Start picking mode
-disable()                  # Stop picking mode  
-toggleClickMode()          # Toggle on/off
+enable(centerlineNode)           # Start picking mode
+disable()                        # Stop picking mode
+toggleClickMode()                # Toggle on/off
+getLandmarkDefs()                # Returns ordered list of SVS/STS zone definitions
+setSelectedZone(zoneName)        # Pre-select a zone for the next placement
+getNextUnplacedZone()            # Returns the name of the next unplaced zone
+getPlacedCount()                 # Returns count of confirmed landmarks
+confirmZonePoint()               # Confirm the current hover/preview point
 ```
 
 **Workflow:**
 1. User clicks "Start Zone Picker"
 2. Centerline highlighted in green
-3. Click on centerline → preview point appears
-4. Click "Confirm Zone" → point added to zone node
-5. Repeat until 10 zones placed
-6. Auto-disables when all zones complete
+3. Move mouse over centerline → hover preview snaps to nearest point
+4. Click on centerline → preview point locked
+5. Click "Confirm Zone" → landmark added with zone name
+6. Repeat until all SVS/STS zones placed
+7. Auto-disables when all zones complete
 
 ---
 
@@ -169,6 +200,7 @@ Session persistence and crash recovery system.
 - Stores state in `{slicer.app.temporaryPath}/taa_wizard_state.json`
 - Recovery banner shown if previous session found (within 24 hours)
 - Quick save to project directory
+- Action history logging for Orthanc operations
 
 **State Saved:**
 ```json
@@ -198,7 +230,7 @@ Data export and bundling.
 | `{id}_Centerline.vtk` | VTK | Extracted centerline model |
 | `{id}_Network.vtk` | VTK | Vascular network model |
 | `{id}_Endpoints.fcsv` | Fiducial CSV | Centerline endpoints |
-| `{id}_Zones.fcsv` | Fiducial CSV | Zone landmarks (10 points) |
+| `{id}_Zones.fcsv` | Fiducial CSV | Zone landmarks |
 | `{id}_notes.txt` | Text | Annotator notes |
 | `export_metadata.json` | JSON | Export metadata |
 
@@ -208,7 +240,7 @@ Data export and bundling.
 
 ### OrthancClient
 
-REST API client for Orthanc PACS server communication.
+REST API client for Orthanc PACS server communication. Operates at the **series level** (CT series as the primary unit). Supports parallel async instance streaming to avoid buffering large ZIP archives in RAM.
 
 **Connection:**
 ```python
@@ -217,8 +249,8 @@ success, message = client.login(username, password)
 ```
 
 **Attachment Type IDs:**
-| ID | Type | Description |
-|----|------|-------------|
+| ID | Constant | Description |
+|----|----------|-------------|
 | 1024 | ATTACHMENT_METADATA | annotation_metadata.json |
 | 1025 | ATTACHMENT_CT_NIFTI | ct_scan.nii.gz |
 | 1026 | ATTACHMENT_UNIFIED_MASK | unified_mask_smoothed.nii.gz |
@@ -236,7 +268,7 @@ login(username, password) → (bool, str)
 logout()
 is_authenticated() → bool
 
-# Study Queries
+# Study / Series Queries
 get_all_studies() → List[Dict]
 get_study_info(study_id) → Dict
 get_worklist(role) → List[Dict]
@@ -247,15 +279,29 @@ set_annotation_metadata(study_id, metadata) → bool
 claim_study(study_id, role) → (bool, str)
 release_study(study_id) → (bool, str)
 
-# File Operations
+# Attachment Operations (series-level with study fallback)
+download_nifti_from_series(series_id, attachment_type, output_path) → str
 upload_nifti(study_id, file_path, attachment_type) → bool
-download_nifti(study_id, attachment_type, output_path) → str
+
+# Profile-Aware Download (parallel, series-level)
+download_files_for_series(series_id, patient_id, profile, temp_dir) → Dict[str, str]
+get_series_attachments_info(series_id, parent_study_id) → Dict[str, bool]
+
+# DICOM Native Streaming
+get_dicom_seg_series_id(study_id) → Optional[str]
+download_dicom_seg_file(seg_series_id, output_path) → Optional[str]
 
 # Workflow Actions
-submit_annotation(study_id, files, notes) → (bool, str)
+submit_annotation_on_series(series_id, files, notes) → (bool, str)
 approve_annotation(study_id, comments) → (bool, str)
 reject_annotation(study_id, reason) → (bool, str)
 ```
+
+**Parallel Download Architecture:**
+
+All profile downloads use `ThreadPoolExecutor`. For standard profiles, attachments are fetched concurrently (up to 4 workers). For the DICOM_NATIVE profile, CT instance streaming and DICOM SEG download run in parallel (2 workers), then optional attachments are fetched sequentially.
+
+CT DICOM instances are streamed one-by-one via `/instances/{id}/file` (1 MB chunks) — no ZIP archive is buffered in RAM.
 
 ---
 
@@ -317,10 +363,10 @@ Combined UI widget for Orthanc integration.
 
 **Signals:**
 ```python
-studyLoaded = qt.Signal(str, dict)        # (study_id, study_info)
-annotationSubmitted = qt.Signal(str)       # study_id
-annotationApproved = qt.Signal(str)        # study_id
-annotationRejected = qt.Signal(str, str)   # (study_id, reason)
+studyLoaded = qt.Signal(str, dict)        # (series_id, series_info)
+annotationSubmitted = qt.Signal(str)       # series_id
+annotationApproved = qt.Signal(str)        # series_id
+annotationRejected = qt.Signal(str, str)   # (series_id, reason)
 loggedOut = qt.Signal()
 ```
 
@@ -328,7 +374,7 @@ loggedOut = qt.Signal()
 
 ### OrthancWorklistWidget
 
-Worklist table with filtering capabilities.
+Worklist table showing CT series with filtering capabilities.
 
 **Annotator Filters:**
 - My Worklist
@@ -371,7 +417,7 @@ Worklist table with filtering capabilities.
 - `REJECTED` studies (for rework)
 
 **Actions:**
-- 📤 Submit Annotation to Orthanc
+- Submit Annotation to Orthanc
 
 ---
 
@@ -389,8 +435,35 @@ Worklist table with filtering capabilities.
 - `GROUND_TRUTH` studies (completed)
 
 **Actions:**
-- ✅ Approve as Ground Truth
-- ❌ Reject (requires comment)
+- Approve as Ground Truth
+- Reject (requires comment)
+
+---
+
+## Dataset Profiles
+
+The module uses a **profile-based** data loading system that auto-detects the dataset type from available Orthanc series/attachments or local folder contents.
+
+| Profile | Input Data | Workflow | Skip |
+|---------|-----------|----------|------|
+| **Dual Mask** | CT NIfTI + unified mask + merged mask | Load → Refine → VMTK → Zones → Export | — |
+| **Mask + Centerline** | CT NIfTI + seg mask + pre-computed centerline (.vtk/.vtp) | Load → Refine → Zones → Export | VMTK |
+| **CT + Seg Mask** | CT (NIfTI or DICOM) + unified mask NIfTI | Load → Refine → VMTK → Zones → Export | — |
+| **DICOM Native** | Native DICOM CT series + DICOM SEG series | Load → Refine → VMTK → Zones → Export | — |
+
+**Auto-detection priority (Orthanc):**
+1. DICOM Native — when a DICOM CT series and a DICOM SEG series are present
+2. Mask + Centerline — when CT + unified mask + centerline attachment exist
+3. Dual Mask — when CT + both NIfTI masks exist
+4. CT + Seg Mask — when CT + unified mask exist
+
+**DICOM Native profile details:**
+- CT is streamed instance-by-instance from the Orthanc series (no ZIP buffering)
+- Segmentation is loaded directly from the DICOM SEG object via the Slicer `DICOMSegmentation` plugin
+- Two-strategy fallback: DICOM database import (primary) → `slicer.util.loadSegmentation` (fallback)
+- The CT DICOM directory is co-imported into a temporary DICOM database so the SEG plugin can resolve the referenced CT series geometry
+
+**Adding a new profile:** Define in `PROFILES` dict in `DatasetProfile.py`, update `detect_profile_from_attachments()` and `detect_profile_from_folder()`.
 
 ---
 
@@ -403,10 +476,10 @@ Worklist table with filtering capabilities.
 2. Folder picker dialog opens
 3. Logic searches for: ct_scan_{id}.nii.gz
 4. Loads:
-   - CT volume → volNode
+   - CT volume → volNode (with configured window/level applied)
    - {id}_unified_mask_smoothed.nii.gz → segNode (editable)
    - {id}_merged.nii.gz → refNode (reference)
-   - Binarized merged mask → binarizedMergedNode
+   - Binarized merged mask → binarizedMergedNode (if profile requires)
 5. Sets up 4-up view layout
 6. Phase advances to 1
 ```
@@ -414,27 +487,34 @@ Worklist table with filtering capabilities.
 ### Orthanc Loading
 
 ```
-1. User logs into Orthanc
-2. Selects study from worklist
-3. OrthancClient downloads:
-   - Attachment 1025 → ct_scan.nii.gz
-   - Attachment 1026 → unified_mask_smoothed.nii.gz
-   - Attachment 1027 → merged_mask.nii.gz
-4. Files saved to temp directory
-5. Logic.loadProcedureDataFromPaths() called
-6. For reviewers: existing annotations also downloaded
+1. User logs into Orthanc (direct mode or via AdminDashboard)
+2. Selects CT series from worklist
+3. Profile auto-detected from available attachments/series
+4. OrthancClient downloads files in parallel:
+   Standard profiles:
+     - Attachment 1025 → ct_scan.nii.gz          (or DICOM series)
+     - Attachment 1026 → unified_mask_smoothed.nii.gz
+     - Attachment 1027 → merged_mask.nii.gz       (Dual Mask)
+     - Attachment 1029 → centerline.vtk           (Mask+CL)
+   DICOM Native:
+     - CT instances streamed per-instance → {id}_ct_dicom/
+     - DICOM SEG instance → {id}_seg.dcm
+5. Files saved to temp directory
+6. Logic.loadProcedureDataFromPaths() called
+7. CT window/level from config applied automatically
+8. For reviewers: existing annotations also downloaded
 ```
 
 ### Orthanc Submission
 
 ```
 1. User clicks "Submit Annotation to Orthanc"
-2. Zone count validation (warning if < 10)
+2. Zone count validation (warning if zones incomplete)
 3. Export to temp directory:
    - refined_mask.seg.nrrd
    - Centerline.vtk
    - Zones.fcsv
-4. OrthancClient uploads each as attachment
+4. OrthancClient uploads each as series-level attachment
 5. Notes uploaded as text attachment
 6. Metadata updated: status → ANNOTATED
 7. History entry added
@@ -449,18 +529,22 @@ Worklist table with filtering capabilities.
 For local loading, folder must contain:
 ```
 folder/
-├── ct_scan_{patientId}.nii.gz        # CT volume
-├── {patientId}_unified_mask_smoothed.nii.gz  # Initial segmentation
-└── {patientId}_merged.nii.gz         # Reference merged mask
+├── ct_scan_{patientId}.nii.gz                        # CT volume
+├── {patientId}_unified_mask_smoothed.nii.gz          # Initial segmentation
+└── {patientId}_merged.nii.gz                         # Reference merged mask
 ```
 
-### Zone Landmarks
+### SVS/STS Zone Landmarks
 
-10 anatomical zone points placed interactively on the centerline:
-- Zone 0-9 start points
-- Uses VMTK-extracted centerline
-- Cross-sectional view alignment
-- Preview before confirmation
+Named anatomical zone points placed interactively on the centerline following the SVS/STS reporting standards. The zone picker guides the annotator through each zone in order with anatomical instructions displayed per zone.
+
+- Uses VMTK-extracted (or pre-computed) centerline
+- Cross-sectional view alignment with tangent plane
+- Hover preview snaps to nearest centerline point
+- Scroll wheel navigates along centerline in Yellow view
+- Cross-section diameter chords rendered at each placed landmark
+- Cumulative centerline distance tracked per zone
+- Preview before confirmation, undo support
 
 ### VMTK Integration
 
@@ -468,6 +552,12 @@ Automatic setup for Extract Centerline module:
 - Creates surface model from binarized refined mask
 - Pre-configures output nodes (Network, Endpoints, Centerline)
 - Sets input references in VMTK parameter node
+
+### CT Window/Level
+
+Default CT display window/level is applied automatically after data load. Values are read from `config.py`:
+- `DEFAULT_CT_WINDOW_WIDTH` (default: 1200)
+- `DEFAULT_CT_WINDOW_LEVEL` (default: 350 HU)
 
 ---
 
@@ -477,15 +567,16 @@ Automatic setup for Extract Centerline module:
 
 - **SegmentEditor** - Built-in segmentation tools
 - **ExtractCenterline** (VMTK) - Centerline extraction
+- **DICOMSegmentation** - For DICOM SEG loading (DICOM Native profile)
 
 ### Python Dependencies
 
-- `requests` - HTTP client for Orthanc API
-- Standard library: `json`, `tempfile`, `os`, `datetime`, `enum`
+- `requests` - HTTP client for Orthanc API and auto-update
+- Standard library: `json`, `tempfile`, `os`, `datetime`, `enum`, `concurrent.futures`
 
 ### Installation
 
-1. Copy TAAAnnotation folder to Slicer's module paths
+1. Copy `TAAAnnotation/` folder to Slicer's module paths
 2. Restart Slicer
 3. Find module under **Segmentation** category
 
@@ -493,11 +584,23 @@ Automatic setup for Extract Centerline module:
 
 ## Configuration
 
-### Orthanc Server
+All server and display settings are in `TAAAnnotationLib/config.py`. Edit this file to match your deployment.
 
-Default: `http://localhost:8042`
+```python
+# Orthanc PACS server
+ORTHANC_URL = "http://localhost:8042"
 
-Configurable in login widget.
+# AdminDashboard base URL
+ADMIN_DASHBOARD_URL = "http://localhost:7778"
+
+# Orthanc service account credentials
+ORTHANC_USERNAME = "orthanc"
+ORTHANC_PASSWORD = "orthanc"
+
+# CT display window defaults (Hounsfield units)
+DEFAULT_CT_WINDOW_WIDTH = 1200
+DEFAULT_CT_WINDOW_LEVEL = 350
+```
 
 ### Autosave
 
@@ -507,22 +610,38 @@ Configurable in login widget.
 
 ---
 
+## Auto-Update
+
+The module checks GitHub for new releases on startup via `AutoUpdater.py`.
+
+- Source: `https://github.com/jaykshirsagar05/taa_annotation_script/releases/latest`
+- Current version stored in `TAAAnnotation/VERSION`
+- On update: downloads release ZIP, extracts `TAAAnnotation/` over current install, prompts user to restart Slicer
+- Non-blocking: check runs via deferred call, failures are logged and ignored silently
+
+To disable auto-update, remove the `checkAndUpdate()` call from `TAAAnnotation.py`.
+
+---
+
 ## API Reference
 
 ### TAAAnnotationLogic
 
 ```python
 # State Management
-reset()                     # Clear all state
-getTimestamp() → str        # Current time HH:MM:SS
+reset()                                      # Clear all state
+getTimestamp() → str                         # Current time HH:MM:SS
 
 # Data Loading
 loadData(folderPath) → bool
-loadProcedureDataFromPaths(ct_path, unified_path, merged_path)
+loadProcedureDataFromPaths(ct_path, seg_path, merged_path, profile)
+
+# Display
+applyConfiguredCtWindowLevel()               # Apply config.py window/level to CT
 
 # Workflow Phases
-setupRefinement() → bool    # Phase 2: Opens Segment Editor
-setupVMTK() → bool          # Phase 3: Configures VMTK
+setupRefinement() → bool                     # Phase 2: Opens Segment Editor
+setupVMTK() → bool                           # Phase 3: Configures VMTK
 
 # Zone Management
 createZoneNode() → node
@@ -533,14 +652,14 @@ renameZonePoint(index, newName)
 jumpToZonePoint(index)
 
 # State Properties
-currentId: str              # Patient ID
-rootDir: str                # Project folder
-volNode: vtkMRMLVolumeNode  # CT volume
-segNode: vtkMRMLSegmentationNode  # Editable segmentation
-refNode: vtkMRMLSegmentationNode  # Reference segmentation
-zoneNode: vtkMRMLMarkupsFiducialNode  # Zone landmarks
+currentId: str                               # Patient ID
+rootDir: str                                 # Project folder
+volNode: vtkMRMLVolumeNode                   # CT volume
+segNode: vtkMRMLSegmentationNode             # Editable segmentation
+refNode: vtkMRMLSegmentationNode             # Reference segmentation
+zoneNode: vtkMRMLMarkupsFiducialNode         # Zone landmarks
 hasUnsavedWork: bool
-workflowState: dict         # {phase, lastSave, zoneCount}
+workflowState: dict                          # {phase, lastSave, zoneCount}
 ```
 
 ---
@@ -562,8 +681,16 @@ workflowState: dict         # {phase, lastSave, zoneCount}
    ATTACHMENT_NEW_TYPE = 1033  # Must be 1024-65535
    ```
 2. Add to `_get_extension_for_type()`
-3. Add to `get_study_attachments()` if needed
-4. Update `submit_annotation()` file mapping
+3. Add to `get_series_attachments_info()` if needed
+4. Update `submit_annotation_on_series()` file mapping
+
+### Adding New Dataset Profile
+
+1. Add profile type constant to `DatasetProfile` class
+2. Add entry to `PROFILES` dict in `DatasetProfile.py`
+3. Update `detect_profile_from_attachments()` detection priority
+4. Update `detect_profile_from_folder()` for local loading
+5. Handle the new profile in `OrthancClient.download_files_for_series()` if it needs special download logic
 
 ### Adding New User Role
 
@@ -586,10 +713,12 @@ progress.setValue(8)
 
 ## Version History
 
-- **2.1_modular** - Current version with modular architecture
-- Refactored into separate library components
-- Added Orthanc PACS integration
-- Role-based workflow support
+| Version | Changes |
+|---------|---------|
+| **1.0.1** | Version bump |
+| **1.0.0** | CT window/level auto-configuration from `config.py`; async parallel DICOM instance streaming replaces ZIP archive download; DICOM Native profile for CT+DICOM SEG workflows |
+| **0.x** | CenterlinePicker: scroll navigation on Yellow view, hover preview, cumulative distances, cross-section diameter chords; `config.py` for centralized server settings; series-level Orthanc operations; DatasetProfile system with DUAL_MASK, MASK_AND_CENTERLINE, CT_AND_SEG_MASK profiles; SVS/STS zone landmark UI with progress table and anatomical instructions; auto-update via GitHub releases |
+| **2.1_modular** | Modular architecture, Orthanc PACS integration, role-based workflow |
 
 ---
 
@@ -602,4 +731,3 @@ Developed by University of Ottawa Heart Institute (Canada)
 ## License
 
 [Add your license information here]
-```
