@@ -303,7 +303,15 @@ class OrthancIntegrationWidget(qt.QWidget):
             self.tempDir = tempfile.mkdtemp(prefix=f"orthanc_{patient_id}_")
 
             # ---- Progress dialog ----
-            progress_max = total_ct_instances if total_ct_instances > 0 else 0
+            # DICOM_NATIVE: progress per CT instance (high granularity)
+            # Other profiles: progress per attachment file (low granularity)
+            is_dicom_native = profile.profile_type == "dicom_native"
+            if is_dicom_native:
+                progress_max = total_ct_instances if total_ct_instances > 0 else 0
+            else:
+                n_files = (len(profile.required_attachments)
+                           + len(profile.optional_attachments))
+                progress_max = n_files if n_files > 0 else 0
             progress = qt.QProgressDialog(
                 f"Downloading {profile.name} from Orthanc…",
                 None,          # no cancel button — downloads cannot safely abort mid-stream
@@ -313,7 +321,6 @@ class OrthancIntegrationWidget(qt.QWidget):
             progress.setWindowTitle(f"Loading {patient_id}")
             progress.setWindowModality(qt.Qt.WindowModal)
             progress.setMinimumDuration(0)
-            # Indeterminate bar for NIfTI profiles (no instance-level granularity)
             if progress_max == 0:
                 progress.setMaximum(0)
             progress.setValue(0)
@@ -359,19 +366,24 @@ class OrthancIntegrationWidget(qt.QWidget):
                         n = msg[1]
                         if progress_max > 0:
                             progress.setValue(min(n, progress_max))
-                        progress.setLabelText(
-                            f"Downloading {profile.name}…  "
-                            + (f"{n}/{total_ct_instances} slices"
-                               if total_ct_instances > 0 else f"{n} slices")
-                        )
+                        if is_dicom_native:
+                            label = (f"Downloading {profile.name}…  "
+                                     + (f"{n}/{total_ct_instances} slices"
+                                        if total_ct_instances > 0 else f"{n} slices"))
+                        else:
+                            label = (f"Downloading {profile.name}…  "
+                                     f"file {n}/{progress_max}")
+                        progress.setLabelText(label)
                     elif msg[0] == 'ct_ready':
                         # CT download complete — start loading CT into scene
                         # immediately while SEG continues downloading.
                         ct_dir = msg[1]
-                        progress.setLabelText(
-                            f"CT downloaded ({total_ct_instances} slices) — "
-                            f"loading CT volume…"
-                        )
+                        if is_dicom_native:
+                            ct_label = (f"CT downloaded ({total_ct_instances} slices) — "
+                                        f"loading CT volume…")
+                        else:
+                            ct_label = "CT downloaded — loading CT volume…"
+                        progress.setLabelText(ct_label)
                         if progress_max > 0:
                             progress.setValue(progress_max)
                         slicer.app.processEvents()

@@ -1466,6 +1466,8 @@ class OrthancClient:
                         print(f"[OrthancClient] CT from DICOM series: {dicom_dir}")
                     else:
                         print("[OrthancClient] CT download failed for series")
+                if local and ct_ready_callback:
+                    ct_ready_callback(local)
                 return logical_name, local
 
             if att_id is None:
@@ -1489,9 +1491,13 @@ class OrthancClient:
                 pool.submit(_fetch_one, name, att_id): name
                 for name, att_id in tasks.items()
             }
+            completed = 0
             for future in as_completed(futures):
                 logical_name, local_path = future.result()
                 paths[logical_name] = local_path
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed)
 
         return paths
 
@@ -1631,7 +1637,9 @@ class OrthancClient:
 
     def _stream_series_instances_to_dir(self, series_id: str, output_dir: str,
                                          max_workers: int = 8,
-                                         progress_callback=None) -> bool:
+                                         progress_callback=None,
+                                         study_uid: str = "",
+                                         series_uid: str = "") -> bool:
         """Download all DICOM instances in a series to output_dir.
 
         Tries three paths in order of preference:
@@ -1645,6 +1653,9 @@ class OrthancClient:
         ``progress_callback``, when provided, is forwarded to the WADO-RS path
         and called as ``progress_callback(n)`` after each instance is written.
 
+        ``study_uid`` / ``series_uid``, when provided, skip the UID resolution
+        step so WADO-RS streaming starts without two extra HTTP round trips.
+
         Returns True when at least one .dcm file was written.
         """
         import shutil
@@ -1653,9 +1664,11 @@ class OrthancClient:
 
         # --- Primary: WADO-RS multipart streaming ---
         if self.check_dicomweb_available():
-            uids = self._get_dicom_uids_for_series(series_id)
-            if uids:
-                study_uid, series_uid = uids
+            if not (study_uid and series_uid):
+                uids = self._get_dicom_uids_for_series(series_id)
+                if uids:
+                    study_uid, series_uid = uids
+            if study_uid and series_uid:
                 n = self._wado_rs_stream_series(
                     study_uid, series_uid, output_dir, progress_callback
                 )
@@ -2048,8 +2061,9 @@ class OrthancClient:
                                         ct_ready_callback=None) -> Dict[str, Optional[str]]:
         """Download CT instances + DICOM SEG for the DICOM_NATIVE profile.
 
-        CT streaming and SEG download run concurrently.  Optional attachment
-        downloads (e.g. a pre-computed centerline) are fetched afterwards.
+        Resolves all study/series metadata in exactly two HTTP calls before
+        launching parallel CT and SEG downloads.  Pre-resolved DICOM UIDs are
+        forwarded to the WADO-RS streamer so it skips its own UID lookups.
 
         ``progress_callback``, when provided, is forwarded to the CT instance
         streamer and called as ``progress_callback(n)`` after each slice lands.
@@ -2059,20 +2073,35 @@ class OrthancClient:
         from .DatasetProfile import download_filename
         paths: Dict[str, Optional[str]] = {}
 
-        # Resolve parent study (SEG lives there alongside the CT series)
+        # --- Pre-flight: two HTTP calls, extract everything needed at once ---
+        # Call 1: series → parent study ID + SeriesInstanceUID
+        series_uid = ""
         parent_study_id = ""
         try:
             r = self.session.get(f"{self.server_url}/series/{series_id}")
             if r.status_code == 200:
-                parent_study_id = r.json().get("ParentStudy", "")
-        except Exception:
-            pass
+                data = r.json()
+                parent_study_id = data.get("ParentStudy", "")
+                series_uid      = data.get("MainDicomTags", {}).get("SeriesInstanceUID", "")
+        except Exception as e:
+            print(f"[OrthancClient] Pre-flight series fetch failed: {e}")
 
-        # Find SEG series before launching parallel tasks
-        seg_series_id = (
-            self.get_dicom_seg_series_id(parent_study_id)
-            if parent_study_id else None
-        )
+        # Call 2: study → StudyInstanceUID + sibling series list
+        study_uid = ""
+        sibling_series_ids = []
+        if parent_study_id:
+            try:
+                r2 = self.session.get(f"{self.server_url}/studies/{parent_study_id}")
+                if r2.status_code == 200:
+                    study_data = r2.json()
+                    study_uid = study_data.get("MainDicomTags", {}).get("StudyInstanceUID", "")
+                    sibling_series_ids = [s for s in study_data.get("Series", [])
+                                          if s != series_id]
+            except Exception as e:
+                print(f"[OrthancClient] Pre-flight study fetch failed: {e}")
+
+        # --- Find SEG series with parallel modality checks ---
+        seg_series_id = self._find_seg_series_among(sibling_series_ids)
 
         # CT and SEG download in parallel.
         # SEG lives in its own subdirectory so that _loadDicomSeg's seg_dir
@@ -2085,7 +2114,9 @@ class OrthancClient:
 
         def _fetch_ct():
             ok = self._stream_series_instances_to_dir(
-                series_id, ct_dir, progress_callback=progress_callback
+                series_id, ct_dir,
+                study_uid=study_uid, series_uid=series_uid,
+                progress_callback=progress_callback,
             )
             result = ct_dir if ok else None
             if result and ct_ready_callback:
@@ -2117,6 +2148,36 @@ class OrthancClient:
             paths[logical_name] = local
 
         return paths
+
+    def _find_seg_series_among(self, series_ids: list) -> Optional[str]:
+        """Return the Orthanc series ID of the first SEG-modality series.
+
+        All modality checks run in parallel to minimise latency.  Excludes the
+        CT series itself — callers should pass only the sibling series IDs.
+
+        Returns None if series_ids is empty or no SEG series is found.
+        """
+        if not series_ids:
+            return None
+
+        def _check(sid: str) -> Optional[str]:
+            try:
+                r = self.session.get(f"{self.server_url}/series/{sid}", timeout=10)
+                if r.status_code == 200:
+                    mod = r.json().get("MainDicomTags", {}).get("Modality", "")
+                    return sid if mod == "SEG" else None
+            except Exception:
+                pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=min(len(series_ids), 4)) as pool:
+            results = list(pool.map(_check, series_ids))
+
+        for result in results:
+            if result:
+                print(f"[OrthancClient] SEG series found (parallel check): {result}")
+                return result
+        return None
 
     def submit_annotation_on_series(self, series_id: str, files: Dict[str, str],
                                      notes: str = "") -> Tuple[bool, str]:

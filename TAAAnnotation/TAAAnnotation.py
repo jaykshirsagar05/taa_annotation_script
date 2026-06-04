@@ -290,11 +290,24 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 exists = os.path.exists(v) if v else 'N/A'
                 print(f"  {k}: {v} (exists={exists})")
             
+            # loadDataWithProfile() is synchronous and blocks the main thread for
+            # 1-2 minutes. We can't avoid the freeze without threading (MRML ops
+            # must run on the main thread), but we can signal activity to the user.
+            slicer.util.showStatusMessage(
+                f"Loading {study_info['patient_id']} — "
+                "CT → seg import → 3D surface (may take 1-2 min)…"
+            )
+            qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+            slicer.app.processEvents()  # flush status + cursor before blocking
+
             # Load using logic
             self.logic.currentId = study_info['patient_id']
             self.logic.rootDir = self.orthancTempDir
             self.logic.activeProfile = profile
-            errors = self.logic.loadDataWithProfile(profile, file_paths)
+            try:
+                errors = self.logic.loadDataWithProfile(profile, file_paths)
+            finally:
+                qt.QApplication.restoreOverrideCursor()
             self.logic.applyConfiguredCtWindowLevel()
             
             # Update UI with profile info
@@ -1035,6 +1048,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         if not _dicom_native_loaded:
             try:
                 print(f"[Loading] CT from: {ct_path}")
+                slicer.util.showStatusMessage("Loading CT volume…")
                 self.volNode = self._loadCtVolume(ct_path)
                 if not self.volNode:
                     raise RuntimeError("Failed to load CT volume")
@@ -1045,6 +1059,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         seg_path = file_paths.get("seg_mask")
         if not _dicom_native_loaded and seg_path and os.path.exists(seg_path):
             try:
+                slicer.util.showStatusMessage("Loading segmentation mask…")
                 seg_path = self._fixFileExtension(seg_path)
                 file_size = os.path.getsize(seg_path)
                 print(f"[Loading] Segmentation mask from: {seg_path} "
@@ -1082,11 +1097,14 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                         "vtkMRMLSegmentationNode",
                         f"{self.currentId}_Segmentation"
                     )
+                    slicer.util.showStatusMessage(
+                        "Importing label map to segmentation — this may take a minute…")
                     slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
                         unifiedLabelNode, self.segNode
                     )
                     slicer.mrmlScene.RemoveNode(unifiedLabelNode)
 
+                slicer.util.showStatusMessage("Creating 3D surface representation…")
                 self.segNode.CreateClosedSurfaceRepresentation()
                 print("[Loading] Segmentation mask loaded successfully")
             except Exception as e:
@@ -1104,16 +1122,20 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             try:
                 ref_path = self._fixFileExtension(ref_path)
                 print(f"[Loading] Reference mask from: {ref_path}")
+                slicer.util.showStatusMessage("Loading reference mask…")
                 mergedLabelNode = self._loadNiftiAsLabelMap(ref_path)
                 if mergedLabelNode:
                     self.refNode = slicer.mrmlScene.AddNewNodeByClass(
                         "vtkMRMLSegmentationNode",
                         f"{self.currentId}_Merged"
                     )
+                    slicer.util.showStatusMessage(
+                        "Importing reference mask to segmentation…")
                     slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
                         mergedLabelNode, self.refNode
                     )
                     slicer.mrmlScene.RemoveNode(mergedLabelNode)
+                    slicer.util.showStatusMessage("Creating reference 3D surface…")
                     self.refNode.CreateClosedSurfaceRepresentation()
                     self.refNode.GetDisplayNode().SetVisibility(False)
                     print("[Loading] Reference mask loaded successfully")
@@ -1140,6 +1162,7 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
             self.segNode.GetDisplayNode().SetVisibility(True)
 
         # --- Setup views ---
+        slicer.util.showStatusMessage("Setting up views…")
         self._setupViews()
 
         self.workflowState["phase"] = 1
