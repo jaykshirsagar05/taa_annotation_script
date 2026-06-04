@@ -22,7 +22,10 @@
       "Bash(curl -s http://10.16.65.17:8042/plugins)",
       "PowerShell(try { $r = Invoke-WebRequest -Uri \"http://10.16.65.17:8042/plugins\" -UseBasicParsing -TimeoutSec 5; $r.Content } catch { $_.Exception.Message })",
       "Bash(git cherry-pick *)",
-      "Bash(git stash *)"
+      "Bash(git stash *)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\JayKshirsagar\\\\Projects\\\\taa_annotation_script\\\\TAAAnnotation\\\\\" -Recurse | Select-Object FullName, PSIsContainer | Sort-Object FullName)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(pip install *)"
     ]
   }
 }
