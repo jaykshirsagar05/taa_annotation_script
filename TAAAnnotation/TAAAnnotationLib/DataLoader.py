@@ -98,17 +98,25 @@ class DataLoader:
         if not ct_path or not os.path.exists(ct_path):
             raise RuntimeError(f"CT scan path missing or not found: {ct_path}")
 
-        # --- DICOM_NATIVE: load CT + SEG together in one TemporaryDICOMDatabase ---
+        # --- DICOM_NATIVE: staged load (CT first, then SEG) ---
         _dicom_native_loaded = False
         if profile.profile_type == "dicom_native" and os.path.isdir(ct_path):
             _seg_path_raw = file_paths.get("seg_mask", "")
             if _seg_path_raw and os.path.exists(_seg_path_raw):
-                print("[Loading] DICOM native: combined CT+SEG load")
-                vol, seg = self._loadDicomNativeAll(ct_path, _seg_path_raw)
+                print("[Loading] DICOM native: staged CT-first load")
+                slicer.util.showStatusMessage("Phase 1/2: Loading CT DICOM…")
+                slicer.app.processEvents()
+                vol = self._loadDicomNativeCtOnly(ct_path)
                 if not vol:
                     raise RuntimeError(
                         f"Failed to load CT volume (DICOM native) from {ct_path}")
                 self._logic.volNode = vol
+                self._setupViews()
+                slicer.app.processEvents()
+
+                slicer.util.showStatusMessage("Phase 2/2: Loading DICOM segmentation…")
+                slicer.app.processEvents()
+                seg = self._loadDicomSeg(_seg_path_raw, ct_dicom_dir=ct_path)
                 if seg:
                     self._logic.segNode = seg
                     self._logic.segNode.CreateClosedSurfaceRepresentation()
