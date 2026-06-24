@@ -1354,13 +1354,15 @@ class OrthancClient:
         attachments available on the series (and its parent study).
 
         Returns:
-            DatasetProfile instance, or None if no profile matches.
+            (DatasetProfile, attachments_dict) — profile is None when no
+            profile matches.  attachments_dict is the raw flags dict from
+            get_series_attachments_info(), e.g. {"ct_nifti": bool, ...}.
         """
         from .DatasetProfile import detect_profile_from_attachments
         info = self.get_series_info(series_id)
         parent_study_id = info.get("orthanc_study_id", "") if info else ""
         attachments = self.get_series_attachments_info(series_id, parent_study_id)
-        return detect_profile_from_attachments(attachments)
+        return detect_profile_from_attachments(attachments), attachments
 
     def download_nifti_from_series(self, series_id: str, attachment_type: int,
                                     output_path: Optional[str] = None) -> Optional[str]:
@@ -1449,29 +1451,40 @@ class OrthancClient:
         paths: Dict[str, Optional[str]] = {}
 
         def _fetch_one(logical_name: str, att_id: int) -> tuple:
+            """Returns (logical_name, local_path, used_dicom_stream).
+
+            used_dicom_stream is True when CT was downloaded instance-by-instance
+            via WADO-RS / DICOM stream with progress_callback already reporting
+            per-instance counts.  The caller skips the per-file progress tick in
+            that case to avoid overwriting the per-instance counter.
+            """
             if logical_name == "ct":
-                # NIfTI attachment first, then DICOM series fallback
                 ct_fname = download_filename("ct", patient_id)
                 local = self.download_nifti_from_series(
                     series_id, self.ATTACHMENT_CT_NIFTI,
                     os.path.join(temp_dir, ct_fname),
                 )
+                used_dicom = False
                 if local:
                     print(f"[OrthancClient] CT from NIfTI attachment: "
                           f"{os.path.basename(local)}")
                 else:
                     dicom_dir = os.path.join(temp_dir, f"{patient_id}_ct_dicom")
-                    if self._stream_series_instances_to_dir(series_id, dicom_dir):
+                    if self._stream_series_instances_to_dir(
+                        series_id, dicom_dir,
+                        progress_callback=progress_callback,
+                    ):
                         local = dicom_dir
+                        used_dicom = True
                         print(f"[OrthancClient] CT from DICOM series: {dicom_dir}")
                     else:
                         print("[OrthancClient] CT download failed for series")
                 if local and ct_ready_callback:
                     ct_ready_callback(local)
-                return logical_name, local
+                return logical_name, local, used_dicom
 
             if att_id is None:
-                return logical_name, None
+                return logical_name, None, False
 
             fname = download_filename(logical_name, patient_id)
             local = self.download_nifti_from_series(
@@ -1479,7 +1492,7 @@ class OrthancClient:
             )
             if logical_name == "centerline" and local:
                 local = self._detect_and_fix_centerline_ext(local)
-            return logical_name, local
+            return logical_name, local, False
 
         tasks = {
             **{name: att_id for name, att_id in profile.required_attachments.items()},
@@ -1493,11 +1506,14 @@ class OrthancClient:
             }
             completed = 0
             for future in as_completed(futures):
-                logical_name, local_path = future.result()
+                logical_name, local_path, used_dicom_stream = future.result()
                 paths[logical_name] = local_path
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed)
+                # CT that streamed DICOM instances already fired progress_callback
+                # per-instance — don't overwrite that counter with a file-level tick.
+                if not used_dicom_stream:
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(completed)
 
         return paths
 

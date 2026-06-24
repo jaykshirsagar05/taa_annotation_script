@@ -116,7 +116,10 @@ class DataLoader:
 
                 slicer.util.showStatusMessage("Phase 2/2: Loading DICOM segmentation…")
                 slicer.app.processEvents()
-                seg = self._loadDicomSeg(_seg_path_raw, ct_dicom_dir=ct_path)
+                # CT was already imported into slicer.dicomDatabase in Phase 1;
+                # pass ct_already_in_db=True to skip the 840-file re-index.
+                seg = self._loadDicomSeg(_seg_path_raw, ct_dicom_dir=ct_path,
+                                         ct_already_in_db=True)
                 if seg:
                     self._logic.segNode = seg
                     self._logic.segNode.CreateClosedSurfaceRepresentation()
@@ -258,19 +261,43 @@ class DataLoader:
         try:
             from DICOMLib import DICOMUtils
 
-            loaded_node_ids = []
-            with DICOMUtils.TemporaryDICOMDatabase() as db:
-                DICOMUtils.importDicom(dicom_folder, db)
-                for patient_uid in db.patients():
-                    loaded_node_ids.extend(DICOMUtils.loadPatientByUID(patient_uid))
+            # Pre-read series UID so we load exactly this series even when the
+            # persistent database already contains unrelated series.
+            series_uid = ""
+            try:
+                import pydicom
+                for fname in os.listdir(dicom_folder):
+                    if fname.lower().endswith(".dcm"):
+                        ds = pydicom.dcmread(
+                            os.path.join(dicom_folder, fname), stop_before_pixels=True
+                        )
+                        series_uid = str(getattr(ds, "SeriesInstanceUID", "") or "")
+                        if series_uid:
+                            break
+            except Exception:
+                pass
 
-            for node_id in loaded_node_ids:
-                node = slicer.mrmlScene.GetNodeByID(node_id)
-                if node and node.IsA("vtkMRMLScalarVolumeNode"):
-                    print(f"[Loading] DICOM CT loaded from folder: {dicom_folder}")
-                    return node
+            db = slicer.dicomDatabase
+            DICOMUtils.importDicom(dicom_folder, db)
+            slicer.app.processEvents()
 
-            # Fallback: first .dcm file as generic volume load
+            if series_uid:
+                loaded = DICOMUtils.loadSeriesByUID([series_uid])
+                for nid in loaded:
+                    node = slicer.mrmlScene.GetNodeByID(nid)
+                    if node and node.IsA("vtkMRMLScalarVolumeNode"):
+                        print(f"[Loading] DICOM CT loaded from folder: {dicom_folder}")
+                        return node
+
+            # Fallback: iterate all patients in the database
+            for patient_uid in db.patients():
+                for nid in DICOMUtils.loadPatientByUID(patient_uid):
+                    node = slicer.mrmlScene.GetNodeByID(nid)
+                    if node and node.IsA("vtkMRMLScalarVolumeNode"):
+                        print(f"[Loading] DICOM CT loaded from folder: {dicom_folder}")
+                        return node
+
+            # Final fallback: first .dcm file as generic volume load
             for root, _, files in os.walk(dicom_folder):
                 for name in files:
                     if name.lower().endswith(".dcm"):
@@ -409,6 +436,12 @@ class DataLoader:
     def _loadDicomNativeCtOnly(self, ct_dir: str):
         """Index CT DICOM and load the CT volume — Phase 1 of the staged load.
 
+        Uses slicer.dicomDatabase (persistent, WAL-mode) instead of
+        TemporaryDICOMDatabase.  TemporaryDICOMDatabase creates a fresh SQLite
+        file without WAL mode; ctkDICOMIndexer's multi-threaded writes then
+        contend on the write lock, causing SQLITE_BUSY crashes with large
+        series (800+ slices) on Windows.
+
         Annotates the returned volume node with DICOM.instanceUIDs so that
         DICOMSegPlugin can resolve SEG geometry in Phase 2 without reloading
         CT pixel data.
@@ -419,21 +452,54 @@ class DataLoader:
 
         try:
             from DICOMLib import DICOMUtils
-            import ctk
 
             ct_count = len([f for f in os.listdir(ct_dir) if f.lower().endswith(".dcm")])
-            print(f"[Loading] Staged Phase 1: indexing {ct_count} CT DICOM files…")
+            print(f"[Loading] Phase 1: importing {ct_count} CT DICOM files into database…")
 
-            with DICOMUtils.TemporaryDICOMDatabase() as db:
-                ct_indexer = ctk.ctkDICOMIndexer()
-                slicer.util.showStatusMessage(f"Indexing {ct_count} CT DICOM files…")
-                slicer.app.processEvents()
-                ct_indexer.addDirectory(db, ct_dir, False)
-                ct_indexer.waitForImportFinished()
-                slicer.app.processEvents()
+            # Read the series UID from the first .dcm file so we can load exactly
+            # this series even if the persistent database contains others.
+            target_series_uid = ""
+            try:
+                import pydicom
+                for fname in os.listdir(ct_dir):
+                    if fname.lower().endswith(".dcm"):
+                        ds = pydicom.dcmread(
+                            os.path.join(ct_dir, fname), stop_before_pixels=True
+                        )
+                        target_series_uid = str(getattr(ds, "SeriesInstanceUID", "") or "")
+                        if target_series_uid:
+                            break
+            except Exception as e_uid:
+                print(f"[Loading] Could not pre-read CT SeriesUID: {e_uid}")
 
-                vol_node = None
-                ct_series_uid = None
+            db = slicer.dicomDatabase
+
+            slicer.util.showStatusMessage(
+                f"Importing {ct_count} CT DICOM files — this may take a moment…"
+            )
+            slicer.app.processEvents()
+
+            DICOMUtils.importDicom(ct_dir, db)
+            slicer.app.processEvents()
+
+            slicer.util.showStatusMessage("Loading CT volume from database…")
+            slicer.app.processEvents()
+
+            vol_node = None
+            ct_series_uid = None
+
+            # Primary: load the specific series identified above
+            if target_series_uid:
+                loaded = DICOMUtils.loadSeriesByUID([target_series_uid])
+                for nid in loaded:
+                    node = slicer.mrmlScene.GetNodeByID(nid)
+                    if node and node.IsA("vtkMRMLScalarVolumeNode"):
+                        vol_node = node
+                        ct_series_uid = target_series_uid
+                        break
+
+            # Fallback: scan database patients (handles already-indexed series)
+            if not vol_node:
                 for patient_uid in db.patients():
                     if vol_node:
                         break
@@ -446,24 +512,25 @@ class DataLoader:
                                 node = slicer.mrmlScene.GetNodeByID(nid)
                                 if node and node.IsA("vtkMRMLScalarVolumeNode"):
                                     vol_node = node
-                                    vol_node.SetName(f"{self._logic.currentId}_CT")
                                     ct_series_uid = series_uid
                                     break
                             if vol_node:
                                 break
 
-                if not vol_node:
-                    print("[Loading] Staged Phase 1: no CT volume found in DICOM DB")
-                    return None
+            if not vol_node:
+                print("[Loading] Phase 1: no CT ScalarVolumeNode found in database")
+                return None
 
-                if ct_series_uid:
-                    inst_uids = db.instancesForSeries(ct_series_uid)
-                    if inst_uids:
-                        vol_node.SetAttribute(
-                            "DICOM.instanceUIDs", " ".join(inst_uids)
-                        )
-                        print(f"[Loading] Staged Phase 1: CT loaded + annotated with "
-                              f"{len(inst_uids)} DICOM instance UIDs")
+            vol_node.SetName(f"{self._logic.currentId}_CT")
+
+            if ct_series_uid:
+                inst_uids = db.instancesForSeries(ct_series_uid)
+                if inst_uids:
+                    vol_node.SetAttribute(
+                        "DICOM.instanceUIDs", " ".join(inst_uids)
+                    )
+                    print(f"[Loading] Phase 1: CT loaded with "
+                          f"{len(inst_uids)} DICOM instance UIDs")
 
             self._setupViews()
             return vol_node
@@ -510,13 +577,23 @@ class DataLoader:
 
         return None
 
-    def _loadDicomSeg(self, path: str, ct_dicom_dir: str = None):
+    def _loadDicomSeg(self, path: str, ct_dicom_dir: str = None,
+                      ct_already_in_db: bool = False):
         """
         Load a DICOM SEG file (or directory containing one) as a
-        vtkMRMLSegmentationNode.
+        vtkMRMLSegmentationNode using Slicer's persistent DICOM database.
 
-        Strategy 1: DICOM database import (primary path for .dcm SEG).
+        Strategy 1: Import SEG (and optionally CT) into slicer.dicomDatabase,
+                    then load via DICOMUtils.loadSeriesByUID.
         Strategy 2: Last-resort direct load via loadSegmentation.
+
+        Args:
+            ct_dicom_dir:      Directory of CT DICOM files needed by DICOMSegPlugin
+                               to resolve SEG geometry.  Pass None when the CT was
+                               already imported in a prior phase (e.g. staged load).
+            ct_already_in_db:  When True, skip re-importing ct_dicom_dir even if it
+                               is provided (CT was imported into slicer.dicomDatabase
+                               in Phase 1 and is already present).
         """
         if os.path.isdir(path):
             dcm_files = [
@@ -533,50 +610,58 @@ class DataLoader:
 
         try:
             from DICOMLib import DICOMUtils
-            with DICOMUtils.TemporaryDICOMDatabase() as db:
-                if ct_dicom_dir and os.path.isdir(ct_dicom_dir):
-                    print("[Loading]   Importing CT DICOM into temp DB for SEG reference")
-                    DICOMUtils.importDicom(ct_dicom_dir, db)
-                DICOMUtils.importDicom(seg_dir, db)
 
-                seg_series_uid = None
-                try:
-                    import pydicom
-                    ds = pydicom.dcmread(path, stop_before_pixels=True)
-                    file_series_uid = str(getattr(ds, "SeriesInstanceUID", "") or "")
-                    if file_series_uid:
-                        for patient in db.patients():
-                            for study in db.studiesForPatient(patient):
-                                for series in db.seriesForStudy(study):
-                                    if series == file_series_uid:
-                                        seg_series_uid = series
-                                        break
-                                if seg_series_uid:
+            # Use the persistent database — avoids the TemporaryDICOMDatabase
+            # SQLite write-lock crash that occurs with large CT series on Windows.
+            db = slicer.dicomDatabase
+
+            # Import CT only when needed and not already present in the database.
+            if ct_dicom_dir and os.path.isdir(ct_dicom_dir) and not ct_already_in_db:
+                print("[Loading]   Importing CT DICOM into persistent DB for SEG reference")
+                DICOMUtils.importDicom(ct_dicom_dir, db)
+                slicer.app.processEvents()
+
+            DICOMUtils.importDicom(seg_dir, db)
+            slicer.app.processEvents()
+
+            seg_series_uid = None
+            try:
+                import pydicom
+                ds = pydicom.dcmread(path, stop_before_pixels=True)
+                file_series_uid = str(getattr(ds, "SeriesInstanceUID", "") or "")
+                if file_series_uid:
+                    for patient in db.patients():
+                        for study in db.studiesForPatient(patient):
+                            for series in db.seriesForStudy(study):
+                                if series == file_series_uid:
+                                    seg_series_uid = series
                                     break
                             if seg_series_uid:
                                 break
-                    if not seg_series_uid:
-                        print(f"[Loading]   SEG SeriesInstanceUID {file_series_uid!r} "
-                              f"not found in temp DB after import")
-                except Exception as e_uid:
-                    print(f"[Loading]   Could not resolve SEG series via UID: {e_uid}")
-
+                        if seg_series_uid:
+                            break
                 if not seg_series_uid:
-                    print(f"[Loading]   SEG file not indexed in temp DB after import: "
-                          f"{os.path.basename(path)}")
-                else:
-                    loaded_ids = DICOMUtils.loadSeriesByUID([seg_series_uid])
-                    for nid in loaded_ids:
-                        node = slicer.mrmlScene.GetNodeByID(nid)
-                        if node and node.IsA("vtkMRMLSegmentationNode"):
-                            node.SetName(f"{self._logic.currentId}_Segmentation")
-                            print(f"[Loading]   DICOM SEG loaded via DICOM database "
-                                  f"(series {seg_series_uid[:8]}…)")
-                            return node
-                    print(f"[Loading]   loadSeriesByUID returned {len(loaded_ids)} node(s), "
-                          f"none are SegmentationNode")
+                    print(f"[Loading]   SEG SeriesInstanceUID {file_series_uid!r} "
+                          f"not found in persistent DB after import")
+            except Exception as e_uid:
+                print(f"[Loading]   Could not resolve SEG series via UID: {e_uid}")
+
+            if not seg_series_uid:
+                print(f"[Loading]   SEG file not indexed in persistent DB after import: "
+                      f"{os.path.basename(path)}")
+            else:
+                loaded_ids = DICOMUtils.loadSeriesByUID([seg_series_uid])
+                for nid in loaded_ids:
+                    node = slicer.mrmlScene.GetNodeByID(nid)
+                    if node and node.IsA("vtkMRMLSegmentationNode"):
+                        node.SetName(f"{self._logic.currentId}_Segmentation")
+                        print(f"[Loading]   DICOM SEG loaded via persistent database "
+                              f"(series {seg_series_uid[:8]}…)")
+                        return node
+                print(f"[Loading]   loadSeriesByUID returned {len(loaded_ids)} node(s), "
+                      f"none are SegmentationNode")
         except Exception as e1:
-            print(f"[Loading]   DICOM database strategy failed: {e1}")
+            print(f"[Loading]   DICOM persistent database strategy failed: {e1}")
 
         try:
             node = slicer.util.loadSegmentation(path)

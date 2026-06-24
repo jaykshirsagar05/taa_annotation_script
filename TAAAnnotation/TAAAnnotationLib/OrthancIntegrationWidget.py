@@ -286,7 +286,7 @@ class OrthancIntegrationWidget(qt.QWidget):
             slicer.util.showStatusMessage("Detecting dataset profile for series...")
             slicer.app.processEvents()
 
-            profile = self.orthancClient.detect_dataset_profile_for_series(series_id)
+            profile, attachments = self.orthancClient.detect_dataset_profile_for_series(series_id)
             if profile is None:
                 slicer.util.errorDisplay(
                     "Cannot determine dataset type for this series.\n\n"
@@ -303,10 +303,18 @@ class OrthancIntegrationWidget(qt.QWidget):
             self.tempDir = tempfile.mkdtemp(prefix=f"orthanc_{patient_id}_")
 
             # ---- Progress dialog ----
-            # DICOM_NATIVE: progress per CT instance (high granularity)
-            # Other profiles: progress per attachment file (low granularity)
+            # DICOM_NATIVE:     per CT instance (high granularity, WADO-RS stream).
+            # Non-native DICOM CT (no CT NIfTI attachment): CT instances are streamed
+            #   instance-by-instance too — show the same per-instance progress so the
+            #   bar doesn't freeze at 50% during an 840-slice download.
+            # Other profiles (NIfTI CT attachment): per attachment file.
             is_dicom_native = profile.profile_type == "dicom_native"
-            if is_dicom_native:
+            ct_is_dicom_stream = (
+                not is_dicom_native
+                and total_ct_instances > 0
+                and not attachments.get("ct_nifti", False)
+            )
+            if is_dicom_native or ct_is_dicom_stream:
                 progress_max = total_ct_instances if total_ct_instances > 0 else 0
             else:
                 n_files = (len(profile.required_attachments)
@@ -366,7 +374,7 @@ class OrthancIntegrationWidget(qt.QWidget):
                         n = msg[1]
                         if progress_max > 0:
                             progress.setValue(min(n, progress_max))
-                        if is_dicom_native:
+                        if is_dicom_native or ct_is_dicom_stream:
                             label = (f"Downloading {profile.name}…  "
                                      + (f"{n}/{total_ct_instances} slices"
                                         if total_ct_instances > 0 else f"{n} slices"))
@@ -378,7 +386,7 @@ class OrthancIntegrationWidget(qt.QWidget):
                         # CT download complete — start loading CT into scene
                         # immediately while SEG continues downloading.
                         ct_dir = msg[1]
-                        if is_dicom_native:
+                        if is_dicom_native or ct_is_dicom_stream:
                             ct_label = (f"CT downloaded ({total_ct_instances} slices) — "
                                         f"loading CT volume…")
                         else:

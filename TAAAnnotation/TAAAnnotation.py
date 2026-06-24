@@ -25,8 +25,9 @@ class TAAAnnotation(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = "TAA Annotation"
-        # Schedule update check 3 s after startup so it doesn't block module loading
-        qt.QTimer.singleShot(3000, self._checkForUpdates)
+        # Ensure Python deps then check for updates — deferred so Slicer finishes
+        # loading the module before any pip/network activity starts.
+        qt.QTimer.singleShot(1000, self._ensureDependenciesThenUpdate)
 
         self.parent.categories = ["Segmentation"]
         self.parent.dependencies = ["SegmentEditor", "ExtractCenterline"]
@@ -46,6 +47,15 @@ class TAAAnnotation(ScriptedLoadableModule):
         self.parent.acknowledgementText = """
         Developed for TAA research annotation workflow.
         """
+
+    def _ensureDependenciesThenUpdate(self):
+        """Install missing Python packages, then run the update check."""
+        try:
+            from TAAAnnotationLib.DependencyInstaller import ensureDependencies
+            ensureDependencies()
+        except Exception as e:
+            print(f"[TAAAnnotation] Dependency install error: {e}")
+        self._checkForUpdates()
 
     def _checkForUpdates(self):
         try:
