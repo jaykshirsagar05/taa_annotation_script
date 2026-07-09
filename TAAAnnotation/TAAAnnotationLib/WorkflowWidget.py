@@ -132,20 +132,18 @@ class WorkflowWidget(qt.QWidget):
         self.groupZones = qt.QGroupBox("4. SVS/STS Zonal Landmarks")
         zonesLayout = qt.QVBoxLayout(self.groupZones)
 
-        # --- Centerline selector ---
+        # --- Centerline status (auto-picked from the VMTK extraction step) ---
         clLayout = qt.QHBoxLayout()
         clLabel = qt.QLabel("Centerline:")
-        self.centerlineCombo = slicer.qMRMLNodeComboBox()
-        self.centerlineCombo.nodeTypes = ["vtkMRMLModelNode"]
-        self.centerlineCombo.selectNodeUponCreation = False
-        self.centerlineCombo.addEnabled = False
-        self.centerlineCombo.removeEnabled = False
-        self.centerlineCombo.noneEnabled = True
-        self.centerlineCombo.showHidden = False
-        self.centerlineCombo.setMRMLScene(slicer.mrmlScene)
-        self.centerlineCombo.setToolTip("Select the centerline model")
+        self.centerlineStatusLabel = qt.QLabel("Pending — complete Step 3 first")
+        self.centerlineStatusLabel.setStyleSheet("color: #999; font-style: italic;")
+        self.centerlineStatusLabel.setToolTip(
+            "Automatically uses the centerline extracted in Step 3. "
+            "No manual selection needed."
+        )
         clLayout.addWidget(clLabel)
-        clLayout.addWidget(self.centerlineCombo)
+        clLayout.addWidget(self.centerlineStatusLabel)
+        clLayout.addStretch(1)
         zonesLayout.addLayout(clLayout)
 
         # --- Zone selector dropdown ---
@@ -277,7 +275,40 @@ class WorkflowWidget(qt.QWidget):
         """Clicking a table row auto-selects that zone in the dropdown."""
         if 0 <= row < 10:
             self.zoneSelector.setCurrentIndex(row)
-        
+
+    def updateCenterlineStatus(self, phase=None):
+        """Refresh the read-only centerline status label from the VMTK-extracted node.
+
+        Returns True if the logic's centerline node has usable geometry, False
+        otherwise (e.g. VMTK extraction was never run, or it failed/produced no points).
+        """
+        if phase is None:
+            phase = self.logic.workflowState.get("phase", 0) if self.logic else 0
+
+        centerlinePreloaded = (
+            self._activeProfile is not None
+            and self._activeProfile.has_precalculated_centerline
+        )
+
+        node = self.logic.centerlineNode if self.logic else None
+        pd = node.GetPolyData() if node else None
+        isValid = bool(pd and pd.GetNumberOfPoints() > 0)
+
+        if isValid:
+            self.centerlineStatusLabel.setText(f"✓ {node.GetName()}")
+            self.centerlineStatusLabel.setStyleSheet("color: #28a745; font-weight: bold;")
+        elif phase >= 3 or centerlinePreloaded:
+            # A centerline was expected by this point but is missing or empty.
+            self.centerlineStatusLabel.setText(
+                "⚠ Not available — VMTK extraction did not complete"
+            )
+            self.centerlineStatusLabel.setStyleSheet("color: #dc3545; font-weight: bold;")
+        else:
+            self.centerlineStatusLabel.setText("Pending — complete Step 3 first")
+            self.centerlineStatusLabel.setStyleSheet("color: #999; font-style: italic;")
+
+        return isValid
+
     # --- Public Methods ---
     
     def setButtonsEnabled(self, enabled: bool):
@@ -296,8 +327,10 @@ class WorkflowWidget(qt.QWidget):
             self._activeProfile is not None
             and self._activeProfile.has_precalculated_centerline
         )
-        # Centerline is considered ready if VMTK phase was passed OR it was pre-loaded
-        centerlineReady = (phase >= 3) or centerlinePreloaded
+        centerlineValid = self.updateCenterlineStatus(phase)
+        # Centerline is considered ready if VMTK phase was passed OR it was pre-loaded,
+        # AND extraction actually produced usable geometry (it may have failed).
+        centerlineReady = ((phase >= 3) or centerlinePreloaded) and centerlineValid
 
         self.btnSeg.setEnabled(phase >= 1)
 
@@ -390,8 +423,7 @@ class WorkflowWidget(qt.QWidget):
         self.btnVmtk.setEnabled(False)
         self._setPickerButtonOff()
         self.btnConfirmPoint.setEnabled(False)
-        self.centerlineCombo.setCurrentNode(None)
-        self.centerlineCombo.setMRMLScene(slicer.mrmlScene)
+        self.updateCenterlineStatus(0)
 
         # Reset zone table
         for i in range(len(SVS_STS_LANDMARKS)):
@@ -500,7 +532,17 @@ class WorkflowWidget(qt.QWidget):
             return
 
         try:
-            centerlineNode = self.centerlineCombo.currentNode()
+            centerlineNode = self.logic.centerlineNode if self.logic else None
+            pd = centerlineNode.GetPolyData() if centerlineNode else None
+            if not pd or pd.GetNumberOfPoints() == 0:
+                self.updateCenterlineStatus()
+                slicer.util.errorDisplay(
+                    "Centerline not available.\n\n"
+                    "Complete Step 3 (Extract VMTK Centerline) successfully before "
+                    "placing zone landmarks."
+                )
+                return
+
             placedCount = (
                 self.centerlinePicker.getPlacedCount()
                 if self.centerlinePicker

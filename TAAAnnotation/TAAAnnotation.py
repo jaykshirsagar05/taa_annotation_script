@@ -144,6 +144,16 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Initial UI state
         self.workflowWidget.updateUIState(0)
 
+    def enter(self):
+        """Called each time the user switches back to this module.
+
+        VMTK extraction (Step 3) runs inside the separate ExtractCenterline
+        module, so re-check the centerline node here — this catches the case
+        where the user leaves it unrun/failed and lands on Zone Landmarks anyway.
+        """
+        if self.logic:
+            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+
     # --- Manual Load Handler ---
     def onLoadData(self):
         """Handle manual data loading from folder (profile auto-detected)."""
