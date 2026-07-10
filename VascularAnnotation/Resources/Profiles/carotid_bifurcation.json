@@ -1,0 +1,67 @@
+{
+  "profile_schema_version": "1.0",
+  "id": "carotid_bifurcation",
+  "name": "Carotid Bifurcation",
+  "description": "Carotid artery bifurcation annotation with ICA/ECA/VA landmarks",
+  "version": "1.0.0",
+  "anatomy_tag": "carotid",
+  "inputs": {
+    "ct": {
+      "label": "CT Volume",
+      "role": "volume",
+      "required": true,
+      "file_patterns": [
+        "ct_scan_{id}.nii.gz",
+        "ct_{id}.nii.gz",
+        "*.nii.gz"
+      ],
+      "mime": "application/nifti"
+    },
+    "seg_mask": {
+      "label": "Segmentation Mask",
+      "role": "mask",
+      "required": true,
+      "file_patterns": [
+        "{id}_carotid_mask.nii.gz",
+        "{id}_mask.nii.gz",
+        "{id}_seg*.nii.gz"
+      ],
+      "mime": "application/nifti"
+    }
+  },
+  "mask_handling": {
+    "binarize_before_refine": false,
+    "multi_segment": false,
+    "centerline_segment_index": 0
+  },
+  "phases": [
+    "load_data",
+    "refine_mask",
+    "extract_centerline",
+    "place_landmarks",
+    "export"
+  ],
+  "landmark_set": "carotid_bifurcation",
+  "export": {
+    "bundle_suffix": "_GT_Bundle",
+    "artifacts": {
+      "refined_mask": "{patient_id}_refined_mask.seg.nrrd",
+      "centerline": "{patient_id}_Centerline.vtk",
+      "network": "{patient_id}_Network.vtk",
+      "endpoints": "{patient_id}_Endpoints.fcsv",
+      "landmarks": "{patient_id}_Zones.fcsv",
+      "notes": "{patient_id}_notes.txt",
+      "metadata": "export_metadata.json"
+    }
+  },
+  "orthanc_attachments": {
+    "metadata": 1024,
+    "ct": 1025,
+    "seg_mask": 1026,
+    "refined_mask": 1028,
+    "centerline": 1029,
+    "landmarks": 1030,
+    "endpoints": 1031,
+    "notes": 1032
+  }
+}

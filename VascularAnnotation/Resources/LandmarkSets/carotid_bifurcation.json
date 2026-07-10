@@ -1,0 +1,57 @@
+{
+  "landmark_schema_version": "1.0",
+  "id": "carotid_bifurcation",
+  "name": "Carotid Bifurcation",
+  "description": "Carotid artery bifurcation landmarks: CCA, ICA, ECA, VA",
+  "max_landmarks": 4,
+  "landmarks": [
+    {
+      "id": 0,
+      "label": "CCA",
+      "name": "Common Carotid Artery",
+      "description": "Common carotid artery bifurcation point.",
+      "color": [
+        1.0,
+        0.2,
+        0.2
+      ],
+      "zone_after": "CCA Segment"
+    },
+    {
+      "id": 1,
+      "label": "ICA",
+      "name": "Internal Carotid Artery",
+      "description": "Origin of the internal carotid artery.",
+      "color": [
+        0.2,
+        0.8,
+        0.2
+      ],
+      "zone_after": "ICA Segment"
+    },
+    {
+      "id": 2,
+      "label": "ECA",
+      "name": "External Carotid Artery",
+      "description": "Origin of the external carotid artery.",
+      "color": [
+        0.2,
+        0.4,
+        1.0
+      ],
+      "zone_after": "ECA Segment"
+    },
+    {
+      "id": 3,
+      "label": "VA",
+      "name": "Vertebral Artery",
+      "description": "Origin of the vertebral artery.",
+      "color": [
+        0.9,
+        0.85,
+        0.0
+      ],
+      "zone_after": null
+    }
+  ]
+}
