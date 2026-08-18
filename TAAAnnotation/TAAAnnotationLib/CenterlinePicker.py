@@ -18,6 +18,22 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
+#  Scroll-navigation tuning
+# ---------------------------------------------------------------------------
+# Scrolling advances a fixed *arc length* along the centerline rather than a
+# fixed number of centerline points.
+SCROLL_STEP_MM = 1.0            # per standard wheel notch
+
+# Wheel events are accumulated for this long before one reformat is applied,
+# which bounds the reformat rate to roughly one per display frame.
+SCROLL_COALESCE_MS = 16
+
+# Non-essential preview work (3D disk, Red/Green re-centre, labels, zone table)
+# runs this long after the wheel goes quiet, so it never adds scroll latency.
+SCROLL_SETTLE_MS = 120
+
+
+# ---------------------------------------------------------------------------
 #  Qt wheel-event filter used during centerline scroll navigation
 # ---------------------------------------------------------------------------
 
@@ -27,6 +43,10 @@ class _YellowWheelFilter(qt.QObject):
     Intercepts Qt-level QWheelEvent before it reaches VTK so the scroll wheel
     steps along the centerline instead of moving the slice stack.
     Returning True from eventFilter() fully consumes the event.
+
+    The event is only *queued* here.  CenterlinePicker coalesces the accumulated
+    delta and applies a single reformat, so a fast flick costs one update rather
+    than one full update per notch.
     """
 
     def __init__(self, picker):
@@ -39,7 +59,7 @@ class _YellowWheelFilter(qt.QObject):
                 delta = event.angleDelta().y()
             except AttributeError:
                 delta = event.delta()   # Qt4-style fallback
-            self._picker._scrollCenterline(+1 if delta > 0 else -1)
+            self._picker._queueScroll(delta)
             return True   # consume — Yellow slice must not also scroll
         return False
 
@@ -231,9 +251,28 @@ class CenterlinePicker:
         self._currentPathIndex = -1        # current position in _centerlinePath
         self._wheelFilter = None           # _YellowWheelFilter Qt event-filter instance
 
-        # Feature 2: Diameter chord nodes (max = red, min = cyan)
-        self._maxDiamNode = None           # vtkMRMLMarkupsLineNode
-        self._minDiamNode = None           # vtkMRMLMarkupsLineNode
+        # Monotonic arc length (mm) along _centerlinePath — the scroll axis.
+        self._pathArcLengths = None        # np.ndarray, len == len(_centerlinePath)
+
+        # Wheel coalescing: events accumulate into _pendingScrollMm and a single
+        # reformat is applied per timer tick.
+        self._pendingScrollMm = 0.0
+        self._isScrolling = False          # re-entrancy guard for the fast path
+        self._scrollTimer = qt.QTimer()
+        self._scrollTimer.setInterval(SCROLL_COALESCE_MS)
+        self._scrollTimer.setSingleShot(True)
+        self._scrollTimer.timeout.connect(self._applyPendingScroll)
+
+        # Deferred heavy preview work, run once the wheel stops.
+        self._settleTimer = qt.QTimer()
+        self._settleTimer.setInterval(SCROLL_SETTLE_MS)
+        self._settleTimer.setSingleShot(True)
+        self._settleTimer.timeout.connect(self._onScrollSettled)
+
+        # Reusable cross-section disk pipeline.
+        self._diskTransform = None
+        self._diskFilter = None
+        self._diskColor = None
 
     # ------------------------------------------------------------------
     #  Public helpers
@@ -289,7 +328,9 @@ class CenterlinePicker:
         self.centerlineNode = centerlineNode
         self._cumulativeDistances = None   # invalidate cache for new centerline
         self._centerlinePath = None
+        self._pathArcLengths = None
         self._currentPathIndex = -1
+        self._pendingScrollMm = 0.0
 
         # Ensure zone node exists
         self.logic.createZoneNode()
@@ -364,11 +405,10 @@ class CenterlinePicker:
                 self._originalSliceIntersectionVisibility = None
                 self._originalSliceIntersectionThickness = None
 
-        # Hide Yellow slice plane in 3D and clean up chord nodes
+        # Hide Yellow slice plane in 3D
         ys = slicer.app.layoutManager().sliceWidget("Yellow")
         if ys:
             ys.sliceLogic().GetSliceNode().SetSliceVisible(False)
-        self._removeDiameterChords()
 
         self._removePointPicking()
 
@@ -380,10 +420,16 @@ class CenterlinePicker:
             slicer.mrmlScene.RemoveNode(self.previewPlaneNode)
             self.previewPlaneNode = None
 
+        # Release the reusable disk pipeline along with its model node.
+        self._diskTransform = None
+        self._diskFilter = None
+        self._diskColor = None
+
         self.isActive = False
         self.centerlineNode = None
         self._cumulativeDistances = None
         self._centerlinePath = None
+        self._pathArcLengths = None
         self.currentPreviewPos = None
         self.currentPreviewId = -1
 
@@ -534,11 +580,7 @@ class CenterlinePicker:
         """Lightweight preview sphere that follows the cursor along the centerline."""
         if not self.previewNode:
             return
-        lm = (
-            SVS_STS_LANDMARKS[self.selectedZoneIndex]
-            if self.selectedZoneIndex < len(SVS_STS_LANDMARKS)
-            else None
-        )
+        lm = self._currentLandmarkDef()
         label = lm["label"] if lm else "?"
 
         # Feature 1: append arc-length distance from previous landmark
@@ -765,6 +807,34 @@ class CenterlinePicker:
         # Fallback: compute from cell connectivity (also populates _centerlinePath).
         self._cumulativeDistances = self._buildCumulativeDistances(pd)
 
+    def _ensurePathArcLengths(self):
+        """Build the monotonic arc-length table along ``_centerlinePath``.
+
+        ``_cumulativeDistances`` is indexed by point ID and, on the VMTK
+        "Length" fast path, is not guaranteed to increase monotonically across
+        branch boundaries.  Scroll navigation needs a strictly increasing axis
+        it can binary-search, so measure arc length directly along the ordered
+        main-trunk path.  Built once per centerline.
+        """
+        if self._pathArcLengths is not None:
+            return
+        if not self._centerlinePath or not self.centerlineNode:
+            return
+        pd = self.centerlineNode.GetPolyData()
+        if pd is None or pd.GetNumberOfPoints() == 0:
+            return
+
+        from vtk.util.numpy_support import vtk_to_numpy
+
+        allPts = vtk_to_numpy(pd.GetPoints().GetData())
+        pathPts = allPts[np.asarray(self._centerlinePath, dtype=np.int64)]
+
+        arc = np.zeros(len(self._centerlinePath), dtype=np.float64)
+        if len(arc) > 1:
+            segLens = np.linalg.norm(np.diff(pathPts, axis=0), axis=1)
+            np.cumsum(segLens, out=arc[1:])
+        self._pathArcLengths = arc
+
     def _getDistanceFromPreviousLandmark(self, pointId):
         """Return arc-length distance from the previous placed landmark.
 
@@ -798,144 +868,51 @@ class CenterlinePicker:
         label = SVS_STS_LANDMARKS[prevIdx]["label"]
         return dist, label
 
-    def _computeCrossSectionDiameters(self, pos, normal, t1):
-        """Cut the aorta surface at (pos, normal) and compute max/min lumen
-        diameters via 2D PCA on the contour points.
-
-        Returns (max_mm, min_mm, max_pt1_3d, max_pt2_3d, min_pt1_3d, min_pt2_3d)
-        or None on failure.
-        """
-        surfPD = self.logic.getAortaSurfacePolyData()
-        if surfPD is None or surfPD.GetNumberOfPoints() < 3:
-            return None
-
-        plane = vtk.vtkPlane()
-        plane.SetOrigin(pos[0], pos[1], pos[2])
-        plane.SetNormal(normal[0], normal[1], normal[2])
-
-        cutter = vtk.vtkCutter()
-        cutter.SetInputData(surfPD)
-        cutter.SetCutFunction(plane)
-        cutter.Update()
-
-        # At curved sections (e.g. arch) the plane can intersect the aorta
-        # wall twice, producing two separate contour loops.  Extract only the
-        # loop whose centroid is closest to the centerline point so that PCA
-        # operates on the correct single lumen cross-section.
-        connFilter = vtk.vtkPolyDataConnectivityFilter()
-        connFilter.SetInputData(cutter.GetOutput())
-        connFilter.SetExtractionModeToClosestPointRegion()
-        connFilter.SetClosestPoint(pos[0], pos[1], pos[2])
-        connFilter.Update()
-        cut = connFilter.GetOutput()
-
-        if cut.GetNumberOfPoints() < 3:
-            return None
-
-        pos_np = np.array(pos, dtype=np.float64)
-        t2 = np.cross(normal, t1)
-        mag = np.linalg.norm(t2)
-        if mag < 1e-9:
-            return None
-        t2 /= mag
-
-        nCut = cut.GetNumberOfPoints()
-        pts_2d = np.empty((nCut, 2), dtype=np.float64)
-        for i in range(nCut):
-            p = np.array(cut.GetPoint(i)) - pos_np
-            pts_2d[i, 0] = np.dot(p, t1)
-            pts_2d[i, 1] = np.dot(p, t2)
-
-        cov = np.cov(pts_2d.T)
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        max_axis_2d = eigenvectors[:, 1]
-        min_axis_2d = eigenvectors[:, 0]
-
-        def _chord_endpoints(axis_2d):
-            projections = pts_2d.dot(axis_2d)
-            diameter = projections.max() - projections.min()
-            half_extent = diameter / 2.0
-            mid_proj = (projections.max() + projections.min()) / 2.0
-            mid_pt_2d = mid_proj * axis_2d
-            pt1_3d = pos_np + (mid_pt_2d - half_extent * axis_2d)[0] * t1 + \
-                              (mid_pt_2d - half_extent * axis_2d)[1] * t2
-            pt2_3d = pos_np + (mid_pt_2d + half_extent * axis_2d)[0] * t1 + \
-                              (mid_pt_2d + half_extent * axis_2d)[1] * t2
-            return diameter, pt1_3d, pt2_3d
-
-        max_mm, max_pt1, max_pt2 = _chord_endpoints(max_axis_2d)
-        min_mm, min_pt1, min_pt2 = _chord_endpoints(min_axis_2d)
-
-        return max_mm, min_mm, max_pt1, max_pt2, min_pt1, min_pt2
-
-    def _createOrUpdateDiameterChords(self, result, lm=None):
-        """Create or update two line-markup chord nodes for max/min diameters."""
-        self._removeDiameterChords()
-
-        if result is None:
-            return
-
-        max_mm, min_mm, max_pt1, max_pt2, min_pt1, min_pt2 = result
-
-        def _make_chord(name, pt1, pt2, color_rgb, label_text):
-            lineNode = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLMarkupsLineNode", name
-            )
-            # Convert to plain Python float — numpy scalars can silently
-            # fail in some Slicer VTK Python bindings, placing points at origin.
-            lineNode.AddControlPoint(float(pt1[0]), float(pt1[1]), float(pt1[2]))
-            lineNode.AddControlPoint(float(pt2[0]), float(pt2[1]), float(pt2[2]))
-            lineNode.SetLocked(True)
-            disp = lineNode.GetDisplayNode()
-            if disp is None:
-                lineNode.CreateDefaultDisplayNodes()
-                disp = lineNode.GetDisplayNode()
-            if disp:
-                disp.SetSelectedColor(*color_rgb)
-                disp.SetColor(*color_rgb)
-                disp.SetLineThickness(0.5)
-                # GlyphScale 0 hides lines in some Slicer builds; use small positive.
-                disp.SetGlyphScale(1.5)
-                disp.SetTextScale(3.0)
-                disp.SetSliceProjection(True)
-                disp.SetSliceProjectionUseFiducialColor(True)
-                # Hide the auto-generated node-name/measurement label.
-                try:
-                    disp.SetPropertiesLabelVisibility(False)
-                except AttributeError:
-                    pass
-                disp.SetPointLabelsVisibility(True)
-            lineNode.SetNthControlPointLabel(0, "")
-            lineNode.SetNthControlPointLabel(1, label_text)
-            return lineNode
-
-        self._maxDiamNode = _make_chord(
-            "Preview_MaxDiam_Temp",
-            max_pt1, max_pt2,
-            [1.0, 0.0, 0.0],
-            f"Max: {max_mm:.1f} mm",
-        )
-        self._minDiamNode = _make_chord(
-            "Preview_MinDiam_Temp",
-            min_pt1, min_pt2,
-            [0.0, 0.8, 1.0],
-            f"Min: {min_mm:.1f} mm",
-        )
-
-    def _removeDiameterChords(self):
-        """Remove max/min diameter chord nodes from the scene."""
-        for attr in ("_maxDiamNode", "_minDiamNode"):
-            node = getattr(self, attr, None)
-            if node:
-                try:
-                    slicer.mrmlScene.RemoveNode(node)
-                except Exception:
-                    pass
-            setattr(self, attr, None)
-
     # ------------------------------------------------------------------
     #  Preview state (after click)
     # ------------------------------------------------------------------
+
+    def _currentLandmarkDef(self):
+        """Landmark definition for the zone being placed, or None."""
+        if 0 <= self.selectedZoneIndex < len(SVS_STS_LANDMARKS):
+            return SVS_STS_LANDMARKS[self.selectedZoneIndex]
+        return None
+
+    def _previewLabel(self, pointId, lm):
+        """Preview marker label, with arc-length offset from the previous landmark."""
+        label = lm["label"] if lm else "Preview"
+        dist, prevLabel = self._getDistanceFromPreviousLandmark(pointId)
+        if dist is not None:
+            label = f"{label} (+{dist:.1f} mm from {prevLabel})"
+        return f"\u25b6 {label}"
+
+    def _sliceFrameAtPoint(self, pointId):
+        """Return (normal, inPlaneAxis) of the cross-section frame at *pointId*."""
+        tangent = self._getTangentAtPoint(self.centerlineNode.GetPolyData(), pointId)
+        n = np.array(tangent, dtype=float)
+        norm = np.linalg.norm(n)
+        n = np.array([0.0, 0.0, 1.0]) if norm < 1e-9 else n / norm
+
+        a = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        t1 = np.cross(n, a)
+        t1 /= np.linalg.norm(t1)
+        return n, t1
+
+    def _reformatYellow(self, pos, pointId):
+        """Orient the Yellow slice as the centerline cross-section at *pointId*.
+
+        This is the only operation the scroll fast path performs, so it stays
+        free of node creation, extra renders and secondary view updates.
+        """
+        n, t1 = self._sliceFrameAtPoint(pointId)
+        yellowSlice = slicer.app.layoutManager().sliceWidget("Yellow")
+        if yellowSlice:
+            yellowSlice.sliceLogic().GetSliceNode().SetSliceToRASByNTP(
+                n[0], n[1], n[2],
+                t1[0], t1[1], t1[2],
+                pos[0], pos[1], pos[2], 0,
+            )
+        return n, t1
 
     def _updatePreviewState(self, pos, pointId):
         """Lock the preview location and show cross-section disk + slice views.
@@ -947,16 +924,18 @@ class CenterlinePicker:
         self.currentPreviewPos = pos
         self.currentPreviewId = pointId
 
-        # Pause hover while locked
+        # Pause hover while locked, and drop any queued wheel delta since the
+        # preview state is being rebuilt from scratch.
         self._hoverTimer.stop()
-        # Stop any active scroll observation before rebuilding the preview state.
-        self._stopYellowScrollObservation()
+        self._scrollTimer.stop()
+        self._settleTimer.stop()
+        self._pendingScrollMm = 0.0
 
-        lm = (
-            SVS_STS_LANDMARKS[self.selectedZoneIndex]
-            if self.selectedZoneIndex < len(SVS_STS_LANDMARKS)
-            else None
-        )
+        lm = self._currentLandmarkDef()
+
+        # Arc-length tables (also populate _centerlinePath / _pathArcLengths).
+        self._ensureCumulativeDistances()
+        self._ensurePathArcLengths()
 
         # Stop observing before modifying the preview node
         self._stopPreviewObservation()
@@ -966,15 +945,9 @@ class CenterlinePicker:
         if self.previewNode:
             self.previewNode.RemoveAllControlPoints()
             self.previewNode.AddControlPoint(pos[0], pos[1], pos[2])
-            label = lm["label"] if lm else "Preview"
-
-            # Feature 1: append arc-length distance from previous landmark
-            self._ensureCumulativeDistances()
-            dist, prevLabel = self._getDistanceFromPreviousLandmark(pointId)
-            if dist is not None:
-                label = f"{label} (+{dist:.1f} mm from {prevLabel})"
-
-            self.previewNode.SetNthControlPointLabel(0, f"\u25b6 {label}")
+            self.previewNode.SetNthControlPointLabel(
+                0, self._previewLabel(pointId, lm)
+            )
             if lm:
                 self.previewNode.GetDisplayNode().SetSelectedColor(*lm["color"])
 
@@ -989,53 +962,20 @@ class CenterlinePicker:
 
         self._isSnapping = False
 
-        # Tangent and slice orientation
-        tangent = self._getTangentAtPoint(self.centerlineNode.GetPolyData(), pointId)
-        n = np.array(tangent, dtype=float)
-        n /= np.linalg.norm(n)
-
-        a = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        t1 = np.cross(n, a)
-        t1 /= np.linalg.norm(t1)
-
-        # Orient Yellow slice as cross-section
-        yellowSlice = slicer.app.layoutManager().sliceWidget("Yellow")
-        yellowLogic = yellowSlice.sliceLogic()
-        yellowLogic.GetSliceNode().SetSliceToRASByNTP(
-            n[0], n[1], n[2],
-            t1[0], t1[1], t1[2],
-            pos[0], pos[1], pos[2], 0,
-        )
-
-        # Center Red (Axial) and Green (Coronal) slices on the point
+        # Orient Yellow as the cross-section, then the secondary views.
+        n, t1 = self._reformatYellow(pos, pointId)
         self._centerSliceViewsOnPoint(pos)
-
-        # 3D disk
         self._createOrUpdatePreviewPlane(pos, n, t1, lm)
-
-        # Feature 2: diameter chords on the cross-section
-        diamResult = self._computeCrossSectionDiameters(pos, n, t1)
-        self._createOrUpdateDiameterChords(diamResult, lm)
 
         # Start observing the preview node for user adjustments in slices
         self._startPreviewObservation()
 
         # Sync scroll-navigation index and enable Yellow-slice scroll.
-        self._ensureCumulativeDistances()  # also populates _centerlinePath
         self._updatePathIndex(pointId)
         self._startYellowScrollObservation()
 
     def _createOrUpdatePreviewPlane(self, center, normal, xAxis, lm=None):
-        if self.previewPlaneNode:
-            slicer.mrmlScene.RemoveNode(self.previewPlaneNode)
-            self.previewPlaneNode = None
-
-        disk = vtk.vtkDiskSource()
-        disk.SetInnerRadius(0)
-        disk.SetOuterRadius(30)
-        disk.SetRadialResolution(30)
-        disk.SetCircumferentialResolution(30)
-
+        """Place the 3D cross-section disk at *center* with the given frame."""
         yAxis = np.cross(normal, xAxis)
         yAxis /= np.linalg.norm(yAxis)
 
@@ -1046,29 +986,50 @@ class CenterlinePicker:
             matrix.SetElement(i, 2, normal[i])
             matrix.SetElement(i, 3, center[i])
 
-        transform = vtk.vtkTransform()
-        transform.SetMatrix(matrix)
+        if self._diskFilter is None:
+            disk = vtk.vtkDiskSource()
+            disk.SetInnerRadius(0)
+            disk.SetOuterRadius(30)
+            disk.SetRadialResolution(30)
+            disk.SetCircumferentialResolution(30)
 
-        tf = vtk.vtkTransformPolyDataFilter()
-        tf.SetInputConnection(disk.GetOutputPort())
-        tf.SetTransform(transform)
-        tf.Update()
+            self._diskTransform = vtk.vtkTransform()
+            self._diskFilter = vtk.vtkTransformPolyDataFilter()
+            self._diskFilter.SetInputConnection(disk.GetOutputPort())
+            self._diskFilter.SetTransform(self._diskTransform)
 
-        self.previewPlaneNode = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLModelNode", "Preview_Plane_Temp"
-        )
-        self.previewPlaneNode.SetAndObservePolyData(tf.GetOutput())
-        self.previewPlaneNode.CreateDefaultDisplayNodes()
+        self._diskTransform.SetMatrix(matrix)
+        self._diskFilter.Update()
 
-        color = lm["color"] if lm else [1, 0, 0]
-        display = self.previewPlaneNode.GetDisplayNode()
-        if display:
-            display.SetColor(*color)
-            display.SetOpacity(0.45)
-            display.SetBackfaceCulling(False)
-            display.SetVisibility(True)
+        if self.previewPlaneNode is None:
+            self.previewPlaneNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLModelNode", "Preview_Plane_Temp"
+            )
+            self.previewPlaneNode.SetAndObservePolyData(self._diskFilter.GetOutput())
+            self.previewPlaneNode.CreateDefaultDisplayNodes()
+            self._diskColor = None
 
-        slicer.app.processEvents()
+            display = self.previewPlaneNode.GetDisplayNode()
+            if display:
+                display.SetOpacity(0.45)
+                display.SetBackfaceCulling(False)
+                display.SetVisibility(True)
+        else:
+            # The filter reuses its output object, so the node already observes
+            # the polydata whose points were just recomputed — only the change
+            # notification is needed.
+            pd = self.previewPlaneNode.GetPolyData()
+            if pd is not None:
+                pd.Modified()
+
+        # Colour only changes when the selected zone does.
+        color = tuple(lm["color"]) if lm else (1.0, 0.0, 0.0)
+        if color != self._diskColor:
+            display = self.previewPlaneNode.GetDisplayNode()
+            if display:
+                display.SetColor(*color)
+            self._diskColor = color
+
         threeDWidget = slicer.app.layoutManager().threeDWidget(0)
         if threeDWidget:
             threeDWidget.threeDView().forceRender()
@@ -1120,14 +1081,13 @@ class CenterlinePicker:
                 self._currentPathIndex = -1
                 return
             pd = self.centerlineNode.GetPolyData()
-            clicked = np.array(pd.GetPoint(pointId))
-            best_i, best_d = 0, float("inf")
-            for i, pid in enumerate(self._centerlinePath):
-                d = np.linalg.norm(np.array(pd.GetPoint(pid)) - clicked)
-                if d < best_d:
-                    best_d = d
-                    best_i = i
-            self._currentPathIndex = best_i
+
+            from vtk.util.numpy_support import vtk_to_numpy
+
+            allPts = vtk_to_numpy(pd.GetPoints().GetData())
+            pathPts = allPts[np.asarray(self._centerlinePath, dtype=np.int64)]
+            d = np.linalg.norm(pathPts - allPts[pointId], axis=1)
+            self._currentPathIndex = int(np.argmin(d))
 
     # ------------------------------------------------------------------
     #  Yellow-slice scroll — walk along the centerline after a click
@@ -1140,15 +1100,18 @@ class CenterlinePicker:
         Using a Qt-level filter (rather than a VTK observer) guarantees the
         event is consumed before VTK ever sees it.
         """
-        self._stopYellowScrollObservation()
         ys = slicer.app.layoutManager().sliceWidget("Yellow")
         if not ys:
             return
-        self._wheelFilter = _YellowWheelFilter(self)
+        if self._wheelFilter is None:
+            self._wheelFilter = _YellowWheelFilter(self)
         ys.sliceView().installEventFilter(self._wheelFilter)
 
     def _stopYellowScrollObservation(self):
-        """Remove the Yellow-slice Qt wheel event filter."""
+        """Remove the Yellow-slice wheel filter and drop queued scroll state."""
+        self._scrollTimer.stop()
+        self._settleTimer.stop()
+        self._pendingScrollMm = 0.0
         if self._wheelFilter is not None:
             ys = slicer.app.layoutManager().sliceWidget("Yellow")
             if ys:
@@ -1158,37 +1121,126 @@ class CenterlinePicker:
                     pass
             self._wheelFilter = None
 
-    def _scrollCenterline(self, delta):
-        """Advance or retreat *delta* points along the centerline path.
-
-        Positive *delta* moves toward higher path indices (distal direction
-        as returned by the guided walk).  Negative moves proximally.
-        Call with delta=+5 / -5 for coarser jumps if needed.
-        """
-        if not self._centerlinePath or self._currentPathIndex < 0:
-            return
-        if self.currentPreviewPos is None:
+    def _queueScroll(self, angleDelta):
+        """Accumulate a wheel delta and schedule one coalesced reformat."""
+        if not angleDelta:
             return
 
-        newIdx = max(
-            0,
-            min(len(self._centerlinePath) - 1, self._currentPathIndex + delta),
-        )
+        # 120 angle-delta units is one standard wheel notch.
+        self._pendingScrollMm += (angleDelta / 120.0) * SCROLL_STEP_MM
+        if not self._scrollTimer.isActive():
+            self._scrollTimer.start()
+
+    def _pathIndexAtOffset(self, fromIndex, offsetMm):
+        """Path index reached by travelling *offsetMm* along the centerline."""
+        arc = self._pathArcLengths
+        target = arc[fromIndex] + offsetMm
+        idx = int(np.searchsorted(arc, target))
+        idx = max(0, min(len(arc) - 1, idx))
+        if idx > 0 and abs(arc[idx - 1] - target) < abs(arc[idx] - target):
+            idx -= 1
+        return idx
+
+    def _applyPendingScroll(self):
+        """Apply the accumulated wheel delta — the scroll fast path."""
+        if self._isScrolling:
+            return                      # re-entrancy guard
+        if self._pendingScrollMm == 0.0:
+            return
+        if (
+            self.currentPreviewPos is None
+            or not self._centerlinePath
+            or self._currentPathIndex < 0
+            or self._pathArcLengths is None
+        ):
+            self._pendingScrollMm = 0.0
+            return
+
+        newIdx = self._pathIndexAtOffset(self._currentPathIndex, self._pendingScrollMm)
         if newIdx == self._currentPathIndex:
+            # Sub-point movement.  Keep the residual so that many tiny trackpad
+            # increments accumulate into a step instead of being discarded.
             return
+        self._pendingScrollMm = 0.0
 
         newPointId = self._centerlinePath[newIdx]
-        exactPos = self.centerlineNode.GetPolyData().GetPoints().GetPoint(newPointId)
+        exactPos = self.centerlineNode.GetPolyData().GetPoint(newPointId)
 
-        # _updatePreviewState stops+restarts scroll observers and calls
-        # _updatePathIndex internally — save the target index so we can
-        # restore it in case the path-lookup finds the same value already.
-        self._updatePreviewState(exactPos, newPointId)
-        # Ensure index matches the scroll target (not just the nearest point).
-        self._currentPathIndex = newIdx
+        self._isScrolling = True
+        try:
+            self.currentPreviewPos = exactPos
+            self.currentPreviewId = newPointId
+            self._currentPathIndex = newIdx
+
+            # Move the existing control point rather than remove/re-add it.
+            self._isSnapping = True         # suppress the snap-back handler
+            try:
+                self._snapTimer.stop()
+                if (
+                    self.previewNode
+                    and self.previewNode.GetNumberOfControlPoints() > 0
+                ):
+                    self.previewNode.SetNthControlPointPosition(
+                        0, exactPos[0], exactPos[1], exactPos[2]
+                    )
+            finally:
+                self._isSnapping = False
+
+            self._reformatYellow(exactPos, newPointId)
+        finally:
+            self._isScrolling = False
+
+        # Restart the settle countdown — heavy work runs when the wheel stops.
+        self._settleTimer.start()
+
+    def _onScrollSettled(self):
+        """Deferred preview work, run once the wheel has gone quiet."""
+        if self.currentPreviewPos is None or self.currentPreviewId < 0:
+            return
+        if not self.centerlineNode:
+            return
+
+        pos = self.currentPreviewPos
+        pointId = self.currentPreviewId
+        lm = self._currentLandmarkDef()
+
+        # Arc-length distance label from the previous placed landmark.
+        if self.previewNode and self.previewNode.GetNumberOfControlPoints() > 0:
+            self._isSnapping = True
+            try:
+                self.previewNode.SetNthControlPointLabel(
+                    0, self._previewLabel(pointId, lm)
+                )
+            finally:
+                self._isSnapping = False
+
+        # Secondary views and the 3D cross-section disk.
+        self._centerSliceViewsOnPoint(pos)
+        n, t1 = self._sliceFrameAtPoint(pointId)
+        self._createOrUpdatePreviewPlane(pos, n, t1, lm)
 
         if self.updateCallback:
             self.updateCallback()
+
+    def _scrollCenterline(self, delta):
+        """Advance or retreat *delta* points along the centerline path.
+
+        Retained as a programmatic entry point (the wheel filter now goes
+        through _queueScroll()).  Converts a point-count step into the
+        equivalent arc-length offset and applies it immediately.
+        """
+        if (
+            not self._centerlinePath
+            or self._currentPathIndex < 0
+            or self._pathArcLengths is None
+            or self.currentPreviewPos is None
+        ):
+            return
+
+        arc = self._pathArcLengths
+        targetIdx = max(0, min(len(arc) - 1, self._currentPathIndex + delta))
+        self._pendingScrollMm = float(arc[targetIdx] - arc[self._currentPathIndex])
+        self._applyPendingScroll()
 
     def _performSnapToLine(self):
         """Snap the preview fiducial to the nearest centerline point.
@@ -1222,45 +1274,12 @@ class CenterlinePicker:
             self.currentPreviewId = nearestPointId
             self._updatePathIndex(nearestPointId)  # keep scroll index in sync
 
-            # Recompute tangent / cross-section
-            tangent = self._getTangentAtPoint(
-                self.centerlineNode.GetPolyData(), nearestPointId
-            )
-            n = np.array(tangent, dtype=float)
-            n /= np.linalg.norm(n)
-            a = (
-                np.array([0.0, 0.0, 1.0])
-                if abs(n[2]) < 0.9
-                else np.array([0.0, 1.0, 0.0])
-            )
-            t1 = np.cross(n, a)
-            t1 /= np.linalg.norm(t1)
+            lm = self._currentLandmarkDef()
 
-            lm = (
-                SVS_STS_LANDMARKS[self.selectedZoneIndex]
-                if self.selectedZoneIndex < len(SVS_STS_LANDMARKS)
-                else None
-            )
-
-            # Update Yellow cross-section
-            yellowSlice = slicer.app.layoutManager().sliceWidget("Yellow")
-            if yellowSlice:
-                yellowLogic = yellowSlice.sliceLogic()
-                yellowLogic.GetSliceNode().SetSliceToRASByNTP(
-                    n[0], n[1], n[2],
-                    t1[0], t1[1], t1[2],
-                    exactPos[0], exactPos[1], exactPos[2], 0,
-                )
-
-            # Re-center Axial / Coronal views
+            # Re-orient Yellow, re-centre Axial / Coronal, redraw the disk.
+            n, t1 = self._reformatYellow(exactPos, nearestPointId)
             self._centerSliceViewsOnPoint(exactPos)
-
-            # Re-draw cross-section disk
             self._createOrUpdatePreviewPlane(exactPos, n, t1, lm)
-
-            # Feature 2: update diameter chords
-            diamResult = self._computeCrossSectionDiameters(exactPos, n, t1)
-            self._createOrUpdateDiameterChords(diamResult, lm)
         finally:
             self._isSnapping = False
 
@@ -1327,8 +1346,7 @@ class CenterlinePicker:
             slicer.mrmlScene.RemoveNode(self.previewPlaneNode)
             self.previewPlaneNode = None
 
-        # Clean up diameter chords and hide Yellow slice plane
-        self._removeDiameterChords()
+        # Hide Yellow slice plane
         ys = slicer.app.layoutManager().sliceWidget("Yellow")
         if ys:
             ys.sliceLogic().GetSliceNode().SetSliceVisible(False)
