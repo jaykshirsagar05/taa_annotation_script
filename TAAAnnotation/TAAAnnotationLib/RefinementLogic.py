@@ -21,8 +21,7 @@ class RefinementLogic:
                 slicer.util.errorDisplay("No segmentation loaded")
                 return False
 
-            if getattr(self._logic.activeProfile, 'binarize_mask_before_refine', False):
-                self._binarizeSegmentationNode(self._logic.segNode)
+            self._binarizeSegmentationNode(self._logic.segNode)
 
             slicer.util.selectModule("SegmentEditor")
 
@@ -33,8 +32,6 @@ class RefinementLogic:
                 segmentEditorNode.SetAndObserveSegmentationNode(self._logic.segNode)
                 segmentEditorNode.SetAndObserveSourceVolumeNode(self._logic.volNode)
 
-            if self._logic.refNode:
-                self._logic.refNode.GetDisplayNode().SetVisibility(False)
             self._logic.segNode.GetDisplayNode().SetVisibility(True)
 
             self._logic.workflowState["phase"] = 2
@@ -66,10 +63,79 @@ class RefinementLogic:
         except Exception as e:
             print(f"[Binarize] WARNING — failed to binarize mask: {e}")
 
-    def setupVMTK(self):
-        """Create output nodes and wire them into the ExtractCenterline widget."""
+    def buildPickingSurface(self):
+        """Build the translucent aorta surface used for 3D centerline picking.
+
+        Also hides the opaque segmentations. CenterlinePicker's vtkCellPicker
+        hits whatever is frontmost in the 3D view and then snaps the hit
+        position to the nearest centerline point, so the wall must be
+        translucent and nothing opaque may sit in front of it — otherwise the
+        centerline is buried inside a solid surface and cannot be hovered,
+        clicked, or seen.
+
+        Returns the surface model node, or None when no surface could be built.
+        """
         import vtk
 
+        if not self._logic.segNode:
+            return None
+
+        existing = slicer.mrmlScene.GetFirstNodeByName(self._pickingSurfaceName())
+        if existing is not None:
+            slicer.mrmlScene.RemoveNode(existing)
+
+        tempLabel = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode", "temp_refined_label"
+        )
+        slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
+            self._logic.segNode, tempLabel,
+            slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
+        )
+        array = slicer.util.arrayFromVolume(tempLabel)
+        array[array > 0] = 1
+        slicer.util.updateVolumeFromArray(tempLabel, array)
+
+        binarizedNode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode",
+            f"{self._logic.currentId}_refined_binary"
+        )
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+            tempLabel, binarizedNode
+        )
+        binarizedNode.CreateClosedSurfaceRepresentation()
+        slicer.mrmlScene.RemoveNode(tempLabel)
+
+        segmentId = binarizedNode.GetSegmentation().GetNthSegmentID(0)
+        polyData = vtk.vtkPolyData()
+        binarizedNode.GetClosedSurfaceRepresentation(segmentId, polyData)
+        if polyData.GetNumberOfPoints() == 0:
+            print("[VMTK] Refined segmentation produced an empty surface")
+            slicer.mrmlScene.RemoveNode(binarizedNode)
+            return None
+
+        surfaceModel = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLModelNode", self._pickingSurfaceName()
+        )
+        surfaceModel.SetAndObservePolyData(polyData)
+        surfaceModel.CreateDefaultDisplayNodes()
+        displayNode = surfaceModel.GetDisplayNode()
+        if displayNode:
+            displayNode.SetVisibility(True)
+            displayNode.SetOpacity(0.3)
+            displayNode.SetColor(0.8, 0.8, 0.0)
+
+        for node in (self._logic.segNode, binarizedNode):
+            if node and node.GetDisplayNode():
+                node.GetDisplayNode().SetVisibility(False)
+
+        print("[VMTK] Picking surface ready — segmentation hidden")
+        return surfaceModel
+
+    def _pickingSurfaceName(self):
+        return f"{self._logic.currentId}_refined_binary_surface"
+
+    def setupVMTK(self):
+        """Create output nodes and wire them into the ExtractCenterline widget."""
         try:
             if not hasattr(slicer.modules, 'extractcenterline'):
                 slicer.util.errorDisplay("VMTK Extension not installed")
@@ -79,27 +145,7 @@ class RefinementLogic:
                 slicer.util.errorDisplay("No refined segmentation available")
                 return False
 
-            # Export refined segmentation to temporary label volume and binarize
-            tempRefinedLabel = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLLabelMapVolumeNode", "temp_refined_label"
-            )
-            slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
-                self._logic.segNode, tempRefinedLabel,
-                slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
-            )
-            array = slicer.util.arrayFromVolume(tempRefinedLabel)
-            array[array > 0] = 1
-            slicer.util.updateVolumeFromArray(tempRefinedLabel, array)
-
-            binarizedRefinedNode = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLSegmentationNode",
-                f"{self._logic.currentId}_refined_binary"
-            )
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-                tempRefinedLabel, binarizedRefinedNode
-            )
-            binarizedRefinedNode.CreateClosedSurfaceRepresentation()
-            slicer.mrmlScene.RemoveNode(tempRefinedLabel)
+            inputSurfaceModel = self.buildPickingSurface()
 
             slicer.util.selectModule("ExtractCenterline")
             slicer.app.processEvents()
@@ -124,28 +170,6 @@ class RefinementLogic:
                 "vtkMRMLModelNode", f"{self._logic.currentId}_Centerline"
             )
 
-            # Build a surface model from the binarized refined mask
-            inputSurfaceModel = None
-            if binarizedRefinedNode:
-                inputSurfaceModel = slicer.mrmlScene.AddNewNodeByClass(
-                    "vtkMRMLModelNode",
-                    f"{self._logic.currentId}_refined_binary_surface"
-                )
-                segmentation = binarizedRefinedNode.GetSegmentation()
-                segmentId = segmentation.GetNthSegmentID(0)
-                binarizedRefinedNode.CreateClosedSurfaceRepresentation()
-                polyData = vtk.vtkPolyData()
-                binarizedRefinedNode.GetClosedSurfaceRepresentation(segmentId, polyData)
-
-                if polyData.GetNumberOfPoints() > 0:
-                    inputSurfaceModel.SetAndObservePolyData(polyData)
-                    inputSurfaceModel.CreateDefaultDisplayNodes()
-                    displayNode = inputSurfaceModel.GetDisplayNode()
-                    if displayNode:
-                        displayNode.SetVisibility(True)
-                        displayNode.SetOpacity(0.3)
-                        displayNode.SetColor(0.8, 0.8, 0.0)
-
             if inputSurfaceModel:
                 parameterNode.SetNodeReferenceID("InputSurface", inputSurfaceModel.GetID())
             parameterNode.SetNodeReferenceID(
@@ -156,14 +180,6 @@ class RefinementLogic:
                 "NetworkModel", self._logic.networkNode.GetID())
             parameterNode.SetNodeReferenceID(
                 "EndPoints", self._logic.endpointNode.GetID())
-
-            # Hide other segmentations so only the surface mesh is visible
-            for node in [self._logic.segNode, self._logic.refNode,
-                         self._logic.binarizedMergedNode]:
-                if node:
-                    node.GetDisplayNode().SetVisibility(False)
-            if binarizedRefinedNode:
-                binarizedRefinedNode.GetDisplayNode().SetVisibility(False)
 
             widgetSelf.updateGUIFromParameterNode()
             slicer.app.processEvents()
@@ -178,23 +194,18 @@ class RefinementLogic:
             return False
 
     def getAortaSurfacePolyData(self):
-        """Extract a vtkPolyData closed surface from the refined segmentation.
-
-        Tries segNode first (refined mask), falls back to refNode.
-        Returns vtkPolyData, or None if no segmentation is available.
-        """
+        """Return a vtkPolyData closed surface of the refined segmentation, or None."""
         import vtk
-        for candidate in (self._logic.segNode, self._logic.refNode):
-            if candidate is None:
-                continue
-            seg = candidate.GetSegmentation()
-            if seg is None or seg.GetNumberOfSegments() == 0:
-                continue
-            candidate.CreateClosedSurfaceRepresentation()
-            segmentId = seg.GetNthSegmentID(0)
-            polyData = vtk.vtkPolyData()
-            candidate.GetClosedSurfaceRepresentation(segmentId, polyData)
-            if polyData.GetNumberOfPoints() > 0:
-                return polyData
-        print("[getAortaSurfacePolyData] No valid surface found in segNode or refNode")
+        node = self._logic.segNode
+        if node is None:
+            return None
+        seg = node.GetSegmentation()
+        if seg is None or seg.GetNumberOfSegments() == 0:
+            return None
+        node.CreateClosedSurfaceRepresentation()
+        polyData = vtk.vtkPolyData()
+        node.GetClosedSurfaceRepresentation(seg.GetNthSegmentID(0), polyData)
+        if polyData.GetNumberOfPoints() > 0:
+            return polyData
+        print("[getAortaSurfacePolyData] No valid surface found in segNode")
         return None

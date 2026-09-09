@@ -1,22 +1,15 @@
-import os
 import qt
 import slicer
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 from TAAAnnotationLib import (
-    OrthancClient, AnnotationStatus,
-    WorkflowWidget, OrthancIntegrationWidget,
-    AutosaveManager, CenterlinePicker, ExportManager
-)
-from TAAAnnotationLib.DatasetProfile import (
-    DatasetProfile, PROFILES,
-    detect_profile_from_folder, detect_profile_from_attachments,
+    CaseBrowserWidget, CenterlinePicker, CheckpointManager,
+    ExportManager, WorkflowWidget,
 )
 from TAAAnnotationLib import config as _cfg
 from TAAAnnotationLib.DataLoader import DataLoader
 from TAAAnnotationLib.RefinementLogic import RefinementLogic
 from TAAAnnotationLib.ZoneManager import ZoneManager
-import tempfile
 
 
 class TAAAnnotation(ScriptedLoadableModule):
@@ -35,14 +28,15 @@ class TAAAnnotation(ScriptedLoadableModule):
         self.parent.helpText = """
         TAA (Thoracic Aortic Aneurysm) Annotation Protocol Module.
         <br><br>
-        This module provides a guided workflow for:
+        Offline workflow — all data is read from and written to a local folder:
         <ul>
-        <li>Loading CT scans from Orthanc PACS or local files</li>
-        <li>Refining segmentation using Segment Editor</li>
-        <li>Extracting centerlines using VMTK</li>
-        <li>Placing zonal landmarks on the centerline</li>
-        <li>Exporting and submitting annotated data</li>
+        <li>Pick a dataset folder and load a case (CT + segmentation mask NIfTI)</li>
+        <li>Refine the segmentation using Segment Editor</li>
+        <li>Extract the centerline using VMTK</li>
+        <li>Place SVS/STS zonal landmarks on the centerline</li>
+        <li>Save progress as a checkpoint, or export the finished annotation</li>
         </ul>
+        Outputs are written back into the case folder. No server connection is used.
         """
         self.parent.acknowledgementText = """
         Developed for TAA research annotation workflow.
@@ -72,75 +66,55 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)
         self.logic = None
-        
-        # Orthanc integration
-        self.orthancClient = OrthancClient()
-        self.orthancTempDir = None
-        self._stagedCtDir = None  # set when CT is loaded in Phase 1; cleared in Phase 2
+        self.checkpointManager = None
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
-        
+
         # Create logic
         self.logic = TAAAnnotationLogic()
-        
+        self.checkpointManager = CheckpointManager(self.logic)
+
         # --- Main Layout ---
         mainWidget = qt.QWidget()
         mainLayout = qt.QVBoxLayout(mainWidget)
-        
+
         # --- Header ---
         title = qt.QLabel("TAA Refinement Protocol")
         title.setStyleSheet("font-weight: bold; font-size: 16px; margin-bottom: 10px; color: #333;")
         title.setAlignment(qt.Qt.AlignCenter)
         mainLayout.addWidget(title)
-        
-        # --- Orthanc Integration Widget ---
-        self.orthancWidget = OrthancIntegrationWidget(self.orthancClient)
-        self.orthancWidget.studyLoaded.connect(self.onOrthancStudyLoaded)
-        self.orthancWidget.ctReadyForStaging.connect(self.onCtReadyForStaging)
-        self.orthancWidget.annotationSubmitted.connect(self.onSubmitToOrthanc)
-        self.orthancWidget.annotationApproved.connect(self.onApproveAnnotation)
-        self.orthancWidget.annotationRejected.connect(self.onRejectAnnotation)
-        self.orthancWidget.loggedOut.connect(self.onOrthancLogout)
-        mainLayout.addWidget(self.orthancWidget)
-        
+
+        # --- Case Browser ---
+        self.caseBrowser = CaseBrowserWidget()
+        self.caseBrowser.caseSelected.connect(self.onCaseSelected)
+        mainLayout.addWidget(self.caseBrowser)
+
         # --- Separator ---
         separator = qt.QFrame()
         separator.setFrameShape(qt.QFrame.HLine)
         separator.setStyleSheet("margin: 10px 0;")
         mainLayout.addWidget(separator)
-        
-        orLabel = qt.QLabel("— OR load manually below —")
-        orLabel.setAlignment(qt.Qt.AlignCenter)
-        orLabel.setStyleSheet("color: #999; margin: 5px 0;")
-        mainLayout.addWidget(orLabel)
-        
+
         # --- Workflow Widget ---
         self.workflowWidget = WorkflowWidget()
         self.workflowWidget.setLogic(self.logic)
-        self.workflowWidget.loadDataRequested.connect(self.onLoadData)
         self.workflowWidget.refineRequested.connect(self.onRefineSetup)
         self.workflowWidget.vmtkRequested.connect(self.onVmtkSetup)
         self.workflowWidget.exportRequested.connect(self.onExport)
-        self.workflowWidget.quickSaveRequested.connect(self.onQuickSave)
+        self.workflowWidget.saveProgressRequested.connect(self.onSaveProgress)
         self.workflowWidget.notesChanged.connect(self.onNotesChanged)
-        self.workflowWidget.btnRecover.clicked.connect(self.onRecover)
-        self.workflowWidget.btnIgnore.clicked.connect(self.onIgnoreRecovery)
         mainLayout.addWidget(self.workflowWidget)
-        
+
         # Spacer
         mainLayout.addStretch(1)
-        
+
         self.layout.addWidget(mainWidget)
-        
-        # Initialize autosave
-        self.autosaveManager = AutosaveManager(self.logic)
-        self.autosaveManager.attemptCrashRecovery(self.workflowWidget.showRecoveryBanner)
-        
+
         # Initialize centerline picker
         self.centerlinePicker = CenterlinePicker(self.logic, self.workflowWidget.updateZoneUI)
         self.workflowWidget.setCenterlinePicker(self.centerlinePicker)
-        
+
         # Initial UI state
         self.workflowWidget.updateUIState(0)
 
@@ -148,483 +122,180 @@ class TAAAnnotationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Called each time the user switches back to this module.
 
         VMTK extraction (Step 3) runs inside the separate ExtractCenterline
-        module, so re-check the centerline node here — this catches the case
+        module, so re-check the workflow phase here — this catches the case
         where the user leaves it unrun/failed and lands on Zone Landmarks anyway.
         """
         if self.logic:
             self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
 
-    # --- Manual Load Handler ---
-    def onLoadData(self):
-        """Handle manual data loading from folder (profile auto-detected)."""
-        # Warn if there's unsaved work
+    # --- Case Loading ---
+
+    def onCaseSelected(self, caseDir: str):
+        """Load a case directory, offering to resume from its checkpoint."""
         if self.logic.hasUnsavedWork:
             if not slicer.util.confirmYesNoDisplay(
-                "You have unsaved work. Loading new data will discard it.\n\nContinue?",
+                "You have unsaved work. Loading another case will discard it.\n\nContinue?",
                 "Unsaved Work"
             ):
                 return
-        
-        folderPath = qt.QFileDialog.getExistingDirectory(self.parent, "Select Subject Directory")
-        if folderPath:
-            # Disable buttons during load to prevent double-clicks
-            self.workflowWidget.setButtonsEnabled(False)
-            try:
-                success = self.logic.loadData(folderPath)
-                if success:
-                    profile = self.logic.activeProfile
-                    self.workflowWidget.setProfile(profile)
-                    self.workflowWidget.markDone(1, "Data Loaded")
-                    
-                    if profile and profile.has_precalculated_centerline and self.logic.centerlineNode:
-                        self.workflowWidget.markDone(3, "Centerline Pre-loaded")
-                    
-                    self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-                    profile_label = f" [{profile.name}]" if profile else ""
-                    self.workflowWidget.setStatus(f"✓ Loaded: {self.logic.currentId}{profile_label}")
-                    self.workflowWidget.setCurrentId(self.logic.currentId)
-            finally:
-                self.workflowWidget.setButtonsEnabled(True)
 
-    # --- Orthanc Handlers ---
-    def onCtReadyForStaging(self, series_id: str, ct_dir: str, series_info: dict):
-        """Phase 1 of staged DICOM load: CT downloaded — index + load CT immediately."""
+        self.caseBrowser.setEnabledState(False)
+        self.workflowWidget.setButtonsEnabled(False)
+        qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+
         try:
-            patient_id = series_info.get('patient_id', series_id)
-            dicom_native_profile = PROFILES[DatasetProfile.DICOM_NATIVE]
-
-            # Reset scene and logic state before loading new data.
             self.centerlinePicker.cleanup()
-            self.logic.reset()
-            self.logic.currentId = patient_id
-            self.logic.rootDir = os.path.dirname(ct_dir)
-            self.logic.activeProfile = dicom_native_profile
+            self.workflowWidget.resetUI()
 
-            slicer.util.showStatusMessage(f"Loading CT for {patient_id}…")
-            slicer.app.processEvents()
-
-            vol_node = self.logic._loadDicomNativeCtOnly(ct_dir)
-            if vol_node:
-                self.logic.volNode = vol_node
-                self.logic.applyConfiguredCtWindowLevel()
-                self._stagedCtDir = ct_dir
-                self.workflowWidget.setCurrentId(patient_id, "loading segmentation…")
-                self.workflowWidget.setStatus(
-                    f"CT loaded for {patient_id} — segmentation downloading…"
-                )
-                slicer.util.showStatusMessage(
-                    f"CT loaded — segmentation downloading…", 10000
-                )
-                print(f"[Orthanc] Staged Phase 1 complete: CT visible for {patient_id}")
-            else:
-                print(f"[Orthanc] Staged Phase 1 failed: CT not loaded for {patient_id}")
-                self._stagedCtDir = None
-        except Exception as e:
-            print(f"[Orthanc] onCtReadyForStaging error: {e}")
-            import traceback
-            traceback.print_exc()
-            self._stagedCtDir = None
-
-    def _completeStagedDicomLoad(self, series_id: str, study_info: dict):
-        """Phase 2 of staged DICOM load: CT is in scene — add SEG and finalize."""
-        try:
-            profile    = study_info.get('_profile')
-            file_paths = study_info.get('_file_paths', {})
-            self.orthancTempDir = study_info.get('_temp_dir')
-            ct_dir = self._stagedCtDir
-            self._stagedCtDir = None
-
-            errors = []
-            seg_path = file_paths.get('seg_mask')
-
-            if seg_path and os.path.exists(seg_path):
-                slicer.util.showStatusMessage("Loading segmentation mask…")
-                slicer.app.processEvents()
-                seg_node = self.logic._loadDicomSeg(seg_path, ct_dicom_dir=ct_dir)
-                if seg_node:
-                    self.logic.segNode = seg_node
-                    seg_node.CreateClosedSurfaceRepresentation()
-                    if seg_node.GetDisplayNode():
-                        seg_node.GetDisplayNode().SetVisibility(True)
-                    print("[Orthanc] Staged Phase 2: segmentation loaded")
-                else:
-                    errors.append("DICOM SEG segmentation could not be loaded")
-            elif seg_path:
-                errors.append(f"Segmentation file not found: {seg_path}")
-
-            # Optional pre-computed centerline
-            centerline_path = file_paths.get('centerline')
-            if centerline_path and os.path.exists(centerline_path):
-                try:
-                    self.logic.centerlineNode = self.logic._loadCenterlineModel(centerline_path)
-                except Exception as e:
-                    errors.append(f"Centerline: {e}")
-
-            self.logic.workflowState["phase"] = 1
-            self.logic.hasUnsavedWork = False
-
-            if profile:
-                self.workflowWidget.setProfile(profile)
-            self.workflowWidget.setCurrentId(
-                study_info.get('patient_id', series_id),
-                f"from Orthanc — {profile.name if profile else 'DICOM Native'}"
-            )
-            self.workflowWidget.markDone(1, "Data Loaded (Orthanc)")
-            if profile and profile.has_precalculated_centerline and self.logic.centerlineNode:
-                self.workflowWidget.markDone(3, "Centerline Pre-loaded")
-            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-
-            if errors:
-                slicer.util.warningDisplay(
-                    "Some files could not be loaded:\n\n" + "\n".join(errors),
-                    "Partial Load"
-                )
-            if self.orthancWidget.getRole() == "reviewer":
-                self._loadExistingAnnotations(series_id, self.orthancTempDir)
-        except Exception as e:
-            slicer.util.errorDisplay(f"Failed to complete staged load:\n{str(e)}")
-            import traceback
-            traceback.print_exc()
-
-    def onOrthancStudyLoaded(self, study_id: str, study_info: dict):
-        """Handle study loaded from Orthanc (profile-aware)."""
-        try:
-            # DICOM_NATIVE staged path: CT already loaded in onCtReadyForStaging.
-            # Only add SEG and finalize.
-            if self._stagedCtDir is not None:
-                self._completeStagedDicomLoad(study_id, study_info)
-                return
-
-            profile = study_info.get('_profile')
-            file_paths = study_info.get('_file_paths', {})
-            self.orthancTempDir = study_info.get('_temp_dir')
-            
-            # Backward-compat: if no profile, build a legacy dual-mask paths dict
-            if profile is None:
-                profile = PROFILES[DatasetProfile.DUAL_MASK]
-                file_paths = {
-                    "ct": study_info.get('_ct_path'),
-                    "seg_mask": study_info.get('_unified_path'),
-                    "ref_mask": study_info.get('_merged_path'),
-                }
-            
-            print(f"[Orthanc] Loading profile: {profile.name}, paths: {list(file_paths.keys())}")
-            for k, v in file_paths.items():
-                exists = os.path.exists(v) if v else 'N/A'
-                print(f"  {k}: {v} (exists={exists})")
-            
-            # loadDataWithProfile() is synchronous and blocks the main thread for
-            # 1-2 minutes. We can't avoid the freeze without threading (MRML ops
-            # must run on the main thread), but we can signal activity to the user.
-            slicer.util.showStatusMessage(
-                f"Loading {study_info['patient_id']} — "
-                "CT → seg import → 3D surface (may take 1-2 min)…"
-            )
-            qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
-            slicer.app.processEvents()  # flush status + cursor before blocking
-
-            # Load using logic
-            self.logic.currentId = study_info['patient_id']
-            self.logic.rootDir = self.orthancTempDir
-            self.logic.activeProfile = profile
-            try:
-                errors = self.logic.loadDataWithProfile(profile, file_paths)
-            finally:
-                qt.QApplication.restoreOverrideCursor()
+            errors = self.logic.loadCase(caseDir)
             self.logic.applyConfiguredCtWindowLevel()
-            
-            # Update UI with profile info
-            self.workflowWidget.setProfile(profile)
-            self.workflowWidget.setCurrentId(
-                study_info['patient_id'],
-                f"from Orthanc — {profile.name}"
-            )
-            self.workflowWidget.markDone(1, "Data Loaded (Orthanc)")
-            
-            # If centerline was pre-loaded, mark VMTK phase as done
-            if profile.has_precalculated_centerline and self.logic.centerlineNode:
-                self.workflowWidget.markDone(3, "Centerline Pre-loaded")
-            
-            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
-            
-            # Show loading errors if any
+
+            source = self._restorePreviousWork(caseDir, errors)
+
+            phase = self.logic.workflowState.get("phase", 1)
+            if phase >= 2:
+                self.workflowWidget.markDone(2, "Refine Mode")
+            if phase >= 3:
+                self.workflowWidget.markDone(3, "VMTK Ready")
+                self._prepareForZonePicking()
+
+            self.workflowWidget.setCurrentId(self.logic.currentId, source)
+            self.workflowWidget.updateUIState(phase)
+            self.workflowWidget.updateZoneUI()
+            self.workflowWidget.setStatus(f"✓ Loaded: {self.logic.currentId}")
+            self.caseBrowser.setCurrentCase(caseDir)
+
             if errors:
                 slicer.util.warningDisplay(
-                    "Some files could not be loaded:\n\n" + "\n".join(errors),
+                    "Some data could not be loaded:\n\n" + "\n".join(errors),
                     "Partial Load"
                 )
-            
-            # Load existing annotations for reviewers
-            if self.orthancWidget.getRole() == "reviewer":
-                self._loadExistingAnnotations(study_id, self.orthancTempDir)
-        
+
         except Exception as e:
-            slicer.util.errorDisplay(f"Failed to load study data:\n{str(e)}")
+            slicer.util.errorDisplay(f"Failed to load case:\n{str(e)}")
             import traceback
             traceback.print_exc()
+        finally:
+            qt.QApplication.restoreOverrideCursor()
+            self.caseBrowser.setEnabledState(True)
+            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
 
-    def _loadExistingAnnotations(self, series_id: str, temp_dir: str):
-        """Load existing annotations for review (series-level attachments)."""
-        pid = self.logic.currentId
+    def _restorePreviousWork(self, caseDir, errors):
+        """Offer to reload a checkpoint or a completed export. Returns a source label.
 
-        # Refined mask
-        refined_path = self.orthancClient.download_nifti_from_series(
-            series_id,
-            OrthancClient.ATTACHMENT_REFINED_MASK,
-            os.path.join(temp_dir, f"{pid}_refined_mask.seg.nrrd"),
+        A checkpoint wins when both exist: export clears the checkpoint, so a
+        checkpoint sitting beside exported outputs is newer work.
+        """
+        checkpointSummary = CheckpointManager.describe(caseDir)
+        if checkpointSummary:
+            if not self._confirmResume(checkpointSummary):
+                return "local folder"
+            state, restoreErrors = self.checkpointManager.restore(caseDir)
+            errors.extend(restoreErrors)
+            if state:
+                self.workflowWidget.setNotesText(state.get("notes", ""))
+            self.centerlinePicker.syncLandmarksFromZoneNode()
+            return "resumed from checkpoint"
+
+        exportSummary = CheckpointManager.describeExport(caseDir)
+        if exportSummary:
+            if not self._confirmReopen(exportSummary):
+                return "local folder"
+            metadata, restoreErrors = self.checkpointManager.restoreExport(caseDir)
+            errors.extend(restoreErrors)
+            if metadata:
+                self.workflowWidget.setNotesText(metadata.get("notes", ""))
+            self.centerlinePicker.syncLandmarksFromZoneNode()
+            return "completed — reopened for review"
+
+        return "local folder"
+
+    def _prepareForZonePicking(self):
+        """Rebuild the 3D view state that step 3 normally leaves behind.
+
+        A checkpoint stores nodes, not view state, so a resumed session comes
+        back with the refined segmentation opaque and visible and no picking
+        surface. That buries the centerline inside a solid model, which stops
+        the zone picker's hover, click, and Yellow-view scrolling from working.
+        """
+        self.logic.buildPickingSurface()
+        self.workflowWidget.setCenterlineNode(self.logic.centerlineNode)
+
+    @staticmethod
+    def _confirmResume(summary: str) -> bool:
+        return slicer.util.confirmYesNoDisplay(
+            f"A saved checkpoint was found for this case.\n\n{summary}\n\n"
+            "Resume from the checkpoint?\n"
+            "Choosing No starts fresh from the original segmentation mask.",
+            "Resume Annotation"
         )
-        if refined_path:
-            slicer.util.loadSegmentation(refined_path)
 
-        # Zones
-        zones_path = self.orthancClient.download_nifti_from_series(
-            series_id,
-            OrthancClient.ATTACHMENT_ZONES,
-            os.path.join(temp_dir, f"{pid}_Zones.fcsv"),
+    @staticmethod
+    def _confirmReopen(summary: str) -> bool:
+        return slicer.util.confirmYesNoDisplay(
+            f"This case is already annotated.\n\n{summary}\n\n"
+            "Load the exported annotation for review?\n"
+            "Choosing No starts fresh from the original segmentation mask; "
+            "the exported files stay on disk either way.",
+            "Reopen Completed Case"
         )
-        if zones_path:
-            slicer.util.loadMarkups(zones_path)
-
-        # Centerline
-        centerline_path = self.orthancClient.download_nifti_from_series(
-            series_id,
-            OrthancClient.ATTACHMENT_CENTERLINE,
-            os.path.join(temp_dir, f"{pid}_Centerline.vtk"),
-        )
-        if centerline_path:
-            slicer.util.loadModel(centerline_path)
-
-    def onSubmitToOrthanc(self, study_id: str):
-        """Handle annotation submission."""
-        if not study_id:
-            slicer.util.errorDisplay("No Orthanc study loaded")
-            return
-        
-        # Validate segmentation exists
-        if not self.logic.segNode:
-            slicer.util.errorDisplay("No segmentation to submit. Please complete refinement first.")
-            return
-        
-        # Validate zones
-        zoneCount = self.logic.zoneNode.GetNumberOfControlPoints() if self.logic.zoneNode else 0
-        if zoneCount < 10:
-            if not slicer.util.confirmYesNoDisplay(
-                f"Only {zoneCount}/10 zone landmarks placed. Submit anyway?",
-                "Incomplete Zones"
-            ):
-                return
-        
-        # Show progress
-        progressDialog = slicer.util.createProgressDialog(labelText="Submitting...", maximum=6)
-        
-        try:
-            progressDialog.setValue(1)
-            slicer.app.processEvents()
-            
-            export_dir = tempfile.mkdtemp(prefix="orthanc_submit_")
-            files = {}
-            
-            # Save segmentation
-            if self.logic.segNode:
-                path = os.path.join(export_dir, f"{self.logic.currentId}_refined_mask.seg.nrrd")
-                slicer.util.saveNode(self.logic.segNode, path)
-                files["refined_mask"] = path
-                print(f"[Submit] Saved refined mask: {path}")
-            
-            progressDialog.setValue(2)
-            slicer.app.processEvents()
-            
-            # Save centerline - use logic node directly
-            if self.logic.centerlineNode:
-                path = os.path.join(export_dir, f"{self.logic.currentId}_Centerline.vtk")
-                slicer.util.saveNode(self.logic.centerlineNode, path)
-                files["centerline"] = path
-                print(f"[Submit] Saved centerline: {path}")
-            else:
-                print("[Submit] WARNING: No centerline node found in logic")
-            
-            progressDialog.setValue(3)
-            slicer.app.processEvents()
-            
-            # Save endpoints - use logic node directly
-            if self.logic.endpointNode:
-                path = os.path.join(export_dir, f"{self.logic.currentId}_Endpoints.fcsv")
-                slicer.util.saveNode(self.logic.endpointNode, path)
-                files["endpoints"] = path
-                print(f"[Submit] Saved endpoints: {path}")
-            else:
-                print("[Submit] WARNING: No endpoints node found in logic")
-            
-            progressDialog.setValue(4)
-            slicer.app.processEvents()
-            
-            # Save zones
-            if self.logic.zoneNode:
-                path = os.path.join(export_dir, f"{self.logic.currentId}_Zones.fcsv")
-                slicer.util.saveNode(self.logic.zoneNode, path)
-                files["zones"] = path
-                print(f"[Submit] Saved zones: {path}")
-            
-            progressDialog.setValue(5)
-            slicer.app.processEvents()
-            
-            notes = self.workflowWidget.getNotesText()
-            
-            progressDialog.setLabelText("Uploading...")
-            slicer.app.processEvents()
-            
-            success, message = self.orthancClient.submit_annotation_on_series(study_id, files, notes)
-            
-            progressDialog.close()
-            
-            if success:
-                slicer.util.infoDisplay(f"✓ Annotation submitted!\n\n{message}")
-                self.logic.hasUnsavedWork = False
-                self.orthancWidget.markSubmitted()
-                self.orthancWidget.refreshWorklist()
-                # Reset for next study after successful submission
-                self.resetForNextStudy()
-            else:
-                slicer.util.errorDisplay(f"Failed: {message}")
-                
-        except Exception as e:
-            progressDialog.close()
-            slicer.util.errorDisplay(f"Error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-    def onApproveAnnotation(self, study_id: str):
-        """Handle annotation approval."""
-        if not slicer.util.confirmYesNoDisplay(
-            "Approve this annotation as ground truth?",
-            "Confirm Approval"
-        ):
-            return
-        
-        try:
-            comments = self.orthancWidget.getReviewComments()
-            success, message = self.orthancClient.approve_annotation_on_series(study_id, comments)
-            
-            if success:
-                slicer.util.infoDisplay(f"✓ {message}")
-                self.orthancWidget.disableReviewButtons()
-                self.orthancWidget.refreshWorklist()
-                self.resetForNextStudy()
-            else:
-                slicer.util.errorDisplay(f"Failed: {message}")
-        except Exception as e:
-            slicer.util.errorDisplay(f"Error: {str(e)}")
-
-    def onRejectAnnotation(self, study_id: str, reason: str):
-        """Handle annotation rejection."""
-        if not slicer.util.confirmYesNoDisplay(
-            f"Reject this annotation?\n\nReason: {reason[:100]}...",
-            "Confirm Rejection"
-        ):
-            return
-        
-        try:
-            success, message = self.orthancClient.reject_annotation_on_series(study_id, reason)
-            
-            if success:
-                slicer.util.infoDisplay(f"✓ {message}")
-                self.orthancWidget.disableReviewButtons()
-                self.orthancWidget.refreshWorklist()
-                self.resetForNextStudy()
-            else:
-                slicer.util.errorDisplay(f"Failed: {message}")
-        except Exception as e:
-            slicer.util.errorDisplay(f"Error: {str(e)}")
-
-    def onOrthancLogout(self):
-        """Handle Orthanc logout."""
-        if self.logic.hasUnsavedWork:
-            if not slicer.util.confirmYesNoDisplay(
-                "You have unsaved work. Logout anyway?",
-                "Unsaved Work"
-            ):
-                return
-        # Disable picker first (removes VTK observers from scene nodes before
-        # the scene is cleared; skipping this step crashes VTK/Slicer).
-        # Then delegate to resetApplication which does the correct teardown order.
-        self.resetApplication()
-
-    def resetForNextStudy(self):
-        """Reset for next study."""
-        # Disable picker before scene clear: removes VTK observers and MRML node
-        # refs while nodes are still alive.  Skipping this leaves dangling state
-        # that crashes Slicer when disable() is called later (e.g. on logout).
-        self.centerlinePicker.cleanup()
-        slicer.mrmlScene.Clear(0)
-        self.logic.reset()
-        self.workflowWidget.resetUI()
-        self.workflowWidget.setOrthancMode(False)  # Reset Orthanc mode
-        self.orthancWidget.resetForNextStudy()
-        self.workflowWidget.setStatus("Ready for next study")
 
     # --- Workflow Handlers ---
+
     def onRefineSetup(self):
         self.workflowWidget.setButtonsEnabled(False)
         try:
             if self.logic.setupRefinement():
                 self.workflowWidget.markDone(2, "Refine Mode")
-                self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
         finally:
-            self.workflowWidget.setButtonsEnabled(True)
+            self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
 
     def onVmtkSetup(self):
-        # If centerline is already pre-loaded, skip VMTK
-        if (self.logic.activeProfile
-                and self.logic.activeProfile.has_precalculated_centerline
-                and self.logic.centerlineNode):
-            slicer.util.infoDisplay(
-                "Centerline is pre-loaded for this dataset.\n"
-                "VMTK extraction is not needed — proceed to zone placement."
-            )
-            return
         self.workflowWidget.setButtonsEnabled(False)
         try:
             if self.logic.setupVMTK():
                 self.workflowWidget.markDone(3, "VMTK Ready")
-                self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
+                self.workflowWidget.setCenterlineNode(self.logic.centerlineNode)
         finally:
-            self.workflowWidget.setButtonsEnabled(True)
-
-    def onQuickSave(self):
-        self.autosaveManager.quickSave()
-        self.workflowWidget.setStatus(f"✓ Quick saved at {self.logic.getTimestamp()}")
-
-    def onExport(self):
-        exporter = ExportManager(self.logic)
-        notes = self.workflowWidget.getNotesText()
-        if exporter.exportAll(notes):
-            self.resetApplication()
-
-    def onRecover(self):
-        if self.autosaveManager.recoverSession():
-            self.workflowWidget.hideRecoveryBanner()
             self.workflowWidget.updateUIState(self.logic.workflowState.get("phase", 0))
 
-    def onIgnoreRecovery(self):
-        self.autosaveManager.cleanup()
-        self.workflowWidget.hideRecoveryBanner()
+    def onSaveProgress(self):
+        success, message = self.checkpointManager.save(self.workflowWidget.getNotesText())
+        if success:
+            self.workflowWidget.setStatus(f"✓ {message} at {self.logic.getTimestamp()}")
+            self.caseBrowser.setCurrentCase(self.logic.caseDir)
+        else:
+            slicer.util.warningDisplay(message)
+
+    def onExport(self):
+        caseDir = self.logic.caseDir
+        exporter = ExportManager(self.logic)
+        if not exporter.exportAll(self.workflowWidget.getNotesText()):
+            return
+
+        CheckpointManager.clear(caseDir)
+        self.resetForNextCase()
+        self.caseBrowser.setCurrentCase("")
 
     def onNotesChanged(self, text):
         self.logic.hasUnsavedWork = True
 
-    def resetApplication(self):
-        """Full reset."""
-        self.centerlinePicker.disable()
+    # --- Reset ---
+
+    def resetForNextCase(self):
+        """Clear the scene and UI, ready for the next case."""
+        # Disable the picker before the scene clear: it removes VTK observers
+        # and MRML node refs while the nodes are still alive.  Skipping this
+        # leaves dangling state that crashes Slicer on the next disable().
+        self.centerlinePicker.cleanup()
         self.logic.reset()
-        self.autosaveManager.cleanup()
         self.workflowWidget.resetUI()
         self.workflowWidget.updateUIState(0)
-        self.workflowWidget.setStatus("✓ Reset. Ready for next scan.")
+        self.workflowWidget.setStatus("✓ Ready for the next case.")
 
     def cleanup(self):
         """Module cleanup."""
         self.centerlinePicker.disable()
-        self.autosaveManager.stop()
 
 
 #
@@ -650,16 +321,13 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
                         the caller will clear the scene separately.
         """
         self.currentId = ""
-        self.rootDir = ""
+        self.caseDir = ""
         self.volNode = None
         self.segNode = None
-        self.refNode = None
-        self.binarizedMergedNode = None
         self.zoneNode = None
         self.networkNode = None
         self.endpointNode = None
         self.centerlineNode = None
-        self.activeProfile = None
         self.hasUnsavedWork = False
         self.workflowState = {
             "phase": 0,
@@ -690,53 +358,21 @@ class TAAAnnotationLogic(ScriptedLoadableModuleLogic):
         print(f"[Display] Applied CT window/level from config: W={width}, L={level}")
         return True
 
-    def getIdFromFiles(self, folderPath):
-        """Extract patient ID from the CT scan filename."""
-        import glob
-        searchPattern = os.path.join(folderPath, "ct_scan_*.nii.gz")
-        foundFiles = glob.glob(searchPattern)
-        if not foundFiles:
-            return None
-        filename = os.path.basename(foundFiles[0])
-        return filename.replace("ct_scan_", "").replace(".nii.gz", "")
-
     # --- Loading (delegated to DataLoader) ---
 
-    def loadData(self, folderPath):
-        return self._loader.loadData(folderPath)
-
-    def loadDataWithProfile(self, profile, file_paths: dict):
-        return self._loader.loadDataWithProfile(profile, file_paths)
-
-    def loadProcedureDataFromPaths(self, ct_path: str, unified_path: str, merged_path: str):
-        """Legacy entry point — delegates to loadDataWithProfile with Dual Mask profile."""
-        profile = PROFILES[DatasetProfile.DUAL_MASK]
-        self.activeProfile = profile
-        return self._loader.loadDataWithProfile(profile, {
-            "ct": ct_path,
-            "seg_mask": unified_path,
-            "ref_mask": merged_path,
-        })
-
-    def _loadDicomNativeCtOnly(self, ct_dir: str):
-        return self._loader._loadDicomNativeCtOnly(ct_dir)
-
-    def _loadDicomSeg(self, path: str, ct_dicom_dir: str = None):
-        return self._loader._loadDicomSeg(path, ct_dicom_dir)
-
-    def _loadCenterlineModel(self, centerline_path):
-        return self._loader._loadCenterlineModel(centerline_path)
+    def loadCase(self, caseDir):
+        return self._loader.loadCase(caseDir)
 
     # --- Refinement & VMTK (delegated to RefinementLogic) ---
 
     def setupRefinement(self):
         return self._refiner.setupRefinement()
 
-    def _binarizeSegmentationNode(self, segNode):
-        return self._refiner._binarizeSegmentationNode(segNode)
-
     def setupVMTK(self):
         return self._refiner.setupVMTK()
+
+    def buildPickingSurface(self):
+        return self._refiner.buildPickingSurface()
 
     def getAortaSurfacePolyData(self):
         return self._refiner.getAortaSurfacePolyData()

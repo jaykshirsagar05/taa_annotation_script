@@ -1,12 +1,13 @@
 """
 WorkflowWidget.py - Annotation workflow UI component.
 
-Contains the step-by-step annotation workflow:
-- Phase 1: Load Data
+Contains the step-by-step annotation workflow that follows case loading:
 - Phase 2: Refine Mask
 - Phase 3: Extract Centerline (VMTK)
 - Phase 4: Zone Landmarks
 - Phase 5: Export
+
+Phase 1 (loading) is driven by CaseBrowserWidget.
 """
 
 import qt
@@ -15,116 +16,100 @@ import slicer
 
 class WorkflowWidget(qt.QWidget):
     """Widget containing the annotation workflow steps."""
-    
+
     # Signals
-    loadDataRequested = qt.Signal()  # Emitted when manual load is clicked
     refineRequested = qt.Signal()
     vmtkRequested = qt.Signal()
     exportRequested = qt.Signal()
-    quickSaveRequested = qt.Signal()
+    saveProgressRequested = qt.Signal()
     notesChanged = qt.Signal(str)
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.centerlinePicker = None
         self.logic = None
-        self.orthancTempDir = ""  # Temporary directory for Orthanc studies
-        self._activeProfile = None  # DatasetProfile for the loaded study
         self._setupUI()
-        
+
     def setLogic(self, logic):
         """Set the logic instance."""
         self.logic = logic
-        
+
     def setCenterlinePicker(self, picker):
         """Set the centerline picker instance."""
         self.centerlinePicker = picker
-        
+
     def _setupUI(self):
         layout = qt.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Styles
         self.defaultStyle = "text-align: left; padding: 8px; font-size: 12px;"
         self.doneStyle = "background-color: #28a745; color: white; text-align: left; padding: 8px; font-weight: bold;"
         self.activeStyle = "background-color: #fff3cd; border: 2px solid #ffc107; text-align: left; padding: 8px;"
-        
-        # --- Recovery Banner (hidden by default) ---
-        self.recoveryBanner = qt.QFrame()
-        self.recoveryBanner.setStyleSheet("background-color: #ffc107; padding: 10px; border-radius: 5px;")
-        recoveryLayout = qt.QHBoxLayout(self.recoveryBanner)
-        self.recoveryLabel = qt.QLabel("⚠ Previous session detected")
-        self.btnRecover = qt.QPushButton("Recover")
-        self.btnIgnore = qt.QPushButton("Start Fresh")
-        recoveryLayout.addWidget(self.recoveryLabel)
-        recoveryLayout.addWidget(self.btnRecover)
-        recoveryLayout.addWidget(self.btnIgnore)
-        self.recoveryBanner.hide()
-        layout.addWidget(self.recoveryBanner)
-        
-        # --- Phase 1: Load ---
-        self.btnLoad = qt.QPushButton("1. Load Data & Initialize")
-        self.btnLoad.setStyleSheet(self.defaultStyle)
-        self.btnLoad.clicked.connect(lambda: self.loadDataRequested.emit())
-        layout.addWidget(self.btnLoad)
-        
+
+        # --- Current case ---
+        self.currentIdLabel = qt.QLabel("No case loaded")
+        self.currentIdLabel.setWordWrap(True)
+        self.currentIdLabel.setStyleSheet("color: #6f42c1; font-weight: bold; margin-bottom: 5px;")
+        layout.addWidget(self.currentIdLabel)
+
         # --- Phase 2: Refine ---
         self.btnSeg = qt.QPushButton("2. Refine Mask")
         self.btnSeg.setStyleSheet(self.defaultStyle)
         self.btnSeg.setEnabled(False)
         self.btnSeg.clicked.connect(lambda: self.refineRequested.emit())
         layout.addWidget(self.btnSeg)
-        
+
         # --- Phase 3: VMTK ---
         self.btnVmtk = qt.QPushButton("3. Extract VMTK Centerline")
         self.btnVmtk.setStyleSheet(self.defaultStyle)
         self.btnVmtk.setEnabled(False)
         self.btnVmtk.clicked.connect(lambda: self.vmtkRequested.emit())
         layout.addWidget(self.btnVmtk)
-        
+
         # --- Phase 4: Zones ---
         self._createZonesGroup(layout)
-        
-        # --- Quick Save ---
-        self.btnQuickSave = qt.QPushButton("💾 Quick Save Progress")
-        self.btnQuickSave.setStyleSheet("background-color: #6c757d; color: white; padding: 8px;")
-        self.btnQuickSave.setEnabled(False)
-        self.btnQuickSave.clicked.connect(lambda: self.quickSaveRequested.emit())
-        layout.addWidget(self.btnQuickSave)
-        
+
+        # --- Checkpoint ---
+        self.btnSaveProgress = qt.QPushButton("💾 Save Progress")
+        self.btnSaveProgress.setStyleSheet("background-color: #6c757d; color: white; padding: 8px;")
+        self.btnSaveProgress.setEnabled(False)
+        self.btnSaveProgress.setToolTip(
+            "Write a checkpoint into the case folder so you can close Slicer "
+            "and resume this annotation later."
+        )
+        self.btnSaveProgress.clicked.connect(lambda: self.saveProgressRequested.emit())
+        layout.addWidget(self.btnSaveProgress)
+
         # --- Phase 5: Export ---
         line = qt.QFrame()
         line.setFrameShape(qt.QFrame.HLine)
         layout.addWidget(line)
-        
-        self.btnExport = qt.QPushButton("5. Export & Reset")
+
+        self.btnExport = qt.QPushButton("5. Export & Finish Case")
         self.btnExport.setStyleSheet("text-align: center; padding: 10px; font-weight: bold; background-color: #007bff; color: white;")
         self.btnExport.setEnabled(False)
+        self.btnExport.setToolTip("Write all annotation outputs into the case folder.")
         self.btnExport.clicked.connect(lambda: self.exportRequested.emit())
         layout.addWidget(self.btnExport)
-        
-        # --- Current ID Label ---
-        self.currentIdLabel = qt.QLabel("")
-        self.currentIdLabel.setStyleSheet("color: #6f42c1; font-weight: bold; margin-top: 5px;")
-        layout.addWidget(self.currentIdLabel)
-        
+
         # --- Status ---
-        self.lblStatus = qt.QLabel("Status: Ready for Scan")
+        self.lblStatus = qt.QLabel("Status: Ready")
         self.lblStatus.setWordWrap(True)
         self.lblStatus.setStyleSheet("color: #666; margin-top: 10px;")
         layout.addWidget(self.lblStatus)
-        
+
         # --- Notes ---
-        notesLabel = qt.QLabel("Annotation Notes (saved with export)")
+        notesLabel = qt.QLabel("Annotation Notes (saved with checkpoint and export)")
         notesLabel.setStyleSheet("font-weight: bold; margin-top: 8px;")
         layout.addWidget(notesLabel)
-        
+
         self.notesEdit = qt.QPlainTextEdit()
         self.notesEdit.setPlaceholderText("Add observations about scan quality, artifacts, decisions...")
         self.notesEdit.setMaximumHeight(100)
         self.notesEdit.textChanged.connect(lambda: self.notesChanged.emit(self.notesEdit.toPlainText()))
         layout.addWidget(self.notesEdit)
-        
+
     def _createZonesGroup(self, parentLayout):
         """Create the SVS/STS zone landmark picking group."""
         from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
@@ -132,18 +117,20 @@ class WorkflowWidget(qt.QWidget):
         self.groupZones = qt.QGroupBox("4. SVS/STS Zonal Landmarks")
         zonesLayout = qt.QVBoxLayout(self.groupZones)
 
-        # --- Centerline status (auto-picked from the VMTK extraction step) ---
+        # --- Centerline selector ---
         clLayout = qt.QHBoxLayout()
         clLabel = qt.QLabel("Centerline:")
-        self.centerlineStatusLabel = qt.QLabel("Pending — complete Step 3 first")
-        self.centerlineStatusLabel.setStyleSheet("color: #999; font-style: italic;")
-        self.centerlineStatusLabel.setToolTip(
-            "Automatically uses the centerline extracted in Step 3. "
-            "No manual selection needed."
-        )
+        self.centerlineCombo = slicer.qMRMLNodeComboBox()
+        self.centerlineCombo.nodeTypes = ["vtkMRMLModelNode"]
+        self.centerlineCombo.selectNodeUponCreation = False
+        self.centerlineCombo.addEnabled = False
+        self.centerlineCombo.removeEnabled = False
+        self.centerlineCombo.noneEnabled = True
+        self.centerlineCombo.showHidden = False
+        self.centerlineCombo.setMRMLScene(slicer.mrmlScene)
+        self.centerlineCombo.setToolTip("Select the centerline model")
         clLayout.addWidget(clLabel)
-        clLayout.addWidget(self.centerlineStatusLabel)
-        clLayout.addStretch(1)
+        clLayout.addWidget(self.centerlineCombo)
         zonesLayout.addLayout(clLayout)
 
         # --- Zone selector dropdown ---
@@ -153,7 +140,7 @@ class WorkflowWidget(qt.QWidget):
         self.zoneSelector = qt.QComboBox()
         for lm in SVS_STS_LANDMARKS:
             self.zoneSelector.addItem(
-                f"{lm['id']}: {lm['label']}  \u2014  {lm['name']}"
+                f"{lm['id']}: {lm['label']}  —  {lm['name']}"
             )
         self.zoneSelector.currentIndexChanged.connect(self._onZoneSelectionChanged)
         zoneSelLayout.addWidget(zoneSelLabel)
@@ -180,7 +167,7 @@ class WorkflowWidget(qt.QWidget):
         self.btnClickMode.clicked.connect(self.onToggleClickMode)
         btnLayout.addWidget(self.btnClickMode)
 
-        self.btnConfirmPoint = qt.QPushButton("\u2705 Confirm")
+        self.btnConfirmPoint = qt.QPushButton("✅ Confirm")
         self.btnConfirmPoint.setStyleSheet(
             "background-color: #28a745; color: white; font-weight: bold; padding: 10px;"
         )
@@ -188,7 +175,7 @@ class WorkflowWidget(qt.QWidget):
         self.btnConfirmPoint.clicked.connect(self.onConfirmZone)
         btnLayout.addWidget(self.btnConfirmPoint)
 
-        self.btnUndoPoint = qt.QPushButton("\u21a9 Undo")
+        self.btnUndoPoint = qt.QPushButton("↩ Undo")
         self.btnUndoPoint.setStyleSheet("padding: 10px;")
         self.btnUndoPoint.setEnabled(False)
         self.btnUndoPoint.clicked.connect(self.onUndoZone)
@@ -238,12 +225,12 @@ class WorkflowWidget(qt.QWidget):
             self.zoneTable.setItem(i, 0, nameItem)
 
             # Column 1 — Status
-            statusItem = qt.QTableWidgetItem("\u25cb Not placed")
+            statusItem = qt.QTableWidgetItem("○ Not placed")
             statusItem.setForeground(qt.QColor(150, 150, 150))
             self.zoneTable.setItem(i, 1, statusItem)
 
             # Column 2 — Coordinates
-            self.zoneTable.setItem(i, 2, qt.QTableWidgetItem("\u2014"))
+            self.zoneTable.setItem(i, 2, qt.QTableWidgetItem("—"))
 
         self.zoneTable.resizeColumnsToContents()
         zonesLayout.addWidget(self.zoneTable)
@@ -257,7 +244,7 @@ class WorkflowWidget(qt.QWidget):
         from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
         if 0 <= zoneIndex < len(SVS_STS_LANDMARKS):
             lm = SVS_STS_LANDMARKS[zoneIndex]
-            zone_text = f"  \u2192  <i>{lm['zone_after']}</i>" if lm.get("zone_after") else ""
+            zone_text = f"  →  <i>{lm['zone_after']}</i>" if lm.get("zone_after") else ""
             self.lblInstruction.setText(
                 f"<b>\U0001f4cd {lm['name']}</b>{zone_text}<br>"
                 f"<span style='color:#555;'>{lm['description']}</span>"
@@ -276,116 +263,49 @@ class WorkflowWidget(qt.QWidget):
         if 0 <= row < 10:
             self.zoneSelector.setCurrentIndex(row)
 
-    def updateCenterlineStatus(self, phase=None):
-        """Refresh the read-only centerline status label from the VMTK-extracted node.
-
-        Returns True if the logic's centerline node has usable geometry, False
-        otherwise (e.g. VMTK extraction was never run, or it failed/produced no points).
-        """
-        if phase is None:
-            phase = self.logic.workflowState.get("phase", 0) if self.logic else 0
-
-        centerlinePreloaded = (
-            self._activeProfile is not None
-            and self._activeProfile.has_precalculated_centerline
-        )
-
-        node = self.logic.centerlineNode if self.logic else None
-        pd = node.GetPolyData() if node else None
-        isValid = bool(pd and pd.GetNumberOfPoints() > 0)
-
-        if isValid:
-            self.centerlineStatusLabel.setText(f"✓ {node.GetName()}")
-            self.centerlineStatusLabel.setStyleSheet("color: #28a745; font-weight: bold;")
-        elif phase >= 3 or centerlinePreloaded:
-            # A centerline was expected by this point but is missing or empty.
-            self.centerlineStatusLabel.setText(
-                "⚠ Not available — VMTK extraction did not complete"
-            )
-            self.centerlineStatusLabel.setStyleSheet("color: #dc3545; font-weight: bold;")
-        else:
-            self.centerlineStatusLabel.setText("Pending — complete Step 3 first")
-            self.centerlineStatusLabel.setStyleSheet("color: #999; font-style: italic;")
-
-        return isValid
-
     # --- Public Methods ---
-    
+
     def setButtonsEnabled(self, enabled: bool):
         """Enable/disable all workflow buttons to prevent double-clicks during operations."""
-        self.btnLoad.setEnabled(enabled)
         self.btnSeg.setEnabled(enabled)
         self.btnVmtk.setEnabled(enabled)
         self.btnExport.setEnabled(enabled)
-        self.btnQuickSave.setEnabled(enabled)
+        self.btnSaveProgress.setEnabled(enabled)
         self.btnClickMode.setEnabled(enabled)
         slicer.app.processEvents()
-    
-    def updateUIState(self, phase: int, orthancMode: bool = False):
-        """Update UI based on workflow phase and active profile."""
-        centerlinePreloaded = (
-            self._activeProfile is not None
-            and self._activeProfile.has_precalculated_centerline
-        )
-        centerlineValid = self.updateCenterlineStatus(phase)
-        # Centerline is considered ready if VMTK phase was passed OR it was pre-loaded,
-        # AND extraction actually produced usable geometry (it may have failed).
-        centerlineReady = ((phase >= 3) or centerlinePreloaded) and centerlineValid
+
+    def updateUIState(self, phase: int):
+        """Update button availability for the current workflow phase."""
+        centerlineReady = phase >= 3
 
         self.btnSeg.setEnabled(phase >= 1)
-
-        if centerlinePreloaded:
-            # VMTK not needed — keep button disabled (already marked done)
-            self.btnVmtk.setEnabled(False)
-        else:
-            self.btnVmtk.setEnabled(phase >= 2)
-
+        self.btnVmtk.setEnabled(phase >= 2)
         self.btnClickMode.setEnabled(centerlineReady)
-        self.btnQuickSave.setEnabled(phase >= 1)
-        
-        # Export only enabled for local workflow, not Orthanc
-        if orthancMode:
-            self.btnExport.setEnabled(False)
-        else:
-            self.btnExport.setEnabled(centerlineReady)
-        
+        self.btnSaveProgress.setEnabled(phase >= 1)
+        self.btnExport.setEnabled(centerlineReady)
+
     def setCurrentId(self, current_id: str, source: str = ""):
-        """Set the current study ID display."""
-        if source:
-            self.currentIdLabel.setText(f"Current: {current_id} ({source})")
-        else:
-            self.currentIdLabel.setText(f"Current: {current_id}" if current_id else "")
-
-    def setProfile(self, profile):
-        """Set the active dataset profile and adjust UI accordingly."""
-        self._activeProfile = profile
-        if profile is None:
+        """Set the current case display."""
+        if not current_id:
+            self.currentIdLabel.setText("No case loaded")
             return
-
-        if profile.has_precalculated_centerline:
-            self.btnVmtk.setText("3. Centerline (Pre-loaded ✔)")
-            self.btnVmtk.setStyleSheet(
-                "background-color: #28a745; color: white; text-align: left; "
-                "padding: 8px; font-weight: bold;"
-            )
-            self.btnVmtk.setEnabled(False)
-            self.btnVmtk.setToolTip(
-                "Centerline was provided with the dataset — "
-                "VMTK extraction is not needed."
-            )
+        if source:
+            self.currentIdLabel.setText(f"✔ Loaded: {current_id} ({source})")
         else:
-            self.btnVmtk.setText("3. Extract VMTK Centerline")
-            self.btnVmtk.setStyleSheet(self.defaultStyle)
-            self.btnVmtk.setToolTip("")
-            
+            self.currentIdLabel.setText(f"✔ Loaded: {current_id}")
+
+    def setCenterlineNode(self, node):
+        """Pre-select a centerline in the zone picker's combo box."""
+        if node is not None:
+            self.centerlineCombo.setCurrentNode(node)
+
     def setStatus(self, message: str):
         """Set status message."""
         self.lblStatus.setText(message)
-        
+
     def markDone(self, phase: int, text: str):
         """Mark a phase button as done."""
         button_map = {
-            1: self.btnLoad,
             2: self.btnSeg,
             3: self.btnVmtk,
         }
@@ -393,43 +313,38 @@ class WorkflowWidget(qt.QWidget):
         if button:
             button.setStyleSheet(self.doneStyle)
             button.setText(f"✔ {text}")
-            
-    def showRecoveryBanner(self, message: str):
-        """Show recovery banner."""
-        self.recoveryLabel.setText(message)
-        self.recoveryBanner.show()
-        
-    def hideRecoveryBanner(self):
-        """Hide recovery banner."""
-        self.recoveryBanner.hide()
-        
+
     def getNotesText(self) -> str:
         """Get the notes text."""
         return self.notesEdit.toPlainText().strip()
-        
+
+    def setNotesText(self, text: str):
+        """Replace the notes text, e.g. when resuming from a checkpoint."""
+        self.notesEdit.setPlainText(text or "")
+
     def resetUI(self):
         """Reset UI to initial state."""
         from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
 
-        self._activeProfile = None
-
-        self.btnLoad.setStyleSheet(self.defaultStyle)
-        self.btnLoad.setText("1. Load Data & Initialize")
         self.btnSeg.setStyleSheet(self.defaultStyle)
         self.btnSeg.setText("2. Refine Mask")
+        self.btnSeg.setEnabled(False)
         self.btnVmtk.setStyleSheet(self.defaultStyle)
         self.btnVmtk.setText("3. Extract VMTK Centerline")
-        self.btnVmtk.setToolTip("")
         self.btnVmtk.setEnabled(False)
+        self.btnExport.setEnabled(False)
+        self.btnSaveProgress.setEnabled(False)
         self._setPickerButtonOff()
         self.btnConfirmPoint.setEnabled(False)
-        self.updateCenterlineStatus(0)
+        self.btnClickMode.setEnabled(False)
+        self.centerlineCombo.setCurrentNode(None)
+        self.centerlineCombo.setMRMLScene(slicer.mrmlScene)
 
         # Reset zone table
         for i in range(len(SVS_STS_LANDMARKS)):
-            self.zoneTable.item(i, 1).setText("\u25cb Not placed")
+            self.zoneTable.item(i, 1).setText("○ Not placed")
             self.zoneTable.item(i, 1).setForeground(qt.QColor(150, 150, 150))
-            self.zoneTable.item(i, 2).setText("\u2014")
+            self.zoneTable.item(i, 2).setText("—")
 
         self.zoneSelector.setCurrentIndex(0)
         self._updateInstructionLabel(0)
@@ -438,9 +353,9 @@ class WorkflowWidget(qt.QWidget):
         self.lblClickStatus.setText("Picker: OFF")
         self.lblClickStatus.setStyleSheet("color: #666; font-style: italic;")
         self.notesEdit.setPlainText("")
-        self.currentIdLabel.setText("")
-        self.lblStatus.setText("Status: Ready for Scan")
-        
+        self.currentIdLabel.setText("No case loaded")
+        self.lblStatus.setText("Status: Ready")
+
     def updateZoneUI(self):
         """Update the zone progress table and counters."""
         from TAAAnnotationLib.CenterlinePicker import SVS_STS_LANDMARKS
@@ -464,27 +379,27 @@ class WorkflowWidget(qt.QWidget):
         for idx, lm in enumerate(SVS_STS_LANDMARKS):
             if lm["label"] in labelPosMap:
                 pos = labelPosMap[lm["label"]]
-                self.zoneTable.item(idx, 1).setText("\u2713 Placed")
+                self.zoneTable.item(idx, 1).setText("✓ Placed")
                 self.zoneTable.item(idx, 1).setForeground(qt.QColor(40, 167, 69))
                 self.zoneTable.item(idx, 2).setText(
                     f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
                 )
                 placedCount += 1
             else:
-                self.zoneTable.item(idx, 1).setText("\u25cb Not placed")
+                self.zoneTable.item(idx, 1).setText("○ Not placed")
                 self.zoneTable.item(idx, 1).setForeground(qt.QColor(150, 150, 150))
-                self.zoneTable.item(idx, 2).setText("\u2014")
+                self.zoneTable.item(idx, 2).setText("—")
 
         # Progress counter
         self.lblZoneCount.setText(f"Landmarks: {placedCount} / 10")
 
         if placedCount >= 10:
             self.lblZoneCount.setStyleSheet("font-weight: bold; color: #28a745;")
-            self.lblZoneCount.setText("\u2713 All 10 landmarks placed!")
+            self.lblZoneCount.setText("✓ All 10 landmarks placed!")
             if self.centerlinePicker and self.centerlinePicker.isActive:
                 self.centerlinePicker.disable()
                 self._setPickerButtonOff()
-                self.lblClickStatus.setText("Picker: OFF \u2014 All zones complete")
+                self.lblClickStatus.setText("Picker: OFF — All zones complete")
                 self.lblClickStatus.setStyleSheet("color: #28a745; font-weight: bold;")
         else:
             self.lblZoneCount.setStyleSheet("font-weight: bold; color: #17a2b8;")
@@ -496,7 +411,7 @@ class WorkflowWidget(qt.QWidget):
         ):
             self.btnConfirmPoint.setEnabled(True)
             self.lblClickStatus.setText(
-                "Preview placed \u2014 adjust in Axial / Coronal / Sagittal "
+                "Preview placed — adjust in Axial / Coronal / Sagittal "
                 "views, then press Confirm"
             )
             self.lblClickStatus.setStyleSheet(
@@ -506,13 +421,11 @@ class WorkflowWidget(qt.QWidget):
             )
         else:
             self.btnConfirmPoint.setEnabled(False)
-    
-    # --- Zone Event Handlers ---
-    
+
     # --- Picker button helpers ---
 
     def _setPickerButtonOn(self):
-        self.btnClickMode.setText("\u23f8 Stop Picker")
+        self.btnClickMode.setText("⏸ Stop Picker")
         self.btnClickMode.setStyleSheet(
             "background-color: #dc3545; color: white; font-weight: bold; padding: 10px;"
         )
@@ -532,17 +445,7 @@ class WorkflowWidget(qt.QWidget):
             return
 
         try:
-            centerlineNode = self.logic.centerlineNode if self.logic else None
-            pd = centerlineNode.GetPolyData() if centerlineNode else None
-            if not pd or pd.GetNumberOfPoints() == 0:
-                self.updateCenterlineStatus()
-                slicer.util.errorDisplay(
-                    "Centerline not available.\n\n"
-                    "Complete Step 3 (Extract VMTK Centerline) successfully before "
-                    "placing zone landmarks."
-                )
-                return
-
+            centerlineNode = self.centerlineCombo.currentNode()
             placedCount = (
                 self.centerlinePicker.getPlacedCount()
                 if self.centerlinePicker
@@ -565,7 +468,7 @@ class WorkflowWidget(qt.QWidget):
                     zIdx = self.zoneSelector.currentIndex
                     lm = SVS_STS_LANDMARKS[zIdx]
                     self.lblClickStatus.setText(
-                        f"Picker: ACTIVE \u2014 Click centerline to place {lm['label']} ({lm['name']})"
+                        f"Picker: ACTIVE — Click centerline to place {lm['label']} ({lm['name']})"
                     )
                     self.lblClickStatus.setStyleSheet(
                         "color: #28a745; font-weight: bold;"
@@ -601,10 +504,10 @@ class WorkflowWidget(qt.QWidget):
                 self.zoneSelector.setCurrentIndex(nextIdx)
                 lm = SVS_STS_LANDMARKS[nextIdx]
                 self.lblStatus.setText(
-                    f"\u2713 {label} confirmed.  Next: {lm['label']} ({lm['name']})"
+                    f"✓ {label} confirmed.  Next: {lm['label']} ({lm['name']})"
                 )
             else:
-                self.lblStatus.setText("\u2713 All 10 zone landmarks complete!")
+                self.lblStatus.setText("✓ All 10 zone landmarks complete!")
 
     def onUndoZone(self):
         """Undo last zone point."""
@@ -674,15 +577,3 @@ class WorkflowWidget(qt.QWidget):
             self.updateZoneUI()
         elif action == replaceAction:
             self.zoneSelector.setCurrentIndex(row)
-    
-    def setOrthancMode(self, enabled: bool):
-        """Enable/disable Orthanc mode - disables local export when using Orthanc."""
-        if enabled:
-            self.btnExport.setEnabled(False)
-            self.btnExport.setToolTip("Using Orthanc workflow - use 'Submit to Orthanc' instead")
-            self.btnExport.setStyleSheet("background-color: #6c757d; color: white; padding: 10px;")
-            self.btnExport.setText("5. Export & Reset (Disabled - Use Orthanc)")
-        else:
-            self.btnExport.setToolTip("")
-            self.btnExport.setStyleSheet("text-align: center; padding: 10px; font-weight: bold; background-color: #007bff; color: white;")
-            self.btnExport.setText("5. Export & Reset")

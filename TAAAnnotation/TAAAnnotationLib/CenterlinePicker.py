@@ -397,6 +397,11 @@ class CenterlinePicker:
     #  Landmark map
     # ------------------------------------------------------------------
 
+    def syncLandmarksFromZoneNode(self):
+        """Re-derive placed-landmark state from the zone node, e.g. after a checkpoint restore."""
+        self._rebuildLandmarkMap()
+        self.updateCenterlineZoneColors()
+
     def _rebuildLandmarkMap(self):
         """Rebuild ``landmarkPointIds`` from existing control-point labels."""
         self.landmarkPointIds = {}
