@@ -223,17 +223,10 @@ class CenterlinePicker:
         self._originalSliceIntersectionVisibility = None
         self._originalSliceIntersectionThickness = None
 
-        # Feature 1: Cumulative arc-length distances along the centerline
-        self._cumulativeDistances = None   # np.ndarray or None
-
         # Scroll navigation — walk along the centerline after a click
         self._centerlinePath = None        # ordered list of point IDs (main trunk)
         self._currentPathIndex = -1        # current position in _centerlinePath
         self._wheelFilter = None           # _YellowWheelFilter Qt event-filter instance
-
-        # Feature 2: Diameter chord nodes (max = red, min = cyan)
-        self._maxDiamNode = None           # vtkMRMLMarkupsLineNode
-        self._minDiamNode = None           # vtkMRMLMarkupsLineNode
 
     # ------------------------------------------------------------------
     #  Public helpers
@@ -287,8 +280,7 @@ class CenterlinePicker:
             self.disable()
 
         self.centerlineNode = centerlineNode
-        self._cumulativeDistances = None   # invalidate cache for new centerline
-        self._centerlinePath = None
+        self._centerlinePath = None        # invalidate cache for new centerline
         self._currentPathIndex = -1
 
         # Ensure zone node exists
@@ -364,11 +356,10 @@ class CenterlinePicker:
                 self._originalSliceIntersectionVisibility = None
                 self._originalSliceIntersectionThickness = None
 
-        # Hide Yellow slice plane in 3D and clean up chord nodes
+        # Hide Yellow slice plane in 3D
         ys = slicer.app.layoutManager().sliceWidget("Yellow")
         if ys:
             ys.sliceLogic().GetSliceNode().SetSliceVisible(False)
-        self._removeDiameterChords()
 
         self._removePointPicking()
 
@@ -382,7 +373,6 @@ class CenterlinePicker:
 
         self.isActive = False
         self.centerlineNode = None
-        self._cumulativeDistances = None
         self._centerlinePath = None
         self.currentPreviewPos = None
         self.currentPreviewId = -1
@@ -546,13 +536,6 @@ class CenterlinePicker:
         )
         label = lm["label"] if lm else "?"
 
-        # Feature 1: append arc-length distance from previous landmark
-        self._ensureCumulativeDistances()
-        hoverPid = self._findNearestCenterlinePoint(pos)
-        dist, prevLabel = self._getDistanceFromPreviousLandmark(hoverPid)
-        if dist is not None:
-            label = f"{label} (+{dist:.1f} mm from {prevLabel})"
-
         if self.previewNode.GetNumberOfControlPoints() == 0:
             self.previewNode.AddControlPoint(pos[0], pos[1], pos[2])
         else:
@@ -706,237 +689,14 @@ class CenterlinePicker:
 
         return best_path
 
-    def _buildCumulativeDistances(self, polydata):
-        """Build a numpy array mapping each point index to its arc-length
-        from the start of the main centerline path.
-
-        Works for both vtkPolyLine cells (one cell per branch, many points)
-        and individual vtkLine cells (one cell per segment, 2 points each),
-        as produced by different VMTK/Slicer ExtractCenterline configurations.
-        Builds a full adjacency graph, then walks the longest path.
-        """
-        nPoints = polydata.GetNumberOfPoints()
-        distances = np.zeros(nPoints, dtype=np.float64)
-
-        if polydata.GetNumberOfCells() == 0:
-            return distances
-
-        best_path = self._buildCenterlinePath(polydata)
-        self._centerlinePath = best_path   # cache for scroll navigation
-
-        if len(best_path) < 2:
-            return distances
-
-        # Assign cumulative arc-lengths to each point ID in the best path.
-        cumDist = 0.0
-        prevPt = np.array(polydata.GetPoint(best_path[0]))
-        distances[best_path[0]] = 0.0
-        for pid in best_path[1:]:
-            currPt = np.array(polydata.GetPoint(pid))
-            cumDist += np.linalg.norm(currPt - prevPt)
-            distances[pid] = cumDist
-            prevPt = currPt
-
-        return distances
-
-    def _ensureCumulativeDistances(self):
-        """Populate _cumulativeDistances lazily if not yet built.
-
-        Prefers the 'Length' point-data array produced by VMTK's
-        vtkvmtkCenterlineGeometry (the same pass that generates FrenetTangent).
-        Falls back to geometry-based computation when the array is absent
-        (e.g. externally loaded .vtk files without VMTK geometry).
-        """
-        if self._cumulativeDistances is not None:
+    def _ensureCenterlinePath(self):
+        """Populate the ordered main-trunk point-ID list used by scroll navigation."""
+        if self._centerlinePath is not None:
             return
         if not self.centerlineNode or not self.centerlineNode.GetPolyData():
             return
-
-        pd = self.centerlineNode.GetPolyData()
-
-        # Fast path: VMTK already stored cumulative arc-lengths in "Length".
-        lengthArr = pd.GetPointData().GetArray("Length")
-        if lengthArr is not None and lengthArr.GetNumberOfTuples() == pd.GetNumberOfPoints():
-            nPts = pd.GetNumberOfPoints()
-            self._cumulativeDistances = np.array(
-                [lengthArr.GetValue(i) for i in range(nPts)],
-                dtype=np.float64,
-            )
-            # Still need the ordered path for scroll navigation.
-            if self._centerlinePath is None:
-                self._centerlinePath = self._buildCenterlinePath(pd)
-            return
-
-        # Fallback: compute from cell connectivity (also populates _centerlinePath).
-        self._cumulativeDistances = self._buildCumulativeDistances(pd)
-
-    def _getDistanceFromPreviousLandmark(self, pointId):
-        """Return arc-length distance from the previous placed landmark.
-
-        Returns (distance_mm, label_str), or (None, None) if no previous
-        landmark is available or distances are not cached.
-        """
-        if self._cumulativeDistances is None:
-            return None, None
-
-        prevIdx = None
-        prevPid = -1
-        for zIdx, pid in self.landmarkPointIds.items():
-            if pid < 0:
-                continue
-            if zIdx < self.selectedZoneIndex:
-                if prevIdx is None or zIdx > prevIdx:
-                    prevIdx = zIdx
-                    prevPid = pid
-
-        if prevIdx is None or prevPid < 0:
-            return None, None
-
-        nPoints = len(self._cumulativeDistances)
-        if pointId < 0 or pointId >= nPoints or prevPid >= nPoints:
-            return None, None
-
-        dist = abs(
-            self._cumulativeDistances[pointId]
-            - self._cumulativeDistances[prevPid]
-        )
-        label = SVS_STS_LANDMARKS[prevIdx]["label"]
-        return dist, label
-
-    def _computeCrossSectionDiameters(self, pos, normal, t1):
-        """Cut the aorta surface at (pos, normal) and compute max/min lumen
-        diameters via 2D PCA on the contour points.
-
-        Returns (max_mm, min_mm, max_pt1_3d, max_pt2_3d, min_pt1_3d, min_pt2_3d)
-        or None on failure.
-        """
-        surfPD = self.logic.getAortaSurfacePolyData()
-        if surfPD is None or surfPD.GetNumberOfPoints() < 3:
-            return None
-
-        plane = vtk.vtkPlane()
-        plane.SetOrigin(pos[0], pos[1], pos[2])
-        plane.SetNormal(normal[0], normal[1], normal[2])
-
-        cutter = vtk.vtkCutter()
-        cutter.SetInputData(surfPD)
-        cutter.SetCutFunction(plane)
-        cutter.Update()
-
-        # At curved sections (e.g. arch) the plane can intersect the aorta
-        # wall twice, producing two separate contour loops.  Extract only the
-        # loop whose centroid is closest to the centerline point so that PCA
-        # operates on the correct single lumen cross-section.
-        connFilter = vtk.vtkPolyDataConnectivityFilter()
-        connFilter.SetInputData(cutter.GetOutput())
-        connFilter.SetExtractionModeToClosestPointRegion()
-        connFilter.SetClosestPoint(pos[0], pos[1], pos[2])
-        connFilter.Update()
-        cut = connFilter.GetOutput()
-
-        if cut.GetNumberOfPoints() < 3:
-            return None
-
-        pos_np = np.array(pos, dtype=np.float64)
-        t2 = np.cross(normal, t1)
-        mag = np.linalg.norm(t2)
-        if mag < 1e-9:
-            return None
-        t2 /= mag
-
-        nCut = cut.GetNumberOfPoints()
-        pts_2d = np.empty((nCut, 2), dtype=np.float64)
-        for i in range(nCut):
-            p = np.array(cut.GetPoint(i)) - pos_np
-            pts_2d[i, 0] = np.dot(p, t1)
-            pts_2d[i, 1] = np.dot(p, t2)
-
-        cov = np.cov(pts_2d.T)
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        max_axis_2d = eigenvectors[:, 1]
-        min_axis_2d = eigenvectors[:, 0]
-
-        def _chord_endpoints(axis_2d):
-            projections = pts_2d.dot(axis_2d)
-            diameter = projections.max() - projections.min()
-            half_extent = diameter / 2.0
-            mid_proj = (projections.max() + projections.min()) / 2.0
-            mid_pt_2d = mid_proj * axis_2d
-            pt1_3d = pos_np + (mid_pt_2d - half_extent * axis_2d)[0] * t1 + \
-                              (mid_pt_2d - half_extent * axis_2d)[1] * t2
-            pt2_3d = pos_np + (mid_pt_2d + half_extent * axis_2d)[0] * t1 + \
-                              (mid_pt_2d + half_extent * axis_2d)[1] * t2
-            return diameter, pt1_3d, pt2_3d
-
-        max_mm, max_pt1, max_pt2 = _chord_endpoints(max_axis_2d)
-        min_mm, min_pt1, min_pt2 = _chord_endpoints(min_axis_2d)
-
-        return max_mm, min_mm, max_pt1, max_pt2, min_pt1, min_pt2
-
-    def _createOrUpdateDiameterChords(self, result, lm=None):
-        """Create or update two line-markup chord nodes for max/min diameters."""
-        self._removeDiameterChords()
-
-        if result is None:
-            return
-
-        max_mm, min_mm, max_pt1, max_pt2, min_pt1, min_pt2 = result
-
-        def _make_chord(name, pt1, pt2, color_rgb, label_text):
-            lineNode = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLMarkupsLineNode", name
-            )
-            # Convert to plain Python float — numpy scalars can silently
-            # fail in some Slicer VTK Python bindings, placing points at origin.
-            lineNode.AddControlPoint(float(pt1[0]), float(pt1[1]), float(pt1[2]))
-            lineNode.AddControlPoint(float(pt2[0]), float(pt2[1]), float(pt2[2]))
-            lineNode.SetLocked(True)
-            disp = lineNode.GetDisplayNode()
-            if disp is None:
-                lineNode.CreateDefaultDisplayNodes()
-                disp = lineNode.GetDisplayNode()
-            if disp:
-                disp.SetSelectedColor(*color_rgb)
-                disp.SetColor(*color_rgb)
-                disp.SetLineThickness(0.5)
-                # GlyphScale 0 hides lines in some Slicer builds; use small positive.
-                disp.SetGlyphScale(1.5)
-                disp.SetTextScale(3.0)
-                disp.SetSliceProjection(True)
-                disp.SetSliceProjectionUseFiducialColor(True)
-                # Hide the auto-generated node-name/measurement label.
-                try:
-                    disp.SetPropertiesLabelVisibility(False)
-                except AttributeError:
-                    pass
-                disp.SetPointLabelsVisibility(True)
-            lineNode.SetNthControlPointLabel(0, "")
-            lineNode.SetNthControlPointLabel(1, label_text)
-            return lineNode
-
-        self._maxDiamNode = _make_chord(
-            "Preview_MaxDiam_Temp",
-            max_pt1, max_pt2,
-            [1.0, 0.0, 0.0],
-            f"Max: {max_mm:.1f} mm",
-        )
-        self._minDiamNode = _make_chord(
-            "Preview_MinDiam_Temp",
-            min_pt1, min_pt2,
-            [0.0, 0.8, 1.0],
-            f"Min: {min_mm:.1f} mm",
-        )
-
-    def _removeDiameterChords(self):
-        """Remove max/min diameter chord nodes from the scene."""
-        for attr in ("_maxDiamNode", "_minDiamNode"):
-            node = getattr(self, attr, None)
-            if node:
-                try:
-                    slicer.mrmlScene.RemoveNode(node)
-                except Exception:
-                    pass
-            setattr(self, attr, None)
+        self._centerlinePath = self._buildCenterlinePath(
+            self.centerlineNode.GetPolyData())
 
     # ------------------------------------------------------------------
     #  Preview state (after click)
@@ -972,13 +732,6 @@ class CenterlinePicker:
             self.previewNode.RemoveAllControlPoints()
             self.previewNode.AddControlPoint(pos[0], pos[1], pos[2])
             label = lm["label"] if lm else "Preview"
-
-            # Feature 1: append arc-length distance from previous landmark
-            self._ensureCumulativeDistances()
-            dist, prevLabel = self._getDistanceFromPreviousLandmark(pointId)
-            if dist is not None:
-                label = f"{label} (+{dist:.1f} mm from {prevLabel})"
-
             self.previewNode.SetNthControlPointLabel(0, f"\u25b6 {label}")
             if lm:
                 self.previewNode.GetDisplayNode().SetSelectedColor(*lm["color"])
@@ -1018,15 +771,11 @@ class CenterlinePicker:
         # 3D disk
         self._createOrUpdatePreviewPlane(pos, n, t1, lm)
 
-        # Feature 2: diameter chords on the cross-section
-        diamResult = self._computeCrossSectionDiameters(pos, n, t1)
-        self._createOrUpdateDiameterChords(diamResult, lm)
-
         # Start observing the preview node for user adjustments in slices
         self._startPreviewObservation()
 
         # Sync scroll-navigation index and enable Yellow-slice scroll.
-        self._ensureCumulativeDistances()  # also populates _centerlinePath
+        self._ensureCenterlinePath()
         self._updatePathIndex(pointId)
         self._startYellowScrollObservation()
 
@@ -1262,10 +1011,6 @@ class CenterlinePicker:
 
             # Re-draw cross-section disk
             self._createOrUpdatePreviewPlane(exactPos, n, t1, lm)
-
-            # Feature 2: update diameter chords
-            diamResult = self._computeCrossSectionDiameters(exactPos, n, t1)
-            self._createOrUpdateDiameterChords(diamResult, lm)
         finally:
             self._isSnapping = False
 
@@ -1332,8 +1077,7 @@ class CenterlinePicker:
             slicer.mrmlScene.RemoveNode(self.previewPlaneNode)
             self.previewPlaneNode = None
 
-        # Clean up diameter chords and hide Yellow slice plane
-        self._removeDiameterChords()
+        # Hide Yellow slice plane
         ys = slicer.app.layoutManager().sliceWidget("Yellow")
         if ys:
             ys.sliceLogic().GetSliceNode().SetSliceVisible(False)

@@ -231,8 +231,6 @@ Features:
 - VTK cell picker for precise centerline selection.
 - Hover preview that snaps to the nearest centerline point before you click.
 - Cross-section plane aligned to the centerline tangent, shown in the Yellow view.
-- Cross-section diameter chords rendered at each confirmed landmark.
-- Cumulative arc-length distance tracking along the centerline.
 - Mouse-wheel navigation along the centerline in the Yellow view.
 - Zone colour overlay between placed landmarks.
 - Preview before confirmation, with undo.
@@ -377,7 +375,7 @@ Edit `LocalDataset.CT_TOKEN`, `LocalDataset.MASK_TOKEN`, and `LocalDataset.INPUT
 | **1.3.1** | Centerline status handling in `WorkflowWidget` |
 | **1.3.0** | Staged DICOM loading, extension auto-install, DICOM database initialization |
 | **1.0.0** | CT window/level from `config.py`, parallel DICOM instance streaming, DICOM Native profile |
-| **0.x** | CenterlinePicker scroll navigation, hover preview, cumulative distances, diameter chords; series-level Orthanc operations; dataset profile system; SVS/STS zone landmark UI; auto-update via GitHub releases |
+| **0.x** | CenterlinePicker scroll navigation and hover preview; series-level Orthanc operations; dataset profile system; SVS/STS zone landmark UI; auto-update via GitHub releases |
 
 ---
 
