@@ -1,5 +1,4 @@
 import os
-import json
 import zipfile
 import shutil
 import tempfile
@@ -8,6 +7,15 @@ GITHUB_REPO = "jaykshirsagar05/taa_annotation_script"
 MODULE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # TAAAnnotation/
 VERSION_FILE = os.path.join(MODULE_DIR, "VERSION")
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+# A payload missing any of these would leave an install that cannot load or cannot
+# self-update again, so the swap is refused before the live tree is touched.
+REQUIRED_PAYLOAD = (
+    "VERSION",
+    "TAAAnnotation.py",
+    os.path.join("TAAAnnotationLib", "__init__.py"),
+    os.path.join("TAAAnnotationLib", "AutoUpdater.py"),
+)
 
 
 def getLocalVersion():
@@ -47,12 +55,57 @@ def checkAndUpdate():
         print(f"[AutoUpdater] Update check failed: {e}")
 
 
+def _missingFromPayload(srcModuleDir):
+    """Return the REQUIRED_PAYLOAD entries absent from srcModuleDir."""
+    return [rel for rel in REQUIRED_PAYLOAD
+            if not os.path.exists(os.path.join(srcModuleDir, rel))]
+
+
+def _copyTreeInto(srcDir, dstDir):
+    for item in os.listdir(srcDir):
+        src = os.path.join(srcDir, item)
+        dst = os.path.join(dstDir, item)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+
+def _clearModuleDir():
+    # Empties MODULE_DIR but keeps the directory itself: Slicer registered the module
+    # at this path, and on Windows the directory cannot be removed while it is loaded.
+    for item in os.listdir(MODULE_DIR):
+        path = os.path.join(MODULE_DIR, item)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+
+
+def _installFresh(srcModuleDir, backupDir):
+    """Replace the contents of MODULE_DIR with srcModuleDir, rolling back on failure."""
+    shutil.copytree(MODULE_DIR, backupDir)
+    try:
+        _clearModuleDir()
+        _copyTreeInto(srcModuleDir, MODULE_DIR)
+    except Exception:
+        try:
+            _clearModuleDir()
+            _copyTreeInto(backupDir, MODULE_DIR)
+            print("[AutoUpdater] Install failed — rolled back to the previous version")
+        except Exception as restoreError:
+            print(f"[AutoUpdater] CRITICAL: rollback failed: {restoreError}")
+            print(f"[AutoUpdater] A copy of the previous version is at: {backupDir}")
+        raise
+
+
 def _downloadAndInstall(zipUrl, newVersion):
+    tmpDir = tempfile.mkdtemp()
+    keepTmpDir = False
     try:
         import requests
         import slicer
 
-        tmpDir = tempfile.mkdtemp()
         zipPath = os.path.join(tmpDir, "update.zip")
 
         print("[AutoUpdater] Downloading update...")
@@ -62,35 +115,30 @@ def _downloadAndInstall(zipUrl, newVersion):
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)
 
+        extractDir = os.path.join(tmpDir, "extracted")
         with zipfile.ZipFile(zipPath, "r") as zf:
-            zf.extractall(tmpDir)
+            zf.extractall(extractDir)
 
         # GitHub zipball has a root folder like "user-repo-abc1234/"
         extracted = [
-            d for d in os.listdir(tmpDir)
-            if os.path.isdir(os.path.join(tmpDir, d)) and d != "__MACOSX"
+            d for d in os.listdir(extractDir)
+            if os.path.isdir(os.path.join(extractDir, d)) and d != "__MACOSX"
         ]
         if not extracted:
             print("[AutoUpdater] Could not locate extracted folder")
             return
 
-        srcModuleDir = os.path.join(tmpDir, extracted[0], "TAAAnnotation")
+        srcModuleDir = os.path.join(extractDir, extracted[0], "TAAAnnotation")
         if not os.path.exists(srcModuleDir):
             print("[AutoUpdater] TAAAnnotation/ not found in downloaded zip")
             return
 
-        # Overwrite current module files with new ones
-        for item in os.listdir(srcModuleDir):
-            src = os.path.join(srcModuleDir, item)
-            dst = os.path.join(MODULE_DIR, item)
-            if os.path.isdir(src):
-                if os.path.exists(dst):
-                    shutil.rmtree(dst)
-                shutil.copytree(src, dst)
-            else:
-                shutil.copy2(src, dst)
+        missing = _missingFromPayload(srcModuleDir)
+        if missing:
+            print(f"[AutoUpdater] Download incomplete, missing {missing} — keeping current version")
+            return
 
-        shutil.rmtree(tmpDir, ignore_errors=True)
+        _installFresh(srcModuleDir, os.path.join(tmpDir, "backup"))
         print(f"[AutoUpdater] Successfully updated to v{newVersion}")
 
         slicer.util.infoDisplay(
@@ -99,4 +147,10 @@ def _downloadAndInstall(zipUrl, newVersion):
         )
 
     except Exception as e:
+        # The rollback copy lives under tmpDir, so leave it in place for recovery.
+        keepTmpDir = True
         print(f"[AutoUpdater] Install failed: {e}")
+
+    finally:
+        if not keepTmpDir:
+            shutil.rmtree(tmpDir, ignore_errors=True)
